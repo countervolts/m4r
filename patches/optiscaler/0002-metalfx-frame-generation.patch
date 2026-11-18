@@ -1,0 +1,889 @@
+diff --git a/OptiScaler.ini b/OptiScaler.ini
+index d4c54e1..54b3b44 100644
+--- a/OptiScaler.ini
++++ b/OptiScaler.ini
+@@ -38,7 +38,8 @@ FGInput=auto
+ ; fsrfg          - requires amd_fidelityfx_dx12.dll OR amd_fidelityfx_loader_dx12.dll + amd_fidelityfx_framegeneration_dx12.dll
+ ; xefg           - requires libxess_fg.dll and libxell.dll
+ ; dlssg          - requires streamline dlls inside 'OptiScaler/streamline' folder + nvngx_dlssg.dll
+-; nofg, fsrfg, xefg, dlssg - Default (auto) is nofg
++; metalfx        - Apple MetalFX frame interpolation through m4r, requires m4r\m4r.dll and a plan for the resolution
++; nofg, fsrfg, xefg, dlssg, metalfx - Default (auto) is nofg
+ FGOutput=auto
+ 
+ ; Selected FG Nvngx Replacement
+@@ -1338,6 +1339,11 @@ StaticPosY=auto
+ ; true or false - Default (auto) is false
+ FlipJitter=auto
+ 
++; Without V-Sync the generated and the real frame would be shown back to back; holds the real frame back by
++; half a frame time
++; true or false - Default (auto) is true
++FGPacing=auto
++
+ ; -------------------------------------------------------
+ [Log]
+ ; -------------------------------------------------------
+diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
+index 0d52635..6969a99 100644
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -247,6 +247,7 @@ bool Config::Reload(std::filesystem::path iniPath)
+         // MetalFX (m4r)
+         {
+             MetalFXFlipJitter.set_from_config(readBool("MetalFX", "FlipJitter"));
++            MetalFXFGPacing.set_from_config(readBool("MetalFX", "FGPacing"));
+         }
+ 
+         // FSR FG Inputs
+@@ -1073,6 +1074,7 @@ bool Config::SaveIni()
+     // MetalFX (m4r)
+     {
+         ini.SetValue("MetalFX", "FlipJitter", GetBoolValue(Instance()->MetalFXFlipJitter.value_for_config()).c_str());
++        ini.SetValue("MetalFX", "FGPacing", GetBoolValue(Instance()->MetalFXFGPacing.value_for_config()).c_str());
+     }
+ 
+     // OptiFG
+diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
+index 900da40..09c7252 100644
+--- a/OptiScaler/Config.h
++++ b/OptiScaler/Config.h
+@@ -263,6 +263,7 @@ class Config
+ 
+     // MetalFX (m4r)
+     CustomOptional<bool> MetalFXFlipJitter { false };
++    CustomOptional<bool> MetalFXFGPacing { true }; // hold the real frame back by half a frame after the generated one
+ 
+     // Logging
+     CustomOptional<bool> LogToFile { false };
+diff --git a/OptiScaler/OptiScaler.vcxproj b/OptiScaler/OptiScaler.vcxproj
+index 510c4d9..4c02eab 100644
+--- a/OptiScaler/OptiScaler.vcxproj
++++ b/OptiScaler/OptiScaler.vcxproj
+@@ -257,6 +257,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
+     <ClInclude Include="low_latency\input\input_xell.h" />
+     <ClInclude Include="low_latency\input\input_antilag2.h" />
+     <ClInclude Include="framegen\reprojection\Reprojection_Dx12.h" />
++    <ClInclude Include="framegen\metalfx\MetalFXFG_Dx12.h" />
+     <ClInclude Include="shaders\reproject\mouseInputs\RawInputHook.h" />
+     <ClInclude Include="shaders\hud_copy\precompile\HudCopy_Shader_Vk.h" />
+     <ClInclude Include="shaders\magnifier\Magnifier_Dx11.h" />
+@@ -598,6 +599,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
+     <ClCompile Include="low_latency\input\input_xell.cpp" />
+     <ClCompile Include="low_latency\input\input_antilag2.cpp" />
+     <ClCompile Include="framegen\reprojection\Reprojection_Dx12.cpp" />
++    <ClCompile Include="framegen\metalfx\MetalFXFG_Dx12.cpp" />
+     <ClCompile Include="shaders\reproject\mouseInputs\RawInputHook.cpp" />
+     <ClCompile Include="shaders\magnifier\Magnifier_Dx11.cpp" />
+     <ClCompile Include="menu\input\input_system.cpp" />
+diff --git a/OptiScaler/State.h b/OptiScaler/State.h
+index 7ff5af6..885c040 100644
+--- a/OptiScaler/State.h
++++ b/OptiScaler/State.h
+@@ -60,7 +60,8 @@ enum class FGOutput : uint32_t
+     FSRFG,
+     DLSSG,
+     XeFG,
+-    Reprojection
++    Reprojection,
++    MetalFX
+ };
+ 
+ template <> struct EnumConfig<FGOutput>
+@@ -73,6 +74,7 @@ template <> struct EnumConfig<FGOutput>
+         { FGOutput::DLSSG, "DLSSG" },
+         { FGOutput::XeFG, "XeFG" },
+         { FGOutput::Reprojection, "Reprojection" },
++        { FGOutput::MetalFX, "MetalFX" },
+     };
+ };
+ 
+@@ -411,6 +413,9 @@ class State
+     bool SCExclusiveFullscreen = false;
+     bool SCAllowTearing = false;
+     UINT SCLastFlags = 0;
++    // What the game passed to its last present, for FG outputs that present extra frames themselves
++    UINT fgPresentSyncInterval = 0;
++    UINT fgPresentFlags = 0;
+ 
+     // HDR
+     std::vector<IUnknown*> scBuffers;
+diff --git a/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.cpp b/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.cpp
+new file mode 100644
+index 0000000..cc19a4c
+--- /dev/null
++++ b/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.cpp
+@@ -0,0 +1,573 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#include "pch.h"
++#include "MetalFXFG_Dx12.h"
++#include <framegen/reprojection/swapchain/reprojectionSwapchain.h>
++
++#include <Config.h>
++#include <State.h>
++#include <hudfix/Hudfix_Dx12.h>
++#include <hudfix/Hudfix_Dx11.h>
++#include <menu/menu_overlay_dx.h>
++
++#include <magic_enum.hpp>
++
++// The swapchain wrapper of the reprojection output only forwards to the real swapchain, so it is reused here.
++
++void MetalFXFG_Dx12::SetReal(IDXGISwapChain* swapchain)
++{
++    _real = nullptr;
++    IDXGISwapChain3* sc3 = nullptr;
++    if (swapchain != nullptr && SUCCEEDED(swapchain->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3 != nullptr)
++    {
++        _real = sc3;
++        sc3->Release(); // the wrapper keeps the real swapchain alive; a second owner would block its release
++    }
++}
++
++void MetalFXFG_Dx12::WaitIdle()
++{
++    if (_fence == nullptr || _fenceEvent == nullptr || _gameCommandQueue == nullptr || _fenceValue == 0)
++        return;
++
++    const UINT64 value = ++_fenceValue;
++    if (FAILED(_gameCommandQueue->Signal(_fence, value)))
++        return;
++    if (_fence->GetCompletedValue() < value && SUCCEEDED(_fence->SetEventOnCompletion(value, _fenceEvent)))
++        WaitForSingleObject(_fenceEvent, 2000);
++}
++
++void MetalFXFG_Dx12::ReleaseObjects()
++{
++    WaitIdle();
++
++    for (size_t i = 0; i < BUFFER_COUNT; i++)
++    {
++        SAFE_RELEASE(_uiCommandAllocator[i]);
++        SAFE_RELEASE(_uiCommandList[i]);
++        SAFE_RELEASE(_scCommandAllocator[i]);
++        SAFE_RELEASE(_scCommandList[i]);
++
++        _scCommandListResetted[i] = false;
++        _scAllocatorFenceValues[i] = 0;
++        _uiCommandListResetted[i] = false;
++        _uiAllocatorFenceValues[i] = 0;
++    }
++
++    for (UINT i = 0; i < Slots; i++)
++    {
++        SAFE_RELEASE(_list[i]);
++        SAFE_RELEASE(_alloc[i]);
++        _slotFence[i] = 0;
++    }
++    SAFE_RELEASE(_fence);
++    SAFE_CLOSE_HANDLE(_fenceEvent);
++    _fenceValue = 0;
++
++    if (_ctx != nullptr)
++    {
++        if (auto& m4r = M4RProxy::Get(); m4r.destroy != nullptr)
++            m4r.destroy(_ctx);
++        _ctx = nullptr;
++    }
++    SAFE_RELEASE(_interop);
++    _ctxFailed = false;
++    _needReset = true;
++    _failedKey = 0;
++
++    _renderUI.reset();
++    _hudlessCompare.reset();
++    _mvFlip.reset();
++    _depthFlip.reset();
++
++    ReleaseResourceCopies();
++}
++
++void MetalFXFG_Dx12::CreateObjects(ID3D12Device* InDevice)
++{
++    _device = InDevice;
++
++    if (_uiCommandAllocator[0] != nullptr)
++        return;
++
++    // The base class's UI and swapchain command lists (hudfix and UI composition record into them)
++    for (size_t i = 0; i < BUFFER_COUNT; i++)
++    {
++        _scCommandListResetted[i] = false;
++        _scAllocatorFenceValues[i] = 0;
++        _uiCommandListResetted[i] = false;
++        _uiAllocatorFenceValues[i] = 0;
++
++        InDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_uiCommandAllocator[i]));
++        _uiCommandAllocator[i]->SetName(std::format(L"_uiCommandAllocator[{}]", i).c_str());
++        InDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _uiCommandAllocator[i], NULL,
++                                    IID_PPV_ARGS(&_uiCommandList[i]));
++        _uiCommandList[i]->SetName(std::format(L"_uiCommandList[{}]", i).c_str());
++        _uiCommandList[i]->Close();
++
++        if (_uiFence == nullptr)
++        {
++            InDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_uiFence));
++            _uiFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
++        }
++
++        InDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_scCommandAllocator[i]));
++        _scCommandAllocator[i]->SetName(std::format(L"_scCommandAllocator[{}]", i).c_str());
++        InDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _scCommandAllocator[i], NULL,
++                                    IID_PPV_ARGS(&_scCommandList[i]));
++        _scCommandList[i]->SetName(std::format(L"_scCommandList[{}]", i).c_str());
++        _scCommandList[i]->Close();
++
++        if (_scFence == nullptr)
++        {
++            InDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_scFence));
++            _scFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
++        }
++    }
++
++    // The command lists m4r records into
++    for (UINT i = 0; i < Slots; i++)
++    {
++        InDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_alloc[i]));
++        InDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _alloc[i], NULL, IID_PPV_ARGS(&_list[i]));
++        _list[i]->SetName(std::format(L"MetalFXFG list[{}]", i).c_str());
++        _list[i]->Close();
++        _slotFence[i] = 0;
++    }
++    InDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_fence));
++    _fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
++}
++
++bool MetalFXFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue,
++                                             DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swapChain)
++{
++    IDXGISwapChain* realSwapchain {};
++    auto result = factory->CreateSwapChain(cmdQueue, desc, &realSwapchain);
++
++    if (result == S_OK && swapChain)
++    {
++        SetReal(realSwapchain);
++        *swapChain = new ReprojectionDXGISwapChain(realSwapchain, cmdQueue, desc->OutputWindow, 0, false);
++
++        _gameCommandQueue = cmdQueue;
++        _swapChain = *swapChain;
++        _hwnd = desc->OutputWindow;
++        return true;
++    }
++    return false;
++}
++
++bool MetalFXFG_Dx12::CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, HWND hwnd,
++                                              DXGI_SWAP_CHAIN_DESC1* desc,
++                                              DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
++                                              IDXGISwapChain1** swapChain)
++{
++    IDXGIFactory2* factory2 = nullptr;
++    if (factory->QueryInterface(IID_PPV_ARGS(&factory2)) != S_OK)
++        return false;
++
++    IDXGISwapChain1* realSwapchain1 {};
++    auto result = factory2->CreateSwapChainForHwnd(cmdQueue, hwnd, desc, pFullscreenDesc, nullptr, &realSwapchain1);
++    factory2->Release();
++
++    if (result == S_OK && swapChain)
++    {
++        SetReal(realSwapchain1);
++        *swapChain = new ReprojectionDXGISwapChain(realSwapchain1, cmdQueue, hwnd, 0, false);
++
++        _gameCommandQueue = cmdQueue;
++        _swapChain = *swapChain;
++        _hwnd = hwnd;
++        return true;
++    }
++    return false;
++}
++
++bool MetalFXFG_Dx12::ReleaseSwapchain(HWND hwnd)
++{
++    if (hwnd != _hwnd || _hwnd == NULL)
++        return false;
++
++    MenuOverlayDx::CleanupRenderTarget(true, NULL);
++    ReleaseObjects();
++    _real = nullptr;
++    return true;
++}
++
++void MetalFXFG_Dx12::CreateContext(ID3D12Device* device, FG_Constants& fgConstants)
++{
++    if (_device != nullptr)
++        return;
++
++    _device = device;
++    CreateObjects(device);
++}
++
++void MetalFXFG_Dx12::Activate()
++{
++    if (!_isActive)
++    {
++        UpdateTarget();
++        _needReset = true;
++        _isActive = true;
++    }
++}
++
++void MetalFXFG_Dx12::Deactivate()
++{
++    if (_isActive)
++    {
++        _isActive = false;
++        _needReset = true;
++    }
++}
++
++void MetalFXFG_Dx12::DestroyFGContext()
++{
++    Deactivate();
++    ReleaseObjects();
++}
++
++bool MetalFXFG_Dx12::Shutdown()
++{
++    MenuOverlayDx::CleanupRenderTarget(true, NULL);
++    DestroyFGContext();
++    return true;
++}
++
++void MetalFXFG_Dx12::EvaluateState(ID3D12Device* device, FG_Constants& fgConstants)
++{
++    OwnedLockGuard lock(Mutex, 555);
++
++    if (State::Instance().isShuttingDown)
++        return;
++
++    _constants = fgConstants;
++
++    if (Config::Instance()->IsFGEnabled())
++    {
++        if (_device == nullptr)
++            CreateContext(device, fgConstants);
++
++        if (!IsPaused() && !IsActive())
++            Activate();
++    }
++    else
++    {
++        Deactivate();
++        ReleaseResourceCopies();
++    }
++
++    if (State::Instance().fgChanged)
++    {
++        LOG_DEBUG("FGchanged");
++
++        State::Instance().fgChanged = false;
++
++        Hudfix_Dx12::ResetCounters();
++        Hudfix_Dx11::ResetCounters();
++
++        // Pause for 10 frames
++        UpdateTarget();
++        _needReset = true;
++
++        if (Mutex.getOwner() == 2)
++            Mutex.unlockThis(2);
++    }
++}
++
++// A command list from the ring; waits for the GPU to be done with the allocator's previous use
++ID3D12GraphicsCommandList* MetalFXFG_Dx12::BeginList()
++{
++    if (_list[0] == nullptr || _fence == nullptr)
++        return nullptr;
++
++    _cur = _slot++ % Slots;
++    if (_slotFence[_cur] != 0 && _fence->GetCompletedValue() < _slotFence[_cur])
++    {
++        if (FAILED(_fence->SetEventOnCompletion(_slotFence[_cur], _fenceEvent)) ||
++            WaitForSingleObject(_fenceEvent, 5000) != WAIT_OBJECT_0)
++        {
++            LOG_ERROR("MetalFX FG: allocator wait failed (slot {}, fence {})", _cur, _slotFence[_cur]);
++            return nullptr;
++        }
++    }
++
++    if (FAILED(_alloc[_cur]->Reset()) || FAILED(_list[_cur]->Reset(_alloc[_cur], nullptr)))
++    {
++        LOG_ERROR("MetalFX FG: command list reset failed");
++        return nullptr;
++    }
++    return _list[_cur];
++}
++
++bool MetalFXFG_Dx12::Submit(ID3D12GraphicsCommandList* list)
++{
++    if (FAILED(list->Close()))
++        return false;
++
++    _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &list);
++    _slotFence[_cur] = ++_fenceValue;
++    _gameCommandQueue->Signal(_fence, _slotFence[_cur]);
++    return true;
++}
++
++// Holds the real frame back after the generated one when the game presents without V-Sync, which would show both
++// frames at once. Half of the game's frame time, taken from the present-to-present time. A guess at good pacing.
++void MetalFXFG_Dx12::Pace(double sinceMs)
++{
++    if (!Config::Instance()->MetalFXFGPacing.value_or_default())
++        return;
++
++    const double frame = State::Instance().lastFGFrameTime;
++    if (frame <= 0.0)
++        return;
++
++    double wait = std::min(frame * 0.5, 50.0) - sinceMs;
++    if (wait < 0.5)
++        return;
++
++    const double end = Util::MillisecondsNow() + wait;
++    if (wait > 2.0)
++        Sleep((DWORD) (wait - 1.5));
++    while (Util::MillisecondsNow() < end)
++        YieldProcessor();
++}
++
++bool MetalFXFG_Dx12::Present()
++{
++    auto& state = State::Instance();
++    auto fIndex = GetIndex();
++
++    // Execute what hudfix or UI composition recorded for this frame
++    if (_gameCommandQueue != nullptr)
++    {
++        if (_uiCommandListResetted[fIndex])
++        {
++            if (_uiCommandList[fIndex]->Close() == S_OK)
++                _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_uiCommandList[fIndex]);
++
++            _gameCommandQueue->Signal(_uiFence, _uiAllocatorFenceValues[fIndex]);
++            _uiCommandListResetted[fIndex] = false;
++        }
++
++        if (_scCommandListResetted[fIndex])
++        {
++            if (_scCommandList[fIndex]->Close() == S_OK)
++                _gameCommandQueue->ExecuteCommandLists(1, (ID3D12CommandList**) &_scCommandList[fIndex]);
++
++            _scCommandListResetted[fIndex] = false;
++        }
++    }
++
++    // Returning false: the caller still presents the real frame
++    if (_real == nullptr || _gameCommandQueue == nullptr || _device == nullptr)
++        return false;
++
++    if (!IsActive() || IsPaused())
++    {
++        _needReset = true;
++        return false;
++    }
++
++    auto& m4r = M4RProxy::Get();
++    if (m4r.module == nullptr || m4r.framegenCapture == nullptr || m4r.framegenRestore == nullptr)
++        return false;
++
++    auto depth = GetResource(FG_ResourceType::Depth, fIndex);
++    auto velocity = GetResource(FG_ResourceType::Velocity, fIndex);
++    if (!depth || depth->validity == FG_ResourceValidity::ValidNow || !velocity ||
++        velocity->validity == FG_ResourceValidity::ValidNow)
++    {
++        // no usable depth or motion vectors this frame (menus, loading): the next one starts over
++        _needReset = true;
++        return false;
++    }
++
++    if (_ctx == nullptr)
++    {
++        if (_ctxFailed)
++            return false;
++
++        _ctx = M4RD3D12::Create(_device, &_interop);
++        if (_ctx == nullptr)
++        {
++            _ctxFailed = true;
++            return false;
++        }
++    }
++
++    ComPtr<ID3D12Resource> backbuffer;
++    if (FAILED(_real->GetBuffer(_real->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backbuffer))))
++        return false;
++
++    m4r_framegen_desc d {};
++    d.backbuffer = M4RD3D12::Image(_interop, backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT);
++    d.depth = M4RD3D12::Image(_interop, depth->GetResource(), depth->state);
++    d.motion = M4RD3D12::Image(_interop, velocity->GetResource(), velocity->state);
++    if (!d.backbuffer.image || !d.depth.image || !d.motion.image)
++        return false;
++
++    if (d.motion.width != d.depth.width || d.motion.height != d.depth.height)
++    {
++        if (!_warnedMV)
++            LOG_WARN("MetalFX FG: motion vectors ({}x{}) are not the depth size ({}x{}), display-resolution motion "
++                     "vectors are not supported yet",
++                     d.motion.width, d.motion.height, d.depth.width, d.depth.height);
++        _warnedMV = true;
++        _needReset = true;
++        return false;
++    }
++
++    const UINT64 key = ((UINT64) d.backbuffer.width << 48) ^ ((UINT64) d.backbuffer.height << 32) ^
++                       ((UINT64) d.depth.width << 16) ^ d.depth.height;
++    if (key == _failedKey)
++        return false;
++
++    d.motion_scale_x = _mvScaleX[fIndex] != 0.0f ? _mvScaleX[fIndex] : 1.0f;
++    d.motion_scale_y = _mvScaleY[fIndex] != 0.0f ? _mvScaleY[fIndex] : 1.0f;
++    d.delta_time = _ftDelta[fIndex] > 0.0 ? (float) (_ftDelta[fIndex] / 1000.0) : 0.0f; // m4r takes seconds
++    d.near_plane = _cameraNear[fIndex];
++    d.far_plane = _cameraFar[fIndex];
++    d.depth_reversed = IsInvertedDepth() ? 1 : 0;
++    d.reset = (_needReset || _reset[fIndex] != 0) ? 1 : 0;
++
++    // 1. the finished frame in; the generated frame replaces the backbuffer contents
++    int generated = -1;
++    {
++        auto list = BeginList();
++        if (list == nullptr)
++            return false;
++
++        VkCommandBuffer cb = VK_NULL_HANDLE;
++        if (SUCCEEDED(_interop->BeginVkCommandBufferInterop(list, &cb)) && cb != VK_NULL_HANDLE)
++        {
++            generated = m4r.framegenCapture(_ctx, cb, &d);
++            _interop->EndVkCommandBufferInterop(list);
++        }
++        else
++        {
++            LOG_ERROR("MetalFX FG: BeginVkCommandBufferInterop failed");
++        }
++        Submit(list);
++    }
++
++    if (generated < 0)
++    {
++        LOG_ERROR("MetalFX FG: {} (prepare the plan with m4r's install script for {}x{} / {}x{})",
++                  m4r.lastError(_ctx), d.backbuffer.width, d.backbuffer.height, d.depth.width, d.depth.height);
++        _failedKey = key;
++        _needReset = true;
++        return false;
++    }
++
++    _needReset = false;
++    if (generated == 0)
++        return false;
++
++    // 2. present the generated frame the way the game presents
++    UINT sync = state.fgPresentSyncInterval;
++    UINT flags = state.fgPresentFlags;
++    if (auto config = Config::Instance(); config->ForceVsync.has_value())
++    {
++        if (!config->ForceVsync.value())
++        {
++            sync = 0;
++            if (state.SCAllowTearing && !state.realExclusiveFullscreen)
++                flags |= DXGI_PRESENT_ALLOW_TEARING;
++        }
++        else
++        {
++            sync = std::max<UINT>(config->VsyncInterval.value_or_default(), 1);
++            flags &= ~DXGI_PRESENT_ALLOW_TEARING;
++        }
++    }
++
++    const double presentStart = Util::MillisecondsNow();
++    const HRESULT hr = _real->Present(sync, flags & DXGI_PRESENT_ALLOW_TEARING);
++    if (FAILED(hr))
++        LOG_ERROR("MetalFX FG: present of the generated frame failed: {:X}", (UINT) hr);
++
++    // 3. the real frame into the next backbuffer, which the caller presents
++    ComPtr<ID3D12Resource> next;
++    if (SUCCEEDED(_real->GetBuffer(_real->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&next))))
++    {
++        const m4r_image im = M4RD3D12::Image(_interop, next.Get(), D3D12_RESOURCE_STATE_PRESENT);
++        if (auto list = BeginList())
++        {
++            VkCommandBuffer cb = VK_NULL_HANDLE;
++            if (SUCCEEDED(_interop->BeginVkCommandBufferInterop(list, &cb)) && cb != VK_NULL_HANDLE)
++            {
++                if (m4r.framegenRestore(_ctx, cb, &im) != 0)
++                    LOG_ERROR("MetalFX FG: {}", m4r.lastError(_ctx));
++                _interop->EndVkCommandBufferInterop(list);
++            }
++            Submit(list);
++        }
++    }
++
++    // 4. pacing
++    if (sync == 0)
++        Pace(Util::MillisecondsNow() - presentStart);
++
++    return false;
++}
++
++bool MetalFXFG_Dx12::SetResource(Dx12Resource* inputResource)
++{
++    if (inputResource == nullptr || inputResource->resource == nullptr)
++        return false;
++
++    auto type = inputResource->type;
++
++    // Only the depth and the motion vectors are used; the frame itself comes from the backbuffer
++    if (type != FG_ResourceType::Depth && type != FG_ResourceType::Velocity)
++        return false;
++
++    auto fIndex = inputResource->frameIndex < 0 ? GetIndex() : inputResource->frameIndex;
++
++    std::unique_lock<std::shared_mutex> lock(_resourceMutex[fIndex]);
++
++    // Making a copy if it's just valid now to be able to use it at present
++    if (IsActive() && inputResource->validity == FG_ResourceValidity::ValidNow)
++        inputResource->validity = FG_ResourceValidity::ValidButMakeCopy;
++
++    auto fResource = &_frameResources[fIndex][type];
++    fResource->type = type;
++    fResource->state = inputResource->state;
++    fResource->validity = inputResource->validity;
++    fResource->resource = inputResource->resource;
++    fResource->cmdList = inputResource->cmdList;
++
++    fResource->top = inputResource->top;
++    fResource->left = inputResource->left;
++    fResource->width = inputResource->width;
++    fResource->height = inputResource->height;
++
++    if (inputResource->cmdList != nullptr && fResource->validity == FG_ResourceValidity::ValidButMakeCopy)
++    {
++        LOG_DEBUG("Making a resource copy of: {}", magic_enum::enum_name(type));
++
++        ID3D12Resource* copyOutput = nullptr;
++
++        if (_resourceCopy[fIndex].contains(type))
++            copyOutput = _resourceCopy[fIndex][type];
++
++        if (!CopyResource(inputResource->cmdList, inputResource->resource, &copyOutput, inputResource->state))
++        {
++            LOG_ERROR("{}, CopyResource error!", magic_enum::enum_name(type));
++            return false;
++        }
++
++        _resourceCopy[fIndex][type] = copyOutput;
++        _resourceCopy[fIndex][type]->SetName(std::format(L"_resourceCopy[{}][{}]", fIndex, (UINT) type).c_str());
++        fResource->copy = copyOutput;
++        fResource->state = D3D12_RESOURCE_STATE_COPY_DEST;
++
++        fResource->validity = FG_ResourceValidity::UntilPresent;
++    }
++
++    SetResourceReady(type, fIndex);
++    return true;
++}
++
++void MetalFXFG_Dx12::SetCommandQueue(FG_ResourceType type, ID3D12CommandQueue* queue) { _gameCommandQueue = queue; }
+diff --git a/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.h b/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.h
+new file mode 100644
+index 0000000..c064c9e
+--- /dev/null
++++ b/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.h
+@@ -0,0 +1,68 @@
++#pragma once
++// MetalFX frame interpolation (Apple's FrameGenImpl kernels run by m4r) as an OptiScaler FG output for D3D12 games
++// under vkd3d-proton. At each present the finished frame is captured; once the previous frame is known, the generated
++// in-between frame is presented first, then the real frame.
++// SPDX-License-Identifier: GPL-3.0-only
++#include <framegen/IFGFeature_Dx12.h>
++#include <upscalers/metalfx/M4R_D3D12.h>
++
++class MetalFXFG_Dx12 : public virtual IFGFeature_Dx12
++{
++  private:
++    static constexpr UINT Slots = 8; // command lists in flight (two per presented frame)
++
++    IDXGISwapChain3* _real = nullptr; // the swapchain under OptiScaler's wrapper, not owned: presenting it skips the FG hooks
++    ID3D12DXVKInteropDevice1* _interop = nullptr;
++    m4r_context* _ctx = nullptr;
++    bool _ctxFailed = false;
++    bool _needReset = true;      // the next captured frame has no usable predecessor
++    UINT64 _failedKey = 0;       // sizes of the last failed capture, retried when they change
++    bool _warnedMV = false;
++
++    ID3D12CommandAllocator* _alloc[Slots] {};
++    ID3D12GraphicsCommandList* _list[Slots] {};
++    UINT64 _slotFence[Slots] {};
++    ID3D12Fence* _fence = nullptr;
++    HANDLE _fenceEvent = nullptr;
++    UINT64 _fenceValue = 0;
++    UINT _slot = 0;
++    UINT _cur = 0;
++
++    ID3D12GraphicsCommandList* BeginList();
++    bool Submit(ID3D12GraphicsCommandList* list);
++    void WaitIdle();
++    void SetReal(IDXGISwapChain* swapchain);
++    void Pace(double sinceMs);
++
++  protected:
++    void ReleaseObjects() override final;
++    void CreateObjects(ID3D12Device* InDevice) override final;
++
++  public:
++    const char* Name() override final { return "MetalFX FG"; };
++    feature_version Version() override final { return { 1, 0, 0 }; };
++    HWND Hwnd() override final { return _hwnd; };
++
++    bool CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, DXGI_SWAP_CHAIN_DESC* desc,
++                                 IDXGISwapChain** swapChain) override final;
++    bool CreateSwapchain1Internal(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue, HWND hwnd,
++                                  DXGI_SWAP_CHAIN_DESC1* desc, DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
++                                  IDXGISwapChain1** swapChain) override final;
++    bool ReleaseSwapchain(HWND hwnd) override final;
++
++    void CreateContext(ID3D12Device* device, FG_Constants& fgConstants) override final;
++    void Activate() override final;
++    void Deactivate() override final;
++    void DestroyFGContext() override final;
++    bool Shutdown() override final;
++    void EvaluateState(ID3D12Device* device, FG_Constants& fgConstants) override final;
++    bool Present() override final;
++    bool SetResource(Dx12Resource* inputResource) override final;
++    void SetCommandQueue(FG_ResourceType type, ID3D12CommandQueue* queue) override final;
++    void* FrameGenerationContext() override final { return _ctx; }
++    void* SwapchainContext() override final { return nullptr; }
++    bool SetInterpolatedFrameCount(UINT interpolatedFrameCount) override { return interpolatedFrameCount <= 1; };
++
++    MetalFXFG_Dx12() : IFGFeature_Dx12(), IFGFeature() { _framesToInterpolate = 1; }
++    ~MetalFXFG_Dx12() { ReleaseObjects(); }
++};
+diff --git a/OptiScaler/hooks/FG_Hooks.cpp b/OptiScaler/hooks/FG_Hooks.cpp
+index 40e2ef7..c1bdceb 100644
+--- a/OptiScaler/hooks/FG_Hooks.cpp
++++ b/OptiScaler/hooks/FG_Hooks.cpp
+@@ -6,6 +6,7 @@
+ #include <framegen/xefg/XeFG_Dx12.h>
+ #include <framegen/dlssg/DLSSG_Dx12.h>
+ #include <framegen/reprojection/Reprojection_Dx12.h>
++#include <framegen/metalfx/MetalFXFG_Dx12.h>
+ 
+ #include <inputs/FG/FSR3_Dx12_FG.h>
+ #include <inputs/FG/FfxApi_Dx12_FG.h>
+@@ -117,6 +118,16 @@ static bool CheckForFGStatus()
+         State::Instance().activeFgNvngx = Config::Instance()->FGNvngxReplacement.value_or_default();
+     }
+ 
++    else if (State::Instance().activeFgOutput == FGOutput::MetalFX && M4RProxy::Get().framegenCapture == nullptr)
++    {
++        ImGui::InsertNotification(
++            { ImGuiToastType::Error, 20000, "Can't init MetalFX FG\nIs m4r\\m4r.dll missing or too old?" });
++
++        LOG_DEBUG("Can't load m4r, disabling FGOutput");
++        Config::Instance()->FGOutput.set_volatile_value(FGOutput::NoFG);
++        State::Instance().activeFgOutput = Config::Instance()->FGOutput.value_or_default();
++    }
++
+     if (State::Instance().activeFgOutput == FGOutput::NoFG)
+     {
+         LOG_WARN("FGOutput doesn't have any FG active");
+@@ -162,6 +173,10 @@ HRESULT FGHooks::CreateSwapChain(IDXGIFactory* pFactory, IUnknown* pDevice, DXGI
+         {
+             State::Instance().currentFG = new Reprojection_Dx12();
+         }
++        else if (State::Instance().activeFgOutput == FGOutput::MetalFX)
++        {
++            State::Instance().currentFG = new MetalFXFG_Dx12();
++        }
+     }
+ 
+     // Create FG swapchain
+@@ -272,6 +287,10 @@ HRESULT FGHooks::CreateSwapChainForHwnd(IDXGIFactory* pFactory, IUnknown* pDevic
+         {
+             State::Instance().currentFG = new Reprojection_Dx12();
+         }
++        else if (State::Instance().activeFgOutput == FGOutput::MetalFX)
++        {
++            State::Instance().currentFG = new MetalFXFG_Dx12();
++        }
+     }
+ 
+     // Create FG swapchain
+@@ -1288,6 +1307,8 @@ HRESULT FGHooks::FGPresent(IDXGISwapChain* This, UINT SyncInterval, UINT Flags,
+         else if (state.activeFgInput == FGInput::FSRFG30)
+             FSR3FG::ffxPresentCallback();
+ 
++        state.fgPresentSyncInterval = SyncInterval;
++        state.fgPresentFlags = Flags;
+         fg->Present();
+     }
+     else if (willPresent && fg != nullptr)
+diff --git a/OptiScaler/menu/menu_common.cpp b/OptiScaler/menu/menu_common.cpp
+index 8794bcb..074e460 100644
+--- a/OptiScaler/menu/menu_common.cpp
++++ b/OptiScaler/menu/menu_common.cpp
+@@ -3694,6 +3694,7 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
+         { FGOutput::DLSSG, "DLSSG", "DLSSG output\nCan be used in conjuction with Nukem's for example" },
+         { FGOutput::XeFG, "XeFG", "XeFG - heaviest, but best universal FG\n\nXeFG 3 overall deals best with HUD\n\nEnable UI Composition if HUD ghosting" },
+         { FGOutput::Reprojection, "Reprojection (WIP)", "Reprojects the game image using new mouse data\nKinda like Reflex 2, perceived latency improvement\n\n- REQUIRES DLSSG VIA STREAMLINE AS INPUT\n- Only works with first person perspective games\n- Only mouse, no controller\n- If possible, disable any mouse/camera smoothing in the game\n" },
++        { FGOutput::MetalFX, "MetalFX FG", "Apple's MetalFX frame interpolation, run by m4r (m4r\\m4r.dll)\n\n- Interpolates the finished frame, HUD included\n- Needs depth and motion vectors (OptiFG with the Upscaler input)\n- Needs a plan for the swapchain and render size in m4r\\plans\n- Runs on D3D12 games under vkd3d-proton\n" },
+     };
+ 
+     // clang-format on
+@@ -3955,8 +3956,20 @@ void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
+         }
+ 
+         auto fgOutput = state.CurrentFG();
+-        if ((state.activeFgOutput != FGOutput::Reprojection && state.activeFgOutput != FGOutput::NoFG &&
+-             state.activeFgInput != FGInput::NoFG && state.activeFgInput != FGInput::NvngxFG) &&
++        if (state.activeFgOutput == FGOutput::MetalFX && fgOutput)
++        {
++            if (bool pacing = config->MetalFXFGPacing.value_or_default();
++                ImGui::Checkbox("Pace generated frames", &pacing))
++            {
++                config->MetalFXFGPacing = pacing;
++            }
++            ShowTooltip("Without V-Sync the generated and the real frame would be shown back to back.\n"
++                        "This holds the real frame back by half a frame time.");
++        }
++
++        if ((state.activeFgOutput != FGOutput::Reprojection && state.activeFgOutput != FGOutput::MetalFX &&
++             state.activeFgOutput != FGOutput::NoFG && state.activeFgInput != FGInput::NoFG &&
++             state.activeFgInput != FGInput::NvngxFG) &&
+             fgOutput)
+         {
+             ImGui::Checkbox("Show Detected UI", &state.fgHudlessCompare);
+diff --git a/OptiScaler/upscalers/metalfx/M4R_Proxy.h b/OptiScaler/upscalers/metalfx/M4R_Proxy.h
+index 92ac838..e86ccb8 100644
+--- a/OptiScaler/upscalers/metalfx/M4R_Proxy.h
++++ b/OptiScaler/upscalers/metalfx/M4R_Proxy.h
+@@ -15,6 +15,8 @@ class M4RProxy
+     using PFN_interpolate_init = decltype(&m4r_interpolate_init);
+     using PFN_interpolate = decltype(&m4r_interpolate);
+     using PFN_last_error = decltype(&m4r_last_error);
++    using PFN_framegen_capture = decltype(&m4r_framegen_capture);
++    using PFN_framegen_restore = decltype(&m4r_framegen_restore);
+ 
+     struct Table
+     {
+@@ -26,6 +28,8 @@ class M4RProxy
+         PFN_interpolate_init interpolateInit = nullptr;
+         PFN_interpolate interpolate = nullptr;
+         PFN_last_error lastError = nullptr;
++        PFN_framegen_capture framegenCapture = nullptr;
++        PFN_framegen_restore framegenRestore = nullptr;
+     };
+ 
+     static std::filesystem::path Dir() { return Util::DllPath().parent_path() / L"m4r"; }
+@@ -54,6 +58,8 @@ class M4RProxy
+         t.interpolateInit = (PFN_interpolate_init) GetProcAddress(t.module, "m4r_interpolate_init");
+         t.interpolate = (PFN_interpolate) GetProcAddress(t.module, "m4r_interpolate");
+         t.lastError = (PFN_last_error) GetProcAddress(t.module, "m4r_last_error");
++        t.framegenCapture = (PFN_framegen_capture) GetProcAddress(t.module, "m4r_framegen_capture");
++        t.framegenRestore = (PFN_framegen_restore) GetProcAddress(t.module, "m4r_framegen_restore");
+         if (!t.create || !t.upscale || !t.lastError)
+         {
+             LOG_ERROR("MetalFX: m4r.dll is missing exports");

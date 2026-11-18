@@ -1,0 +1,41 @@
+# Builds OptiScaler (external/optiscaler at fd3a45a, patches/optiscaler and clang-cl.patch applied by scripts/apply_optiscaler_patches.sh) on Linux
+# with clang-cl and xwin. Sources, include paths and libraries come from OptiScaler.vcxproj (Release|x64).
+cmake_minimum_required(VERSION 3.20)
+project(optiscaler_m4r CXX C RC)
+set(OPTI_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../external/optiscaler CACHE PATH "OptiScaler checkout")
+set(PROJ ${OPTI_ROOT}/OptiScaler)
+execute_process(COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/vcxproj.py ${PROJ}/OptiScaler.vcxproj
+                OUTPUT_VARIABLE VCX OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+string(REPLACE "\n" ";" VCX_LINES "${VCX}")
+foreach(line ${VCX_LINES})
+  if(line MATCHES "^SRC (.*)$")
+    list(APPEND SRCS ${PROJ}/${CMAKE_MATCH_1})
+  elseif(line MATCHES "^INC (.*)$")
+    list(APPEND INCS ${CMAKE_MATCH_1})
+  elseif(line MATCHES "^LIB (.*)$")
+    list(APPEND LIBS ${CMAKE_MATCH_1})
+  elseif(line MATCHES "^LIBDIR (.*)$")
+    list(APPEND LIBDIRS ${CMAKE_MATCH_1})
+  elseif(line MATCHES "^DEF (.*)$")
+    list(APPEND DEFS ${CMAKE_MATCH_1})
+  endif()
+endforeach()
+# Visual Studio pre-build steps and Windows-only file encodings, done here instead
+list(FILTER SRCS EXCLUDE REGEX "imgui_impl_uwp\\.cpp$")
+string(TIMESTAMP BUILD_DATE "%Y%m%d_%H%M%S")
+file(WRITE ${PROJ}/resource_build_date.h "#define VER_BUILD_DATE \"${BUILD_DATE}\"\n")
+file(WRITE ${PROJ}/resource_build_commit.h "#define VER_BUILD_COMMIT \"m4r\"\n")
+execute_process(COMMAND iconv -f UTF-16 -t UTF-8 ${PROJ}/OptiScaler.rc OUTPUT_FILE ${CMAKE_BINARY_DIR}/OptiScaler.rc)
+execute_process(COMMAND python3 -c "import sys;p=sys.argv[1];d=open(p,'rb').read();open(p,'wb').write(d[3:] if d[:3]==bytes([0xef,0xbb,0xbf]) else d)" ${CMAKE_BINARY_DIR}/OptiScaler.rc)
+# OptiScaler.rc only holds version info, which llvm-rc cannot expand; the DLL works without it
+add_library(OptiScaler SHARED ${SRCS} ${CMAKE_CURRENT_SOURCE_DIR}/uwp_stub.cpp)
+set_source_files_properties(${CMAKE_BINARY_DIR}/OptiScaler.rc PROPERTIES INCLUDE_DIRECTORIES "${PROJ}")
+target_include_directories(OptiScaler PRIVATE ${INCS})
+target_compile_definitions(OptiScaler PRIVATE ${DEFS} NDEBUG _WINDOWS _USRDLL _UNICODE UNICODE WIN32_LEAN_AND_MEAN NOMINMAX
+                           _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR VK_ENABLE_BETA_EXTENSIONS)
+target_compile_options(OptiScaler PRIVATE /std:c++latest /MD /O2 /Z7 /Zc:__cplusplus /bigobj /permissive
+                       -Wno-everything -fms-extensions)
+target_link_directories(OptiScaler PRIVATE ${LIBDIRS})
+target_link_libraries(OptiScaler PRIVATE ${LIBS})
+target_link_options(OptiScaler PRIVATE /DEF:${PROJ}/Source.def /DEBUG)
+set_target_properties(OptiScaler PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreadedDLL)

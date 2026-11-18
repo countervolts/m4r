@@ -1,0 +1,599 @@
+diff --git a/OptiScaler.ini b/OptiScaler.ini
+index 9d04443..d4c54e1 100644
+--- a/OptiScaler.ini
++++ b/OptiScaler.ini
+@@ -6,7 +6,7 @@
+ Dx11Upscaler=auto
+ 
+ ; Select Upscaler for Dx12 games
+-; xess, fsr21, fsr22, ffx (FSR 2.3; 3.1; 4.x), dlss
++; xess, fsr21, fsr22, ffx (FSR 2.3; 3.1; 4.x), dlss, metalfx (Apple MetalFX through m4r, needs m4r\m4r.dll)
+ ; Default (auto) is DLSS when capable gpu, FSR4 when capable gpu, XeSS otherwise
+ Dx12Upscaler=auto
+ 
+@@ -1330,6 +1330,14 @@ StaticPosY=auto
+ 
+ 
+ 
++; -------------------------------------------------------
++[MetalFX]
++; -------------------------------------------------------
++; Apple MetalFX through m4r (github.com/countervolts/m4r): Dx12Upscaler=metalfx, FGOutput=metalfx
++; Negates the jitter before it is given to the network; leave off, m4r already handles the NGX sign
++; true or false - Default (auto) is false
++FlipJitter=auto
++
+ ; -------------------------------------------------------
+ [Log]
+ ; -------------------------------------------------------
+diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
+index 224f357..0d52635 100644
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -244,6 +244,11 @@ bool Config::Reload(std::filesystem::path iniPath)
+             ReprojectionThirdPersonDetection.set_from_config(readBool("Reprojection", "ThirdPersonDetection"));
+         }
+ 
++        // MetalFX (m4r)
++        {
++            MetalFXFlipJitter.set_from_config(readBool("MetalFX", "FlipJitter"));
++        }
++
+         // FSR FG Inputs
+         {
+             FSRFGSkipConfigForHudless.set_from_config(readBool("FSRFGInputs", "SkipConfigForHudless"));
+@@ -1065,6 +1070,11 @@ bool Config::SaveIni()
+                      GetBoolValue(Instance()->ReprojectionThirdPersonDetection.value_for_config()).c_str());
+     }
+ 
++    // MetalFX (m4r)
++    {
++        ini.SetValue("MetalFX", "FlipJitter", GetBoolValue(Instance()->MetalFXFlipJitter.value_for_config()).c_str());
++    }
++
+     // OptiFG
+     {
+         ini.SetValue("OptiFG", "DisableHUDFix", GetBoolValue(Instance()->FGDisableHUDFix.value_for_config()).c_str());
+diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
+index 87072db..900da40 100644
+--- a/OptiScaler/Config.h
++++ b/OptiScaler/Config.h
+@@ -261,6 +261,9 @@ class Config
+     CustomOptional<bool, NoDefault> DisableReactiveMask;
+     CustomOptional<float> DlssReactiveMaskBias { 0.45f };
+ 
++    // MetalFX (m4r)
++    CustomOptional<bool> MetalFXFlipJitter { false };
++
+     // Logging
+     CustomOptional<bool> LogToFile { false };
+     CustomOptional<bool> LogToConsole { false };
+diff --git a/OptiScaler/OptiScaler.vcxproj b/OptiScaler/OptiScaler.vcxproj
+index 8dfeda6..510c4d9 100644
+--- a/OptiScaler/OptiScaler.vcxproj
++++ b/OptiScaler/OptiScaler.vcxproj
+@@ -820,6 +820,7 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
+     <ClCompile Include="upscalers\xess\XeSSFeature_Dx11.cpp" />
+     <ClCompile Include="upscalers\xess\XeSSFeature_Dx11on12.cpp" />
+     <ClCompile Include="upscalers\xess\XeSSFeature_Dx12.cpp" />
++    <ClCompile Include="upscalers\metalfx\MetalFXFeature_Dx12.cpp" />
+     <ClInclude Include="upscalers\xess\XeSSFeature_Dx12.h" />
+     <ClCompile Include="scanner\rtti.cpp" />
+     <ClCompile Include="scanner\scanner.cpp" />
+diff --git a/OptiScaler/OptiTypes.cpp b/OptiScaler/OptiTypes.cpp
+index 379e947..411a147 100644
+--- a/OptiScaler/OptiTypes.cpp
++++ b/OptiScaler/OptiTypes.cpp
+@@ -81,6 +81,9 @@ std::string UpscalerDisplayName(Upscaler upscaler, API api)
+ 
+     case Upscaler::DLSSD:
+         return "DLSSD";
++
++    case Upscaler::MetalFX:
++        return "MetalFX";
+     }
+ 
+     return "????";
+@@ -120,6 +123,9 @@ std::string UpscalerShortName(Upscaler upscaler)
+ 
+     case Upscaler::DLSSD:
+         return "DLSSD";
++
++    case Upscaler::MetalFX:
++        return "MetalFX";
+     }
+ 
+     return "????";
+@@ -154,6 +160,8 @@ std::string UpscalerToCode(Upscaler upscaler)
+         return "dlssd";
+     case Upscaler::FSR31: // DX11 only
+         return "fsr31";
++    case Upscaler::MetalFX:
++        return "metalfx";
+     default: // Upscaler::Reset and unknown
+         return "";
+     }
+@@ -170,6 +178,7 @@ Upscaler CodeToUpscaler(const std::string& code)
+         { "dlss", Upscaler::DLSS },         { "dlss_12", Upscaler::DLSS_on12 },
+         { "dlssd", Upscaler::DLSSD },       { "fsr31", Upscaler::FSR31 },
+         { "fsr31_12", Upscaler::FFX_on12 }, // for compat reasons
++        { "metalfx", Upscaler::MetalFX },
+     };
+ 
+     auto it = mapping.find(code);
+diff --git a/OptiScaler/OptiTypes.h b/OptiScaler/OptiTypes.h
+index e2f1023..47bab6b 100644
+--- a/OptiScaler/OptiTypes.h
++++ b/OptiScaler/OptiTypes.h
+@@ -67,6 +67,9 @@ enum class Upscaler
+     DLSS_on12, // DX12 dlss using interops
+ 
+     DLSSD, // "dlssd", used for the DLSS-D/Ray Reconstruction upscaler+denoiser backend
++
++    MetalFX, // "metalfx", Apple MetalFX ML temporal scaler via m4r (AMD RDNA3 under vkd3d-proton)
++
+     Reset
+ };
+ 
+diff --git a/OptiScaler/menu/menu_common.cpp b/OptiScaler/menu/menu_common.cpp
+index 06f49c1..8794bcb 100644
+--- a/OptiScaler/menu/menu_common.cpp
++++ b/OptiScaler/menu/menu_common.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include <framegen/nvngx/Nvngx_FG.h>
+ #include <framegen/reprojection/Reprojection_Dx12.h>
++#include <upscalers/metalfx/M4R_Proxy.h>
+ 
+ #include <nvapi/fakenvapi.h>
+ #include <hooks/Reflex_Hooks.h>
+@@ -798,6 +799,10 @@ void MenuCommon::RenderUpscalerCombo(const API api, Upscaler currentUpscaler, co
+         if ((opt == Upscaler::DLSS || opt == Upscaler::DLSS_on12) && !primaryGpu.dlssCapable)
+             continue;
+ 
++        // MetalFX needs m4r (m4r\m4r.dll next to OptiScaler)
++        if (opt == Upscaler::MetalFX && M4RProxy::Get().module == nullptr)
++            continue;
++
+         // Not all Intel GPUs support native DX11 XeSS but don't think we have a good way to check exactly
+         if (opt == Upscaler::XeSS && api == API::DX11 && primaryGpu.vendorId != VendorId::Intel)
+             continue;
+@@ -896,7 +901,8 @@ void MenuCommon::AddDx11Backends(Upscaler upscaler)
+ void MenuCommon::AddDx12Backends(Upscaler upscaler)
+ {
+     RenderUpscalerCombo(API::DX12, upscaler,
+-                        { Upscaler::XeSS, Upscaler::FSR21, Upscaler::FSR22, Upscaler::FFX, Upscaler::DLSS });
++                        { Upscaler::XeSS, Upscaler::FSR21, Upscaler::FSR22, Upscaler::FFX, Upscaler::DLSS,
++                          Upscaler::MetalFX });
+ }
+ 
+ void MenuCommon::AddVulkanBackends(Upscaler upscaler)
+diff --git a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
+index d738498..408173c 100644
+--- a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
++++ b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
+@@ -1,5 +1,6 @@
+ #include "pch.h"
+ #include "FeatureProvider_Dx12.h"
++#include "upscalers/metalfx/MetalFXFeature_Dx12.h"
+ 
+ #include "Util.h"
+ #include "Config.h"
+@@ -29,6 +30,10 @@ bool FeatureProvider_Dx12::GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NG
+         *feature = std::make_unique<XeSSFeatureDx12>(handleId, parameters);
+         break;
+ 
++    case Upscaler::MetalFX:
++        *feature = std::make_unique<MetalFXFeatureDx12>(handleId, parameters);
++        break;
++
+     case Upscaler::FSR21:
+         *feature = std::make_unique<FSR2FeatureDx12_212>(handleId, parameters);
+         break;
+diff --git a/OptiScaler/upscalers/metalfx/M4R_D3D12.h b/OptiScaler/upscalers/metalfx/M4R_D3D12.h
+new file mode 100644
+index 0000000..a472f42
+--- /dev/null
++++ b/OptiScaler/upscalers/metalfx/M4R_D3D12.h
+@@ -0,0 +1,69 @@
++#pragma once
++// m4r on a vkd3d-proton D3D12 device: context creation and D3D12 resource -> Vulkan image description.
++// SPDX-License-Identifier: GPL-3.0-only
++#include "M4R_Proxy.h"
++#include "VkD3D_Interop.h"
++
++namespace M4RD3D12
++{
++inline PFN_vkGetInstanceProcAddr VulkanLoader()
++{
++    HMODULE vk = GetModuleHandleW(L"vulkan-1.dll");
++    if (vk == nullptr)
++        vk = LoadLibraryW(L"vulkan-1.dll");
++    return vk ? (PFN_vkGetInstanceProcAddr) GetProcAddress(vk, "vkGetInstanceProcAddr") : nullptr;
++}
++
++// m4r context on the game's Vulkan device; *interop receives a reference the caller releases
++inline m4r_context* Create(ID3D12Device* device, ID3D12DXVKInteropDevice1** interop)
++{
++    auto& m4r = M4RProxy::Get();
++    *interop = nullptr;
++    if (m4r.module == nullptr || device == nullptr)
++        return nullptr;
++    if (FAILED(device->QueryInterface(__uuidof(ID3D12DXVKInteropDevice1), (void**) interop)) || *interop == nullptr)
++    {
++        LOG_ERROR("MetalFX: needs vkd3d-proton (ID3D12DXVKInteropDevice1 unavailable)");
++        return nullptr;
++    }
++    VkInstance instance = VK_NULL_HANDLE;
++    VkPhysicalDevice physical = VK_NULL_HANDLE;
++    VkDevice vkDevice = VK_NULL_HANDLE;
++    auto gipa = VulkanLoader();
++    if (gipa == nullptr || FAILED((*interop)->GetVulkanHandles(&instance, &physical, &vkDevice)))
++    {
++        LOG_ERROR("MetalFX: no Vulkan handles from vkd3d-proton");
++        return nullptr;
++    }
++    auto plans = wstring_to_string(M4RProxy::Dir().wstring()) + "\\plans";
++    m4r_context* ctx = nullptr;
++    if (m4r.create(&ctx, gipa, instance, physical, vkDevice, 0, plans.c_str()) != 0)
++    {
++        LOG_ERROR("MetalFX: m4r_create: {}", m4r.lastError(ctx));
++        m4r.destroy(ctx);
++        return nullptr;
++    }
++    return ctx;
++}
++
++// the Vulkan image behind a D3D12 resource and its layout in the given D3D12 state
++inline m4r_image Image(ID3D12DXVKInteropDevice1* interop, ID3D12Resource* res, D3D12_RESOURCE_STATES state)
++{
++    m4r_image im {};
++    if (res == nullptr || interop == nullptr)
++        return im;
++    UINT64 handle = 0, offset = 0;
++    VkFormat format = VK_FORMAT_UNDEFINED;
++    if (FAILED(interop->GetVulkanResourceInfo1(res, &handle, &offset, &format)) || handle == 0)
++        return im;
++    auto desc = res->GetDesc();
++    im.image = (VkImage) handle;
++    im.format = format;
++    im.width = (uint32_t) desc.Width;
++    im.height = desc.Height;
++    VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
++    interop->GetVulkanImageLayout(res, state, &layout);
++    im.layout = layout;
++    return im;
++}
++} // namespace M4RD3D12
+diff --git a/OptiScaler/upscalers/metalfx/M4R_Proxy.h b/OptiScaler/upscalers/metalfx/M4R_Proxy.h
+new file mode 100644
+index 0000000..92ac838
+--- /dev/null
++++ b/OptiScaler/upscalers/metalfx/M4R_Proxy.h
+@@ -0,0 +1,64 @@
++#pragma once
++// m4r (MetalFX on AMD, github.com/countervolts/m4r): loads m4r\m4r.dll from OptiScaler's folder.
++// SPDX-License-Identifier: GPL-3.0-only
++#include <pch.h>
++#include <Util.h>
++#include "m4r.h"
++
++class M4RProxy
++{
++  public:
++    using PFN_create = decltype(&m4r_create);
++    using PFN_destroy = decltype(&m4r_destroy);
++    using PFN_upscale_init = decltype(&m4r_upscale_init);
++    using PFN_upscale = decltype(&m4r_upscale);
++    using PFN_interpolate_init = decltype(&m4r_interpolate_init);
++    using PFN_interpolate = decltype(&m4r_interpolate);
++    using PFN_last_error = decltype(&m4r_last_error);
++
++    struct Table
++    {
++        HMODULE module = nullptr;
++        PFN_create create = nullptr;
++        PFN_destroy destroy = nullptr;
++        PFN_upscale_init upscaleInit = nullptr;
++        PFN_upscale upscale = nullptr;
++        PFN_interpolate_init interpolateInit = nullptr;
++        PFN_interpolate interpolate = nullptr;
++        PFN_last_error lastError = nullptr;
++    };
++
++    static std::filesystem::path Dir() { return Util::DllPath().parent_path() / L"m4r"; }
++
++    static Table& Get()
++    {
++        static Table t = Load();
++        return t;
++    }
++
++  private:
++    static Table Load()
++    {
++        Table t;
++        auto path = Dir() / L"m4r.dll";
++        t.module = LoadLibraryW(path.c_str());
++        if (t.module == nullptr)
++        {
++            LOG_ERROR("MetalFX: can't load {}", wstring_to_string(path.wstring()));
++            return t;
++        }
++        t.create = (PFN_create) GetProcAddress(t.module, "m4r_create");
++        t.destroy = (PFN_destroy) GetProcAddress(t.module, "m4r_destroy");
++        t.upscaleInit = (PFN_upscale_init) GetProcAddress(t.module, "m4r_upscale_init");
++        t.upscale = (PFN_upscale) GetProcAddress(t.module, "m4r_upscale");
++        t.interpolateInit = (PFN_interpolate_init) GetProcAddress(t.module, "m4r_interpolate_init");
++        t.interpolate = (PFN_interpolate) GetProcAddress(t.module, "m4r_interpolate");
++        t.lastError = (PFN_last_error) GetProcAddress(t.module, "m4r_last_error");
++        if (!t.create || !t.upscale || !t.lastError)
++        {
++            LOG_ERROR("MetalFX: m4r.dll is missing exports");
++            t.module = nullptr;
++        }
++        return t;
++    }
++};
+diff --git a/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.cpp b/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.cpp
+new file mode 100644
+index 0000000..b821acc
+--- /dev/null
++++ b/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.cpp
+@@ -0,0 +1,112 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#include <pch.h>
++#include "MetalFXFeature_Dx12.h"
++#include <Config.h>
++#include <State.h>
++
++bool MetalFXFeatureDx12::InitInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters)
++{
++    LOG_FUNC();
++    if (IsInited())
++        return true;
++    auto& m4r = M4RProxy::Get();
++    _ctx = M4RD3D12::Create(Device, &_interop);
++    if (_ctx == nullptr)
++        return false;
++    if (m4r.upscaleInit(_ctx, DisplayWidth(), DisplayHeight(), RenderWidth(), RenderHeight()) != 0)
++    {
++        LOG_ERROR("MetalFX: {} (prepare it with m4r's install script for {}x{} -> {}x{})", m4r.lastError(_ctx),
++                  RenderWidth(), RenderHeight(), DisplayWidth(), DisplayHeight());
++        return false;
++    }
++    LOG_INFO("MetalFX: ready, {}x{} -> {}x{}", RenderWidth(), RenderHeight(), DisplayWidth(), DisplayHeight());
++    SetInit(true);
++    return true;
++}
++
++m4r_image MetalFXFeatureDx12::Image(ID3D12Resource* res, D3D12_RESOURCE_STATES state)
++{
++    return M4RD3D12::Image(_interop, res, state);
++}
++
++template <class T> static T* GetResource(NVSDK_NGX_Parameter* p, const char* name)
++{
++    T* r = nullptr;
++    if (p->Get(name, &r) != NVSDK_NGX_Result_Success)
++        p->Get(name, (void**) &r);
++    return r;
++}
++
++bool MetalFXFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters)
++{
++    LOG_FUNC();
++    if (!IsInited() || _ctx == nullptr)
++        return false;
++    auto& m4r = M4RProxy::Get();
++    m4r_upscale_desc d {};
++    auto color = GetResource<ID3D12Resource>(InParameters, NVSDK_NGX_Parameter_Color);
++    auto motion = GetResource<ID3D12Resource>(InParameters, NVSDK_NGX_Parameter_MotionVectors);
++    auto depth = GetResource<ID3D12Resource>(InParameters, NVSDK_NGX_Parameter_Depth);
++    auto output = GetResource<ID3D12Resource>(InParameters, NVSDK_NGX_Parameter_Output);
++    auto exposure = AutoExposure() ? nullptr : GetResource<ID3D12Resource>(InParameters, NVSDK_NGX_Parameter_ExposureTexture);
++    if (!color || !motion || !depth || !output)
++    {
++        LOG_ERROR("MetalFX: missing color, motion vectors, depth or output");
++        return false;
++    }
++    if (!LowResMV())
++        LOG_WARN("MetalFX: display-resolution motion vectors are not supported yet");
++    // OptiScaler's evaluation contract: inputs readable by compute, the output an UAV
++    d.color = Image(color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    d.motion = Image(motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    d.depth = Image(depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    d.exposure = Image(exposure, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    d.output = Image(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++    unsigned int rw = 0, rh = 0;
++    GetRenderResolution(InParameters, &rw, &rh);
++    d.content_width = rw;
++    d.content_height = rh;
++    InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &d.jitter_x);
++    InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &d.jitter_y);
++    if (Config::Instance()->MetalFXFlipJitter.value_or(false))
++    {
++        d.jitter_x = -d.jitter_x;
++        d.jitter_y = -d.jitter_y;
++    }
++    if (InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &d.motion_scale_x) != NVSDK_NGX_Result_Success ||
++        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &d.motion_scale_y) != NVSDK_NGX_Result_Success)
++    {
++        d.motion_scale_x = 1.0f;
++        d.motion_scale_y = 1.0f;
++    }
++    if (InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &d.pre_exposure) != NVSDK_NGX_Result_Success)
++        d.pre_exposure = 1.0f;
++    int reset = 0;
++    InParameters->Get(NVSDK_NGX_Parameter_Reset, &reset);
++    d.reset = reset;
++    d.depth_reversed = DepthInverted() ? 1 : 0;
++
++    VkCommandBuffer cb = VK_NULL_HANDLE;
++    if (FAILED(_interop->BeginVkCommandBufferInterop(InCommandList, &cb)) || cb == VK_NULL_HANDLE)
++    {
++        LOG_ERROR("MetalFX: BeginVkCommandBufferInterop failed");
++        return false;
++    }
++    const int r = m4r.upscale(_ctx, cb, &d);
++    _interop->EndVkCommandBufferInterop(InCommandList);
++    if (r != 0)
++    {
++        LOG_ERROR("MetalFX: {}", m4r.lastError(_ctx));
++        return false;
++    }
++    _frameCount++;
++    return true;
++}
++
++MetalFXFeatureDx12::~MetalFXFeatureDx12()
++{
++    if (_ctx)
++        M4RProxy::Get().destroy(_ctx);
++    if (_interop)
++        _interop->Release();
++}
+diff --git a/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h b/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h
+new file mode 100644
+index 0000000..2e539b4
+--- /dev/null
++++ b/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h
+@@ -0,0 +1,31 @@
++#pragma once
++// MetalFX ML temporal upscaler (Apple's BBR network run by m4r on AMD RDNA3) for D3D12 games under vkd3d-proton.
++// SPDX-License-Identifier: GPL-3.0-only
++#include <upscalers/IFeature_Dx12.h>
++#include "M4R_D3D12.h"
++
++class MetalFXFeatureDx12 : public IFeature_Dx12
++{
++  private:
++    m4r_context* _ctx = nullptr;
++    ID3D12DXVKInteropDevice1* _interop = nullptr;
++    m4r_image Image(ID3D12Resource* res, D3D12_RESOURCE_STATES state);
++
++  public:
++    feature_version Version() override { return feature_version { 1, 0, 0 }; }
++    Upscaler GetUpscalerType() const final { return Upscaler::MetalFX; }
++    API Api() const override { return IFeature_Dx12::Api(); }
++    bool IsWithDx12() final { return false; }
++
++    MetalFXFeatureDx12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters)
++        : IFeature(InHandleId, InParameters), IFeature_Dx12(InHandleId, InParameters)
++    {
++        _initParameters = SetInitParameters(InParameters);
++        _moduleLoaded = M4RProxy::Get().module != nullptr;
++    }
++
++    bool InitInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
++    bool EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
++
++    ~MetalFXFeatureDx12();
++};
+diff --git a/OptiScaler/upscalers/metalfx/VkD3D_Interop.h b/OptiScaler/upscalers/metalfx/VkD3D_Interop.h
+new file mode 100644
+index 0000000..41ba7f4
+--- /dev/null
++++ b/OptiScaler/upscalers/metalfx/VkD3D_Interop.h
+@@ -0,0 +1,16 @@
++#pragma once
++// vkd3d-proton's D3D12 <-> Vulkan interop interface (public API of vkd3d-proton, include/vkd3d_device_vkd3d_ext.idl).
++#include <d3d12.h>
++#include <vulkan/vulkan_core.h>
++
++#include <misc/IdentifyGpu.h>   // declares ID3D12DXVKInteropDevice
++
++MIDL_INTERFACE("902d8115-59eb-4406-9518-fe00f991ee65")
++ID3D12DXVKInteropDevice1 : public ID3D12DXVKInteropDevice
++{
++    virtual HRESULT STDMETHODCALLTYPE GetVulkanResourceInfo1(ID3D12Resource* resource, UINT64* handle, UINT64* offset, VkFormat* format) = 0;
++    virtual HRESULT STDMETHODCALLTYPE CreateInteropCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, UINT32 family, ID3D12CommandQueue** queue) = 0;
++    virtual HRESULT STDMETHODCALLTYPE CreateInteropCommandAllocator(D3D12_COMMAND_LIST_TYPE type, UINT32 family, ID3D12CommandAllocator** allocator) = 0;
++    virtual HRESULT STDMETHODCALLTYPE BeginVkCommandBufferInterop(ID3D12CommandList* list, VkCommandBuffer* buffer) = 0;
++    virtual HRESULT STDMETHODCALLTYPE EndVkCommandBufferInterop(ID3D12CommandList* list) = 0;
++};
+diff --git a/OptiScaler/upscalers/metalfx/m4r.h b/OptiScaler/upscalers/metalfx/m4r.h
+new file mode 100644
+index 0000000..af97683
+--- /dev/null
++++ b/OptiScaler/upscalers/metalfx/m4r.h
+@@ -0,0 +1,79 @@
++/* m4r: MetalFX ML temporal upscaling and frame interpolation for Vulkan callers (OptiScaler backend, harnesses).
++ *
++ * The caller owns the Vulkan device; m4r records its passes into the caller's command buffer. Images are passed as
++ * VkImage + format + size + current layout; m4r transitions them to GENERAL around its passes. Prepared plans (tools/prepare_bbr.py, tools/prepare_fg.py) are read from
++ * <data dir>/bbr-<out w>x<out h>-<in w>x<in h> and <data dir>/fg-<out w>x<out h>-<in w>x<in h>.
++ * SPDX-License-Identifier: GPL-3.0-only */
++#pragma once
++#include <stdint.h>
++#ifndef VK_NO_PROTOTYPES
++#define VK_NO_PROTOTYPES
++#endif
++#include <vulkan/vulkan.h>
++
++#ifdef _WIN32
++#define M4R_API __declspec(dllexport)
++#else
++#define M4R_API __attribute__((visibility("default")))
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct m4r_context m4r_context;
++
++typedef struct m4r_image {
++    VkImage image;          /* VK_NULL_HANDLE = not provided */
++    VkFormat format;
++    uint32_t width, height;
++    VkImageLayout layout;   /* layout at the time the commands run; m4r moves it to GENERAL and back.
++                               VK_IMAGE_LAYOUT_UNDEFINED is treated as GENERAL */
++} m4r_image;
++
++typedef struct m4r_upscale_desc {
++    m4r_image color, depth, motion, exposure, output;
++    uint32_t content_width, content_height;  /* rendered area of color/depth/motion */
++    float jitter_x, jitter_y;                /* sub-pixel offset the frame was rendered with (pixels) */
++    float motion_scale_x, motion_scale_y;    /* converts motion texture values to pixels (previous - current) */
++    float pre_exposure;
++    int reset, depth_reversed;
++} m4r_upscale_desc;
++
++typedef struct m4r_interpolate_desc {
++    m4r_image color, prev_color, depth, motion, output;  /* color/output at output size; depth/motion at input size */
++    float motion_scale_x, motion_scale_y;                /* to input pixels, previous - current */
++    float delta_time, near_plane, far_plane;
++    int depth_reversed, reset;
++} m4r_interpolate_desc;
++
++/* Frame generation at present time. The finished frame (backbuffer, display size) and this frame's render-size depth
++ * and motion vectors go in; m4r keeps a copy of the frame and, once it has the previous one, writes the MetalFX
++ * in-between frame into the backbuffer. */
++typedef struct m4r_framegen_desc {
++    m4r_image backbuffer, depth, motion;
++    float motion_scale_x, motion_scale_y;   /* to render pixels, previous - current */
++    float delta_time, near_plane, far_plane;
++    int depth_reversed, reset;
++} m4r_framegen_desc;
++
++/* get_instance_proc_addr resolves every Vulkan entry point on the caller's instance/device */
++M4R_API int m4r_create(m4r_context** out, PFN_vkGetInstanceProcAddr get_instance_proc_addr, VkInstance instance,
++                       VkPhysicalDevice physical, VkDevice device, uint32_t queue_family, const char* data_dir);
++M4R_API void m4r_destroy(m4r_context* ctx);
++/* 0 on success; a non-zero return means the configuration is not prepared or not supported (see m4r_last_error) */
++M4R_API int m4r_upscale_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t max_in_w, uint32_t max_in_h);
++M4R_API int m4r_upscale(m4r_context* ctx, VkCommandBuffer cb, const m4r_upscale_desc* desc);
++M4R_API int m4r_interpolate_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);
++M4R_API int m4r_interpolate(m4r_context* ctx, VkCommandBuffer cb, const m4r_interpolate_desc* desc);
++/* Returns 1 when the generated frame was written to desc->backbuffer: present it, then call m4r_framegen_restore with
++ * the next backbuffer to put the real frame back. 0 = nothing generated (first frame or reset), the backbuffer is
++ * unchanged. Negative = error (m4r_last_error). Loads the fg plan for the backbuffer and depth sizes on first use. */
++M4R_API int m4r_framegen_capture(m4r_context* ctx, VkCommandBuffer cb, const m4r_framegen_desc* desc);
++/* writes the frame given to the last m4r_framegen_capture into backbuffer */
++M4R_API int m4r_framegen_restore(m4r_context* ctx, VkCommandBuffer cb, const m4r_image* backbuffer);
++M4R_API const char* m4r_last_error(m4r_context* ctx);
++
++#ifdef __cplusplus
++}
++#endif

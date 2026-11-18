@@ -93,8 +93,10 @@ bool Context::adopt(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32
 bool Context::wrap(Texture& t, VkImage image, VkFormat format, uint32_t w, uint32_t h) {
     t = Texture{};
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    const bool isDepth = format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                         format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D16_UNORM || format == VK_FORMAT_X8_D24_UNORM_PACK32;
     vci.image = image; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = format;
-    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vci.subresourceRange = {VkImageAspectFlags(isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
     if (vkCreateImageView(device, &vci, nullptr, &t.view) != VK_SUCCESS) { error = "image view"; return false; }
     t.image = image; t.format = format; t.width = w; t.height = h; t.owned = false;
     return writeRecord(t);

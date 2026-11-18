@@ -2,10 +2,11 @@
 
 want dlss on radeon? check out [d4r](https://github.com/countervolts/d4r)! xess xmx? [x4r](https://github.com/countervolts/x4r)!
 
-m4r runs Apple's **MetalFX** upscaler (the ML temporal scaler, "BBR") and, later, MetalFX frame
-interpolation in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS/FSR/XeSS as usual; a custom
-[OptiScaler](https://github.com/optiscaler/OptiScaler) 10 build offers **MetalFX** in its upscaler menu and hands the
-frame to m4r.
+m4r runs Apple's **MetalFX** upscaler (the ML temporal scaler, "BBR") and MetalFX frame
+interpolation in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS/FSR/XeSS as usual;
+patches for [OptiScaler](https://github.com/optiscaler/OptiScaler) add **MetalFX** to its upscaler menu and **MetalFX FG**
+to its frame generation menu, and hand the frame to m4r ([docs/optiscaler.md](docs/optiscaler.md)). m4r ships the patches,
+not an OptiScaler build.
 
 m4r runs Apple's own kernels and network weights, as d4r does with NVIDIA's and x4r with Intel's: the Metal
 compute kernels in your copy of MetalFX's `default.metallib` are translated from their AIR (LLVM) bitcode to
@@ -23,7 +24,8 @@ is re-trained, approximated or replaced.
 | Apple MXU matrix instructions (`llvm.agx3.igemm/fgemm`) | lane layout measured; MetalFX's int8 conv kernels match a reference convolution exactly ([docs/mxu.md](docs/mxu.md)) |
 | Runtime (Vulkan + vkhip, Metal binding model, pass plans) | works: translated `copyTexture` is bit-exact on an RX 7700 XT |
 | ML temporal scaler (BBR: tBBRNet + sBBRNet) | **works offline**: full 27-pass pipeline, 640x360 → 1280x720 at 28.2 dB vs a supersampled reference (bilinear 21.9 dB), 5.3 ms per frame before optimisation |
-| OptiScaler "MetalFX" upscaler | not started |
+| OptiScaler "MetalFX" upscaler (`patches/optiscaler/`) | **works in a test harness under Proton** (vkd3d-proton): 28.0–28.2 dB, about 6.3 ms per frame with submit and wait; not tried in a game yet |
+| OptiScaler "MetalFX FG" output | written and compiled; not tested end to end yet |
 | Frame interpolation | **works offline**: 30 passes, 31.9–32.1 dB vs true in-between frames (frame blend 22.3 dB), 0.87 ms at 1280x720 |
 | Spatial scaler, temporal V3, denoiser | later |
 
@@ -50,7 +52,9 @@ python3 air/m4r_air.py /path/to/MetalFX/Resources/default.metallib copyTexture -
 |---|---|
 | `air/` | metallib reader, AIR → AMDGPU translator and AIR built-in library |
 | `runtime/` | Vulkan context, kernel loader with Metal's binding model, vkhip (from d4r) |
-| `tests/` | GPU tests of translated kernels |
+| `patches/optiscaler/` | MetalFX upscaler and frame generation entries for OptiScaler (`scripts/apply_optiscaler_patches.sh`) |
+| `optiscaler/` | helper to build a patched OptiScaler with clang-cl on Linux, for the tests (not a distribution) |
+| `tests/` | GPU tests of translated kernels, offline runners, and the D3D12 harness that drives OptiScaler under Proton |
 | `tools/` | helpers for reading the MetalFX binary (Mach-O sections, annotated disassembly) |
 | `docs/` | how the translation works, what is known about MetalFX's pipelines, and what is verified vs inferred |
 

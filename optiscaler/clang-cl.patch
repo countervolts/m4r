@@ -1,0 +1,80 @@
+diff --git a/OptiScaler/framegen/ffx/FSRFG_Dx12.cpp b/OptiScaler/framegen/ffx/FSRFG_Dx12.cpp
+index 6d06a81..70fb4ee 100644
+--- a/OptiScaler/framegen/ffx/FSRFG_Dx12.cpp
++++ b/OptiScaler/framegen/ffx/FSRFG_Dx12.cpp
+@@ -1068,7 +1068,7 @@ void FSRFG_Dx12::DestroyFGContext()
+ {
+     _frameCount = 1;
+     // _lastDispatchedFrame = 0;
+-    _version = {};
++    _version = feature_version {};
+ 
+     LOG_DEBUG("");
+ 
+diff --git a/OptiScaler/hooks/Hook_Utils.h b/OptiScaler/hooks/Hook_Utils.h
+index e9e14d3..1b5afd1 100644
+--- a/OptiScaler/hooks/Hook_Utils.h
++++ b/OptiScaler/hooks/Hook_Utils.h
+@@ -18,6 +18,15 @@ template <typename Ret, typename Class, typename... Args> struct rewrite_signatu
+ // For checking that the hooked function's signature matches the original
+ // Place just above function definition, example of usage:
+ // VALIDATE_HOOK(hkCheckFeatureSupport, PFN_CheckFeatureSupport)
++// clang-cl keeps the external linkage of the extern declaration when a static definition follows, so header hooks
++// would be emitted once per translation unit under one symbol; declare them static there (internal linkage is kept
++// by a later definition without a storage class)
++#ifdef __clang__
++#define VALIDATE_HOOK(HookName, PfnType)                                                                               \
++    static std::remove_pointer_t<PfnType> HookName;                                                                    \
++    VALIDATE_MEMBER_HOOK(HookName, PfnType)
++#else
+ #define VALIDATE_HOOK(HookName, PfnType)                                                                               \
+     extern std::remove_pointer_t<PfnType> HookName;                                                                    \
+-    VALIDATE_MEMBER_HOOK(HookName, PfnType)
+\ No newline at end of file
++    VALIDATE_MEMBER_HOOK(HookName, PfnType)
++#endif
+\ No newline at end of file
+diff --git a/OptiScaler/hooks/Kernel_Hooks.h b/OptiScaler/hooks/Kernel_Hooks.h
+index 40154c5..c05b3c6 100644
+--- a/OptiScaler/hooks/Kernel_Hooks.h
++++ b/OptiScaler/hooks/Kernel_Hooks.h
+@@ -67,7 +67,7 @@ class KernelHooks
+     static inline std::mutex hookMutexBase;
+ 
+   public:
+-    static constexpr HMODULE amdxc64Mark = HMODULE(0xFFFFFFFF13372137);
++    static inline const HMODULE amdxc64Mark = HMODULE(0xFFFFFFFF13372137); // not constexpr: clang rejects the cast
+ 
+     static void Hook()
+     {
+diff --git a/OptiScaler/inputs/FG/XeFG_Inputs_Dx12.h b/OptiScaler/inputs/FG/XeFG_Inputs_Dx12.h
+index f618db8..fe1cf4b 100644
+--- a/OptiScaler/inputs/FG/XeFG_Inputs_Dx12.h
++++ b/OptiScaler/inputs/FG/XeFG_Inputs_Dx12.h
+@@ -14,7 +14,7 @@ class XeFGInputs
+     {
+         const char* name;
+         PVOID function;
+-        PVOID target = nullptr;
++        PVOID target; // zero for the static tables below (clang: no default member initializer here)
+     };
+ 
+     // XeFG output: the game's own XeFG and XeLL run on OptiScaler's libraries, as they would without OptiScaler.
+diff --git a/OptiScaler/inputs/FfxApiExe_Dx12.cpp b/OptiScaler/inputs/FfxApiExe_Dx12.cpp
+index 0bf795a..0824260 100644
+--- a/OptiScaler/inputs/FfxApiExe_Dx12.cpp
++++ b/OptiScaler/inputs/FfxApiExe_Dx12.cpp
+@@ -15,6 +15,13 @@
+ #include "dx12/ffx_api_dx12.h"
+ #include "FfxApiExe_Dx12.h"
+ 
++// FfxApi_Dx12.h declares these names with external linkage; the static hooks below are distinct functions
++#define ffxCreateContext_Dx12 ffxCreateContext_Dx12Exe
++#define ffxDestroyContext_Dx12 ffxDestroyContext_Dx12Exe
++#define ffxConfigure_Dx12 ffxConfigure_Dx12Exe
++#define ffxQuery_Dx12 ffxQuery_Dx12Exe
++#define ffxDispatch_Dx12 ffxDispatch_Dx12Exe
++
+ inline static PfnFfxCreateContext _D3D12_CreateContext = nullptr;
+ inline static PfnFfxDestroyContext _D3D12_DestroyContext = nullptr;
+ inline static PfnFfxConfigure _D3D12_Configure = nullptr;

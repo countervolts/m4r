@@ -135,6 +135,34 @@ frame on an RX 7700 XT with the unoptimised GEMM.
   (+0xf0); m4r runs it as its own GLSL pass (`shaders/sacneh.comp`) with the taps read from
   `emit_sacneh_constants.dat`.
 
+## Which scaler a Mac gets, GPU or Neural Engine
+
+`-[MTLFXTemporalScalerDescriptor newTemporalScalerWithDevice:]` (read from the arm64e disassembly) chooses the
+effect from the descriptor's `version` (after the `MTLFX_TEMPORAL_SCALER_VERSION` override, which is only read in
+internal builds):
+
+| version | effect | execution labels in the binary |
+|---|---|---|
+| 0x10000 | `_MFXTemporalScalingEffectV3` | `TAAUv3 \| ANE`, `TAAUv3 \| GPU` |
+| 0x10001 | `_MFXTemporalScalingEffectNRS` | |
+| 0x10002, 0x10003 | `_MFXTemporalScalingEffectV4` (`BRNet4_1`, packages `brnet`/`brnet_ane`, `_useANE` flag) | `TAAUv4 \| ANE`, `TAAUv4 \| GPU` |
+| 0x10004, 0x10005 | `_MFXTemporalScalingEffectBBR` | `TAAUBBR \| GPU` only |
+| anything else (default) | BBR if `deviceSupportsFusedBBRNet(device, pixels)`, otherwise V4 | |
+
+`deviceSupportsFusedBBRNet` requires `supportsFamily:1010` (0x3f2; read as the newest Apple GPU family, the one with
+the matrix instructions m4r lowers), then a device property (read as the GPU core count) above 20, or equal to 20
+with at most 4,096,000 pixels. So the newest GPUs get BBR on the GPU's matrix units, and other Macs get V4, which
+has the Neural Engine mode (`MTLFX_FORCE_GPU` and `MTLFX_EXECUTION_MODE` override it). Apple's own order is
+V3 < V4 < BBR, so BBR is the latest of the three.
+
+m4r runs BBR: Apple's network (`tBBRNet`, `sBBRNet` hand-written Metal kernels in `default.metallib`) and weights,
+on the GPU, nothing substituted. It does not run V3, V4 or the denoiser, which are the effects with Neural Engine
+variants. Not verified: the property read by `deviceSupportsFusedBBRNet` is the core count; whether V4 defaults to
+the ANE or the GPU (`_useANE` is not decoded); whether V4's ANE and GPU paths agree numerically. Nothing here was
+observed running on a Mac.
+
+The frame interpolator has no network at all (docs/metalfx-framegen.md): optical flow and warps on the GPU.
+
 ## Open
 
 - encodePost details, the `sacneh` overlap network
