@@ -60,12 +60,14 @@ Layer kernels: `Conv12x12Stride4(MXU3_K32)`, `Conv3x3Stride2(MXU3_K32 / K64, U8)
 `warp_history_high_resolution`, `anisotropic_gaussian_filter`, `output_spatial_lr`, `output_temporal`, ...) and tile kernels
 `unified_pass_tile` / `unified_low_resolution_tile`.
 
-All of these translate for gfx1101 with default settings **except the two tile kernels**: the metadata parser fails on their
-argument structs (`struct_info` in `air/m4r_air.py`, `IndexError` on a nested member list).
+All of these translate for gfx1101 with default settings. The two tile kernels (`--tg 8,8,1`) write three render targets
+(plan bindings 255, 254, 253) and have not run on the GPU yet; their real function constants (`using_tile`,
+`using_bicubic_sampler`, `emulate_srgb`, `max_exposure_ratio`) and threadgroup size come from the effect's host code. The
+compute-imageblock variant (`using_compute_imageblock`) is refused.
 
 ## What is missing
 
-1. Fix the metadata parser for the tile kernels and check that the imageblock emulation covers what they use.
+1. (done) Translate the tile kernels.
 2. The layer classes' setup (function constants, buffer layouts, weight layout conversions as `block_major` for BBR) and the
    remaining four descriptors.
 3. The effect's `encodeToCommandBuffer:`: the pre / mid / post pass lists with their bindings and parameter blocks

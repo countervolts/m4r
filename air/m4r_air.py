@@ -131,10 +131,20 @@ def kernel_info(text, kernel):
 def struct_info(nodes, ref):
     items = md_items(nodes[int(ref[1:])])
     fields = []
-    for i in range(0, len(items), 5):
-        if i + 4 < len(items):
-            off = int(items[i].split()[1]); size = int(items[i + 1].split()[1])
-            fields.append({'offset': off, 'size': size, 'type': items[i + 3].strip('!"'), 'name': items[i + 4].strip('!"')})
+    i = 0
+    while i + 4 < len(items):
+        # offset, size, <kind>, type name, member name; then optional tags: !"air.xxx" followed by an i32 value (imageblock
+        # members carry !"air.render_target", i32 N)
+        off = int(items[i].split()[1]); size = int(items[i + 1].split()[1])
+        field = {'offset': off, 'size': size, 'type': items[i + 3].strip('!"'), 'name': items[i + 4].strip('!"')}
+        i += 5
+        while i < len(items) and items[i].startswith('!"air.'):
+            tag = items[i].strip('!"')[4:]
+            i += 1
+            if i < len(items) and items[i].startswith('i32 '):
+                field[tag] = int(items[i].split()[1])
+                i += 1
+        fields.append(field)
     return fields
 
 
@@ -193,10 +203,25 @@ def translate(text, kernel, constants, tg, wave=32):
     is_fragment = re.search(r'^!air\.fragment = ', text, re.M) is not None
     uses_imageblock = '@air.store.implicit_imageblock' in text
     intrinsics.CTX['tg'] = tg
+    rt_count = 0
     if uses_imageblock:
-        # tile kernels: the imageblock is the render pass's colour attachment; stores go to a render-target texture
-        text = re.sub(r'(call void @air\.store\.implicit_imageblock\.\w+\()', r'\1ptr addrspace(1) %__m4r_rt, ', text)
+        # tile kernels: the imageblock is the render pass's colour attachment; each implicit-imageblock store names a
+        # render target by a literal index and goes to that attachment's texture (kernel arguments __rendertarget,
+        # __rendertarget1, ...; plan locations 255, 254, ...)
+        def rt_call(m):
+            nonlocal rt_count
+            args = intrinsics.split_params(m.group(2))
+            if not re.fullmatch(r'i32 \d+', args[1]):
+                raise ValueError(f'{kernel}: render target index of an imageblock store is not a literal: {args[1]}')
+            k = int(args[1].split()[1])
+            rt_count = max(rt_count, k + 1)
+            return f'{m.group(1)}(ptr addrspace(1) %__m4r_rt{k}, {m.group(2)}){m.group(3)}'
+        text = re.sub(r'(call void @air\.store\.implicit_imageblock\.\w+)\((.*)\)( #\d+.*)$', rt_call, text, flags=re.M)
+        if len(re.findall(r'call void @air\.store\.implicit_imageblock\.\w+\(<', text)):
+            raise ValueError(f'{kernel}: an imageblock store was not rewritten')
         text = re.sub(r'(declare void @air\.store\.implicit_imageblock\.\w+\()', r'\1ptr addrspace(1), ', text)
+        if re.search(r'@air\.(write_imageblock_slice_to_texture_2d|imageblock_data)', text) and constants.get('using_compute_imageblock'):
+            raise ValueError(f'{kernel}: the compute-imageblock path is not supported')
     manifest = {'kernel': kernel, 'threadgroup': tg, 'wave': wave, 'constants': {}, 'args': [], 'samplers': []}
 
     # 1. function constants
@@ -312,7 +337,7 @@ def translate(text, kernel, constants, tg, wave=32):
     inner = '__air_' + kernel
     head = m.group(0).replace('define ', 'define internal ', 1).replace('@' + kernel + '(', '@' + inner + '(', 1)
     if uses_imageblock:
-        head = head.replace(m.group(2) + ')', m.group(2) + ', ptr addrspace(1) %__m4r_rt)', 1)
+        head = head.replace(m.group(2) + ')', m.group(2) + ''.join(f', ptr addrspace(1) %__m4r_rt{k}' for k in range(rt_count)) + ')', 1)
     text = text[:m.start()] + head + text[m.end():]
 
     by_index = {a['index']: a for a in args}
@@ -349,12 +374,13 @@ def translate(text, kernel, constants, tg, wave=32):
             continue
         raise ValueError(f'{kernel}: unsupported argument {i} kind {kind}')
     if is_fragment or uses_imageblock:
-        kparams.append('ptr addrspace(1) %krt')
-        manifest['args'].append({'slot': slot, 'offset': slot * 8, 'kind': 'texture', 'location': 255,
-                                 'name': '__rendertarget', 'access': 'write'})
-        slot += 1
-        if uses_imageblock:
-            call_args.append(('ptr addrspace(1)', '%krt'))
+        for k in range(max(rt_count, 1)):
+            kparams.append(f'ptr addrspace(1) %krt{k}' if k else 'ptr addrspace(1) %krt')
+            manifest['args'].append({'slot': slot, 'offset': slot * 8, 'kind': 'texture', 'location': 255 - k,
+                                     'name': '__rendertarget' + (str(k) if k else ''), 'access': 'write'})
+            slot += 1
+            if uses_imageblock:
+                call_args.append(('ptr addrspace(1)', f'%krt{k}' if k else '%krt'))
     grid_off = slot * 8
     manifest['grid_offset'] = grid_off
     kparams += ['i32 %gx', 'i32 %gy', 'i32 %gz']

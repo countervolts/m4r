@@ -20,7 +20,7 @@ is re-trained, approximated or replaced.
 | Piece | State |
 |---|---|
 | `default.metallib` reader (functions, AIR bitcode) | works, all 90 functions of macOS 27.2.1 |
-| AIR → AMDGPU translator (`air/`) | 80 of the 90 functions of MetalFX 27.2.1 translate for gfx1101 (default settings); the rest are the spatial scaler's fragment shaders, a vertex shader and V3/V4's two tile kernels (`unified_pass_tile`, `unified_low_resolution_tile`: struct metadata the parser does not handle yet). The frame interpolation's tile kernel (`warpImage`) works |
+| AIR → AMDGPU translator (`air/`) | 82 of the 90 functions of MetalFX 27.2.1 translate for gfx1101 (default settings); the rest are the spatial scaler's fragment shaders and a vertex shader. The tile kernels translate: the frame interpolation's `warpImage` runs; V3/V4's `unified_pass_tile` and `unified_low_resolution_tile` (three render targets) have not run on the GPU yet |
 | Apple MXU matrix instructions (`llvm.agx3.igemm/fgemm`) | lane layout measured; the integer GEMMs run on RDNA3 WMMA and match a reference convolution exactly, the fp16 ones keep an exact `fdot2` chain ([docs/mxu.md](docs/mxu.md)) |
 | Runtime (Vulkan + vkhip, Metal binding model, pass plans) | works: translated `copyTexture` is bit-exact on an RX 7700 XT |
 | ML temporal scaler (BBR: tBBRNet + sBBRNet) | **works offline**: full 27-pass pipeline, 640x360 → 1280x720 at 28.27 dB vs a supersampled reference (bilinear 21.9 dB), bit-identical from run to run, 1.7 ms per frame |

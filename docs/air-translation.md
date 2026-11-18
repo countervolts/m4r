@@ -63,12 +63,17 @@ From the seven distinct states MetalFX uses and the coordinates the kernels pass
   colour is stored into a render-target texture passed as a hidden argument (Metal binding 255 in plans).
 - A tile kernel's implicit imageblock store (`warpImage`) writes the same render target at
   workgroup · tile + in-tile coordinate; m4r dispatches one threadgroup per tile.
+- A store names its render target by a literal index; each index gets its own hidden texture argument:
+  `__rendertarget` (plan binding 255), `__rendertarget1` (254), `__rendertarget2` (253). V3/V4's `unified_*_tile` use three.
+- Imageblock struct members in the metadata carry extra tag pairs (`!"air.render_target", i32 N`); `struct_info` skips them.
 - LLVM 23's gfx11 true-16-bit register mode miscompiles `findOpticalMotionVectorsV3/Ref` ("expected inline
   constant"); kernels are built with `-real-true16`.
 
 ## Not done yet
 
-- explicit imageblock reads and `write_imageblock_slice_to_texture` (`unified_*_tile`, temporal V3 only).
+- compute-kernel imageblocks (`air.imageblock_data`, `write_imageblock_slice_to_texture_2d`): the `unified_*_tile` kernels
+  use them only when the function constant `using_compute_imageblock` is set; they are stubbed and `translate()` refuses that
+  setting.
 - Metal's partial edge threadgroups: Metal shrinks `threads_per_threadgroup` at the grid edge; the translation
   reports the shrunk size but forms SIMD groups from the full threadgroup shape.
 - Floating-point reduction order in `simd_sum` and the exact rounding of Apple's texture filtering differ from

@@ -594,6 +594,13 @@ def imageblock_store(b, s):
     return None
 
 
+def compute_imageblock_unused(b, s):
+    """Compute-kernel imageblocks (air.imageblock_data, air.write_imageblock_slice_to_texture_2d) are the other branch of the
+    `using_compute_imageblock` function constant; with the tile pipeline's constant they are dead code. translate() refuses
+    the kernel when the constant selects them."""
+    return 'null' if s.ret != 'void' else None
+
+
 def rt_store_def(vt):
     """@__m4r_rt_write(value, rt, x, y): a fragment function's return value to the render target."""
     b = Body()
@@ -673,6 +680,7 @@ TABLE = [
     (r'air\.atomic\.local\.store\.', atomic_store_local),
     (r'air\.wg\.barrier$', wg_barrier),
     (r'air\.store\.implicit_imageblock\.', imageblock_store),
+    (r'air\.(imageblock_data|write_imageblock_slice_to_texture_2d)', compute_imageblock_unused),
 ]
 
 
