@@ -75,8 +75,42 @@ depthBias = reversed ? (1, 0) : (−1, 1), deltaTime = P+0x58, prevDeltaTime = f
 proj34 = −n·f/(n−f) (n, f = P+0x5c, P+0x60), clipPrevFromClipCur from the current (P+0x70..0xef) and stored
 previous (fg+0x250..0x2cf) matrices when both exist (P+0xf0, fg+0x2d0), rejectionThreshold = content w·h·80/900.
 
+## Resources (constructor; O = output size, I = input size: `FrameGenImpl(dev, lib, O.w, O.h, I.w, I.h, colourFormat, ...)`)
+
+levels = min(floor(log2(min(O.w, O.h))) − 2, 7) (fg+0x240); prevDeltaTime starts at 1/60 (fg+0x244); stored previous
+camera matrices start as identity (fg+0x250..0x2cf) with fg+0x2d0 = "have previous" = 0. Function constant 1 is
+false for a few colour formats (0x24a, 0x27e, 0x27f and a small set around 0x46) and true otherwise.
+
+| slot | Metal format | size |
+|---|---|---|
+| +0xe8, +0xf0 | R32Uint | O / 8 (optical splat targets) |
+| +0xf8, +0x100 | R32Uint | I (game-motion splat targets) |
+| +0x1f0, +0x1f8 | R32Float | I (dilated depth, two frames) |
+| +0x108 + 16·l + 8·k | R8Unorm | O >> l, l < levels, two pyramids (k = frame parity) |
+| +0x178[l], +0x1b0[l] | RG16Float | O >> (l + 3) (flow per level, two sets) |
+| +0x1e8 | RG16Float | last level size |
+| +0x200 | RG16Float | O (game motion, upsampled) |
+| +0x208 | R8Uint | O (mask) |
+| +0x210 | R16Float | I (mover mask) |
+| +0x218 | RG16Float | O (optical motion) |
+| +0x220, +0x228 | colour format | current / previous colour copies |
+| +0x230 | buffer, 18,436 bytes | histogram; +0x4800 = frame-change word |
+
+## End-to-end result
+
+`tools/prepare_fg.py` + `tests/run_fg.cpp` on the moving-camera fixture (`tests/scene_fg.py`, output 1280x720,
+input 640x360, a moving sphere): interpolated frames score **31.9–32.1 dB** sRGB PSNR against the true in-between
+frames (blending the two frames: 22.3 dB, repeating the previous one: 20.2 dB), no NaNs, 0.87 ms per frame on an
+RX 7700 XT.
+
+Tile emulation detail (verified by the result): `warpImage` rebuilds its pixel as
+x = (xy.x & ~7) + lane / 4, y = (xy.y & ~3) + lane % 4, i.e. it relies on Apple forming each SIMD group of a tile
+dispatch from an 8x4 pixel block (its shuffles with lane masks 1/4 and 2/8 are vertical/horizontal neighbours). m4r
+runs a 32x32 tile as a 1024-thread workgroup whose wave w covers 8x4 block w; with plain row-major waves the output
+is noise.
+
 ## Open
 
 - full binding list of encodeTo, FrameGenParams / the 176-byte shader parameter block, pyramid level count
-- `findOpticalMotionVectorsV3` fails in instruction selection ("expected inline constant") — translator issue
-- copyImage (fragment) as compute
+- the copy path (scene cut, `copyImage`), distortion field, UI composition, camera-matrix reprojection and the
+  disocclusion-blend variants are not exercised by the fixture yet

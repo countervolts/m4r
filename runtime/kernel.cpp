@@ -79,7 +79,7 @@ VkDeviceAddress Runtime::transient(const void* data, size_t bytes, size_t align)
     return a;
 }
 
-Kernel* Runtime::load(const std::string& base) {
+Kernel* Runtime::load(const std::string& base, uint32_t extraLds) {
     auto it = kernels_.find(base);
     if (it != kernels_.end()) return it->second.get();
     auto k = std::make_unique<Kernel>();
@@ -111,6 +111,8 @@ Kernel* Runtime::load(const std::string& base) {
     auto kd = k->module.kernels.find(k->name);
     if (kd == k->module.kernels.end()) { error = base + ": kernel symbol missing"; return nullptr; }
     k->kd = kd->second;
+    k->staticLds = k->kd.lds;
+    k->kd.lds = ((k->kd.lds + 15) & ~15u) + extraLds;
     uint64_t dataAddr = 0;
     if (k->module.dataHi > k->module.dataLo) {
         if (!vk_.createBuffer(k->data, k->module.dataHi - k->module.dataLo, true)) { error = "data buffer"; return nullptr; }
@@ -196,7 +198,7 @@ bool Encoder::dispatch(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t nx, uint3
         return true;
     }
     std::vector<uint8_t> block(k_->kernargSize, 0);
-    uint32_t ldsOffset = (k_->kd.lds + 15) & ~15u;
+    uint32_t ldsOffset = (k_->staticLds + 15) & ~15u;
     for (const auto& a : k_->args) {
         uint64_t v = 0;
         if (a.kind == Arg::Buffer) {

@@ -36,6 +36,7 @@ private:
     std::map<std::string, const Texture*> extTex_;
     std::map<std::string, VkDeviceAddress> extBuf_;
     std::vector<Pass> passes_;
+    std::map<std::string, std::pair<std::string, VkDeviceSize>> views_;
     int parity_ = 0;
     std::string pick(const std::string& n) const {
         auto bar = n.find('|');

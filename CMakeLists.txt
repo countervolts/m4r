@@ -31,3 +31,6 @@ target_link_libraries(test_plan m4r_runtime)
 
 add_executable(run_bbr tests/run_bbr.cpp)
 target_link_libraries(run_bbr m4r_runtime)
+
+add_executable(run_fg tests/run_fg.cpp)
+target_link_libraries(run_fg m4r_runtime)

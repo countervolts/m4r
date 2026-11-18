@@ -11,7 +11,7 @@ VkFormat formatByName(const std::string& n) {
         {"R8_UNORM", VK_FORMAT_R8_UNORM}, {"R8G8_UNORM", VK_FORMAT_R8G8_UNORM}, {"R16_SFLOAT", VK_FORMAT_R16_SFLOAT},
         {"R16G16_SFLOAT", VK_FORMAT_R16G16_SFLOAT}, {"R16G16B16A16_SFLOAT", VK_FORMAT_R16G16B16A16_SFLOAT},
         {"R32_SFLOAT", VK_FORMAT_R32_SFLOAT}, {"R32_UINT", VK_FORMAT_R32_UINT}, {"R8G8B8A8_UNORM", VK_FORMAT_R8G8B8A8_UNORM},
-        {"R16G16_UINT", VK_FORMAT_R16G16_UINT}, {"R32G32_SFLOAT", VK_FORMAT_R32G32_SFLOAT}};
+        {"R16G16_UINT", VK_FORMAT_R16G16_UINT}, {"R8_UINT", VK_FORMAT_R8_UINT}, {"R32G32_SFLOAT", VK_FORMAT_R32G32_SFLOAT}};
     auto it = f.find(n);
     return it == f.end() ? VK_FORMAT_UNDEFINED : it->second;
 }
@@ -77,9 +77,11 @@ bool Plan::load(const std::string& dir) {
             if (!vk.submit(cb)) return fail("clear " + name);
             textures_[name] = t;
         } else if (w == "kernel") {
-            std::string name, path;
+            std::string name, path, opt;
             ls >> name >> path;
-            Kernel* k = rt_.load(dir + "/" + path);
+            uint32_t lds = 0;
+            while (ls >> opt) if (opt.rfind("lds=", 0) == 0) lds = uint32_t(std::stoul(opt.substr(4)));
+            Kernel* k = rt_.load(dir + "/" + path, lds);
             if (!k) return fail(rt_.error);
             kernels_[name] = k;
         } else if (w == "glsl") {      // glsl NAME path.spv tx ty tz
@@ -98,10 +100,15 @@ bool Plan::load(const std::string& dir) {
             p.kernel = it->second; p.groups = mode == "groups"; p.label = kname;
             passes_.push_back(p);
             cur = &passes_.back();
-        } else if (w == "buf" || w == "tex" || w == "bytes") {
+        } else if (w == "view") {      // view NAME BUFFER OFFSET: a buffer address at an offset
+            std::string name, base;
+            VkDeviceSize off;
+            ls >> name >> base >> off;
+            views_[name] = {base, off};
+        } else if (w == "buf" || w == "tex" || w == "bytes" || w == "tgmem") {
             if (!cur) return fail("binding outside a pass");
             Bind b;
-            b.kind = w == "bytes" ? 'y' : w[0];
+            b.kind = w == "bytes" ? 'y' : w == "tgmem" ? 'g' : w[0];
             ls >> b.index >> b.name;
             if (w == "bytes") b.bytes = hexBytes(b.name);
             cur->binds.push_back(b);
@@ -122,9 +129,12 @@ bool Plan::record(VkCommandBuffer cb) {
             if (b.kind == 'b') {
                 auto e = extBuf_.find(b.name);
                 if (e != extBuf_.end()) { enc.setBuffer(e->second, b.index); continue; }
-                Buffer* buf = buffer(b.name);
+                auto v = views_.find(b.name);
+                Buffer* buf = buffer(v != views_.end() ? v->second.first : b.name);
                 if (!buf) { error = p.label + ": no buffer " + b.name; return false; }
-                enc.setBuffer(*buf, b.index);
+                enc.setBuffer(*buf, b.index, v != views_.end() ? v->second.second : 0);
+            } else if (b.kind == 'g') {
+                enc.setThreadgroupMemory(uint32_t(std::stoul(b.name)), b.index);
             } else if (b.kind == 't') {
                 auto e = extTex_.find(b.name);
                 const Texture* t = e != extTex_.end() ? e->second : texture(b.name);

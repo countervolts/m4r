@@ -365,11 +365,29 @@ def translate(text, kernel, constants, tg, wave=32):
     manifest['kernarg_size'] = lds_off + 4 * len(lds_args)
 
     tgx, tgy, tgz = tg
-    w = [f'define amdgpu_kernel void @{kernel}({", ".join(kparams)}) #901 !reqd_work_group_size !{{i32 {tgx}, i32 {tgy}, i32 {tgz}}} {{',
+    tile = uses_imageblock   # tile kernel: Apple forms each SIMD group of a tile from an 8x4 pixel block
+    phys = (tgx * tgy * tgz, 1, 1) if tile else (tgx, tgy, tgz)
+    manifest['threadgroup'] = list(phys)
+    w = [f'define amdgpu_kernel void @{kernel}({", ".join(kparams)}) #901 !reqd_work_group_size !{{i32 {phys[0]}, i32 {phys[1]}, i32 {phys[2]}}} {{',
          'entry:']
-    w.append('  %lx = call i32 @llvm.amdgcn.workitem.id.x()')
-    w.append('  %ly = call i32 @llvm.amdgcn.workitem.id.y()' if tgy > 1 else '  %ly = add i32 0, 0')
-    w.append('  %lz = call i32 @llvm.amdgcn.workitem.id.z()' if tgz > 1 else '  %lz = add i32 0, 0')
+    if tile:
+        assert tgx % 8 == 0 and tgy % 4 == 0 and tgz == 1
+        w.append('  %tflat = call i32 @llvm.amdgcn.workitem.id.x()')
+        w.append('  %twave = lshr i32 %tflat, 5')
+        w.append('  %tlane = and i32 %tflat, 31')
+        w.append(f'  %tbx = urem i32 %twave, {tgx // 8}')
+        w.append(f'  %tby = udiv i32 %twave, {tgx // 8}')
+        w.append('  %tbx8 = shl i32 %tbx, 3')
+        w.append('  %tl4 = lshr i32 %tlane, 2')
+        w.append('  %lx = add i32 %tbx8, %tl4')
+        w.append('  %tby4 = shl i32 %tby, 2')
+        w.append('  %tl3 = and i32 %tlane, 3')
+        w.append('  %ly = add i32 %tby4, %tl3')
+        w.append('  %lz = add i32 0, 0')
+    else:
+        w.append('  %lx = call i32 @llvm.amdgcn.workitem.id.x()')
+        w.append('  %ly = call i32 @llvm.amdgcn.workitem.id.y()' if tgy > 1 else '  %ly = add i32 0, 0')
+        w.append('  %lz = call i32 @llvm.amdgcn.workitem.id.z()' if tgz > 1 else '  %lz = add i32 0, 0')
     w.append('  %wx = call i32 @llvm.amdgcn.workgroup.id.x()')
     w.append('  %wy = call i32 @llvm.amdgcn.workgroup.id.y()')
     w.append('  %wz = call i32 @llvm.amdgcn.workgroup.id.z()')
@@ -382,13 +400,17 @@ def translate(text, kernel, constants, tg, wave=32):
         w.append(f'  %ng{c} = udiv i32 %ng{c}a, {t}')
         w.append(f'  %out{c} = icmp uge i32 %p{c}, %g{c}')
     w.append('  %oxy = or i1 %outx, %outy')
-    w.append('  %oxyz = or i1 %oxy, %outz')
+    w.append('  %oxyz0 = or i1 %oxy, %outz')
+    w.append('  %oxyz = and i1 %oxyz0, false' if tile else '  %oxyz = and i1 %oxyz0, true')
     w.append('  br i1 %oxyz, label %done, label %body')
     w.append('body:')
-    w.append(f'  %ly8 = mul i32 %ly, {tgx}')
-    w.append(f'  %lz8 = mul i32 %lz, {tgx * tgy}')
-    w.append('  %flat0 = add i32 %lx, %ly8')
-    w.append('  %flat = add i32 %flat0, %lz8')
+    if tile:
+        w.append('  %flat = add i32 %tflat, 0')   # SIMD groups are the 8x4 blocks
+    else:
+        w.append(f'  %ly8 = mul i32 %ly, {tgx}')
+        w.append(f'  %lz8 = mul i32 %lz, {tgx * tgy}')
+        w.append('  %flat0 = add i32 %lx, %ly8')
+        w.append('  %flat = add i32 %flat0, %lz8')
     w.append(f'  %sgi = lshr i32 %flat, {5 if wave == 32 else 6}')
     w.append(f'  %tis = and i32 %flat, {wave - 1}')
     for j, i in enumerate(lds_args):
@@ -476,7 +498,7 @@ def translate(text, kernel, constants, tg, wave=32):
              '"amdgpu-no-dispatch-ptr" "amdgpu-no-queue-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-dispatch-id" '
              '"amdgpu-no-hostcall-ptr" "amdgpu-no-heap-ptr" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-lds-kernel-id" '
              '"amdgpu-no-default-queue" "amdgpu-no-completion-action" "amdgpu-no-flat-scratch-init" '
-             '"target-cpu"="gfx1101" "target-features"="+wavefrontsize%d" }\n') % (tgx * tgy * tgz, tgx * tgy * tgz, wave)
+             '"target-cpu"="gfx1101" "target-features"="+wavefrontsize%d" }\n') % (phys[0] * phys[1] * phys[2], phys[0] * phys[1] * phys[2], wave)
     # the inner kernel and its helpers get the same target
     text = re.sub(r'^define internal (.*?)#(\d+) \{$', r'define internal \1#\2 {', text, flags=re.M)
     manifest['wrapper_params'] = kparams

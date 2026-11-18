@@ -32,6 +32,7 @@ struct Kernel {
     // m4r's own GLSL kernels (passes that are not Metal kernels, e.g. MPSGraph parts): argument block is
     // 8 x u64 (buffer addresses / texture records by binding index 0-7), then u32 constants from setBytes 8-15
     bool glsl = false;
+    uint32_t staticLds = 0;   // the code object's own LDS; dynamic threadgroup memory follows it
 };
 
 // Metal sampler state words (as stored in AIR constexpr samplers) -> Vulkan sampler. Bit layout inferred from
@@ -44,7 +45,7 @@ public:
     bool init();
     void destroy();
     // loads <base>.hsaco + <base>.args; kernels are cached by base path
-    Kernel* load(const std::string& base);
+    Kernel* load(const std::string& base, uint32_t extraLds = 0);   // extraLds: dynamic threadgroup memory
     // a SPIR-V compute shader using the same push-constant ABI (one 64-bit argument-block pointer)
     Kernel* loadGlsl(const std::string& spv, uint32_t tx, uint32_t ty, uint32_t tz);
     Context& vk() { return vk_; }

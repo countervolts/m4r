@@ -24,7 +24,7 @@ is re-trained, approximated or replaced.
 | Runtime (Vulkan + vkhip, Metal binding model, pass plans) | works: translated `copyTexture` is bit-exact on an RX 7700 XT |
 | ML temporal scaler (BBR: tBBRNet + sBBRNet) | **works offline**: full 27-pass pipeline, 640x360 → 1280x720 at 28.2 dB vs a supersampled reference (bilinear 21.9 dB), 5.3 ms per frame before optimisation |
 | OptiScaler "MetalFX" upscaler | not started |
-| Frame interpolation | kernels compile; host logic not read yet |
+| Frame interpolation | **works offline**: 30 passes, 31.9–32.1 dB vs true in-between frames (frame blend 22.3 dB), 0.87 ms at 1280x720 |
 | Spatial scaler, temporal V3, denoiser | later |
 
 ## What you need
