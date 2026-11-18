@@ -20,8 +20,9 @@ is re-trained, approximated or replaced.
 |---|---|
 | `default.metallib` reader (functions, AIR bitcode) | works, all 90 functions of macOS 27.2.1 |
 | AIR → AMDGPU translator (`air/`) | 79 of 82 compute kernels compile for gfx1101; tile/imageblock kernels not yet |
-| Runtime (Vulkan + vkhip, Metal binding model) | works: translated `copyTexture` is bit-exact on an RX 7700 XT |
-| ML temporal scaler (BBR: tBBRNet + sBBRNet) | host pipeline being reconstructed, see [docs/metalfx-bbr.md](docs/metalfx-bbr.md) |
+| Apple MXU matrix instructions (`llvm.agx3.igemm/fgemm`) | lane layout measured; MetalFX's int8 conv kernels match a reference convolution exactly ([docs/mxu.md](docs/mxu.md)) |
+| Runtime (Vulkan + vkhip, Metal binding model, pass plans) | works: translated `copyTexture` is bit-exact on an RX 7700 XT |
+| ML temporal scaler (BBR: tBBRNet + sBBRNet) | tBBRNet (11 layers, 14 dispatches) runs: 3.5 ms at 1280x720 output with the unoptimised GEMM; pre/post passes and sBBRNet being wired up ([docs/metalfx-bbr.md](docs/metalfx-bbr.md)) |
 | OptiScaler "MetalFX" upscaler | not started |
 | Frame interpolation | kernels compile; host logic not read yet |
 | Spatial scaler, temporal V3, denoiser | later |

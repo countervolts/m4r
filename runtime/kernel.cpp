@@ -3,6 +3,7 @@
 #include "kernel.h"
 #include <cstdio>
 #include <fstream>
+#include <random>
 #include <sstream>
 
 namespace m4r {
@@ -47,6 +48,9 @@ bool decodeSamplerState(uint64_t w0, VkSamplerCreateInfo& ci, std::string& why) 
 }
 
 bool Runtime::init() {
+    // vkhip donors are keyed by their specialisation (including the pipeline id); RADV's on-disk shader cache can
+    // hand back a pipeline patched by an earlier process for a repeated key. Fresh ids per process avoid that.
+    nextId_ = uint32_t(std::random_device{}()) | 1u;
     if (!hip_.load(vk_.device, vkGetDeviceProcAddr)) { error = "vkhip device functions"; return false; }
     VkPushConstantRange pc{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
     VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
