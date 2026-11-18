@@ -1,0 +1,28 @@
+# Apple's files (dump of a macOS install) and anything derived from them.
+# m4r reads MetalFX from the user's own macOS files at runtime; none of it is committed.
+/metalfx-dump/
+/metalfx/
+._*
+*.metallib
+*.dat
+*.mtlpackage/
+*.mpsgraph
+*.a2s
+# generated from Apple's kernels/weights
+/build/
+/cache/
+*.hsaco
+*.co
+*.bc
+*.spv
+# local outputs
+/dist/
+/out/
+/captures/
+*.log
+__pycache__/
+.venv/
+.vscode/
+*.dll
+*.exe
+*.so

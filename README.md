@@ -1,0 +1,60 @@
+# m4r (metalfx 4 radeon)
+
+want dlss on radeon? check out [d4r](https://github.com/countervolts/d4r)! xess xmx? [x4r](https://github.com/countervolts/x4r)!
+
+m4r runs Apple's **MetalFX** upscaler (the ML temporal scaler, "BBR") and, later, MetalFX frame
+interpolation in Windows games on AMD Radeon GPUs under Linux and Proton. The game asks for DLSS/FSR/XeSS as usual; a custom
+[OptiScaler](https://github.com/optiscaler/OptiScaler) 10 build offers **MetalFX** in its upscaler menu and hands the
+frame to m4r.
+
+m4r runs Apple's own kernels and network weights, as d4r does with NVIDIA's and x4r with Intel's: the Metal
+compute kernels in your copy of MetalFX's `default.metallib` are translated from their AIR (LLVM) bitcode to
+AMDGPU code objects and run inside the game's Vulkan command stream through d4r's **vkhip** loader. No network
+is re-trained, approximated or replaced.
+
+> **Work in progress / proof of concept.** Not affiliated with Apple or AMD.
+
+## Status
+
+| Piece | State |
+|---|---|
+| `default.metallib` reader (functions, AIR bitcode) | works, all 90 functions of macOS 27.2.1 |
+| AIR → AMDGPU translator (`air/`) | 79 of 82 compute kernels compile for gfx1101; tile/imageblock kernels not yet |
+| Runtime (Vulkan + vkhip, Metal binding model) | works: translated `copyTexture` is bit-exact on an RX 7700 XT |
+| ML temporal scaler (BBR: tBBRNet + sBBRNet) | host pipeline being reconstructed, see [docs/metalfx-bbr.md](docs/metalfx-bbr.md) |
+| OptiScaler "MetalFX" upscaler | not started |
+| Frame interpolation | kernels compile; host logic not read yet |
+| Spatial scaler, temporal V3, denoiser | later |
+
+## What you need
+
+- Linux, an RDNA3 GPU (developed on an RX 7700 XT, gfx1101), Mesa RADV with `VK_EXT_descriptor_buffer`.
+- LLVM with the AMDGPU target and lld (developed with LLVM 23.1), CMake, Ninja, glslang, Python 3.
+- **Your own MetalFX files** from macOS 27.2.1 (build 26B131): the framework's `Resources/` folder
+  (`default.metallib`, `emit_*.dat`) and the MetalFX binary extracted from the dyld shared cache. m4r ships none
+  of Apple's files and nothing derived from them; everything Apple-specific is read from your copy at build time.
+
+## Build
+
+```bash
+cmake -S . -B build -G Ninja && ninja -C build
+# translate one kernel from your metallib (example)
+python3 air/m4r_air.py /path/to/MetalFX/Resources/default.metallib copyTexture -o build/k/copyTexture.hsaco --tg 8,8,1
+./build/test_kernel build/k
+```
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| `air/` | metallib reader, AIR → AMDGPU translator and AIR built-in library |
+| `runtime/` | Vulkan context, kernel loader with Metal's binding model, vkhip (from d4r) |
+| `tests/` | GPU tests of translated kernels |
+| `tools/` | helpers for reading the MetalFX binary (Mach-O sections, annotated disassembly) |
+| `docs/` | how the translation works, what is known about MetalFX's pipelines, and what is verified vs inferred |
+
+## License
+
+GPL-3.0-only (see [LICENSE](LICENSE)). `runtime/vkhip/` comes from d4r under the same license. Apple's MetalFX
+files, and anything produced from them (translated kernels, extracted parameters), are not covered by this license
+and must not be redistributed.
