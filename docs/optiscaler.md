@@ -31,19 +31,30 @@ build it. Upstream builds with MSVC and needs none of it.
 
 ## Installing
 
-Next to the game executable (for the D3D12 games OptiScaler supports, running under Proton):
+Next to the game executable (for the D3D12 games OptiScaler supports, running under Proton) you need the patched OptiScaler
+(`dxgi.dll` and its ini) and, from m4r:
 
 ```
-dxgi.dll              OptiScaler (patched), or any OptiScaler setup you already use
-OptiScaler.ini        Dx12Upscaler=metalfx   and/or   [FrameGen] FGOutput=metalfx
 m4r\m4r.dll
-m4r\plans\bbr-<out w>x<out h>-<in w>x<in h>   one per upscaling resolution pair in use
-m4r\plans\fg-<display w>x<display h>-<in w>x<in h>   one per frame generation resolution pair
+m4r\plans\bbr-<display w>x<display h>-<render w>x<render h>        upscaler plan, reversed depth
+m4r\plans\bbr-<display w>x<display h>-<render w>x<render h>-fwd    upscaler plan, forward depth
+m4r\plans\fg-<display w>x<display h>-<render w>x<render h>         frame generation plan
 ```
 
-Plans are generated on your machine from your own copy of MetalFX (`tools/prepare_bbr.py`, `tools/prepare_fg.py`); they
-contain Apple's translated kernels and weights and must not be shared. An installer that generates the common
-resolutions is not written yet.
+and in `OptiScaler.ini`: `Dx12Upscaler=metalfx` and/or `[FrameGen] Enabled=true`, `FGInput=upscaler`, `FGOutput=metalfx`.
+
+`scripts/install.py` makes all of that from your own copy of MetalFX (the framework's `Resources` folder and the MetalFX binary
+extracted from the dyld shared cache) in about two seconds per plan:
+
+```bash
+scripts/install.py --resources .../MetalFX.framework/Versions/A/Resources --binary .../MetalFX --game /path/to/game \
+    --display 2560x1440 [--modes quality,balanced,performance,ultra] [--input 1706x960] [--depth both] [--no-fg]
+```
+
+It works out each quality mode's render size the way OptiScaler does and writes a plan per display and render size pair; sizes a
+game chooses on its own (dynamic resolution) are added with `--input`. A plan is needed for every pair that will be used: without
+one, `m4r_upscale_init` fails and the feature reports it in OptiScaler's log (the error names the missing plan). The plans contain
+Apple's translated kernels and weights and must not be shared.
 
 ## What happens
 

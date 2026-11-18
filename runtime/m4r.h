@@ -2,7 +2,8 @@
  *
  * The caller owns the Vulkan device; m4r records its passes into the caller's command buffer. Images are passed as
  * VkImage + format + size + current layout; m4r transitions them to GENERAL around its passes. Prepared plans (tools/prepare_bbr.py, tools/prepare_fg.py) are read from
- * <data dir>/bbr-<out w>x<out h>-<in w>x<in h> and <data dir>/fg-<out w>x<out h>-<in w>x<in h>.
+ * <data dir>/bbr-<out w>x<out h>-<in w>x<in h>[-fwd] and <data dir>/fg-<out w>x<out h>-<in w>x<in h>. The upscaler plan is specialised
+ * for the depth convention: the plain name is for reversed depth, `-fwd` for forward depth (m4r_upscale_desc.depth_reversed).
  * SPDX-License-Identifier: GPL-3.0-only */
 #pragma once
 #include <stdint.h>

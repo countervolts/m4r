@@ -514,15 +514,16 @@ index 0000000..41ba7f4
 +};
 diff --git a/OptiScaler/upscalers/metalfx/m4r.h b/OptiScaler/upscalers/metalfx/m4r.h
 new file mode 100644
-index 0000000..af97683
+index 0000000..8930aa6
 --- /dev/null
 +++ b/OptiScaler/upscalers/metalfx/m4r.h
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,80 @@
 +/* m4r: MetalFX ML temporal upscaling and frame interpolation for Vulkan callers (OptiScaler backend, harnesses).
 + *
 + * The caller owns the Vulkan device; m4r records its passes into the caller's command buffer. Images are passed as
 + * VkImage + format + size + current layout; m4r transitions them to GENERAL around its passes. Prepared plans (tools/prepare_bbr.py, tools/prepare_fg.py) are read from
-+ * <data dir>/bbr-<out w>x<out h>-<in w>x<in h> and <data dir>/fg-<out w>x<out h>-<in w>x<in h>.
++ * <data dir>/bbr-<out w>x<out h>-<in w>x<in h>[-fwd] and <data dir>/fg-<out w>x<out h>-<in w>x<in h>. The upscaler plan is specialised
++ * for the depth convention: the plain name is for reversed depth, `-fwd` for forward depth (m4r_upscale_desc.depth_reversed).
 + * SPDX-License-Identifier: GPL-3.0-only */
 +#pragma once
 +#include <stdint.h>

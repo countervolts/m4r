@@ -97,6 +97,30 @@ int main(int argc, char** argv) {
             std::memcpy(plan.buffer("fgparams")->map, &p, sizeof p);
             plan.setParity(noWarmup ? t - 1 : t);
             rt.resetTransient();
+            if (std::getenv("M4R_PASS_TIME")) {   // debug: GPU time of every pass (one submission each), averaged over frames >= 2
+                static std::vector<double> total(plan.passes(), 0.0);
+                for (size_t i = 0; i < plan.passes(); ++i) {
+                    VkCommandBuffer pcb = vk.begin();
+                    vkCmdResetQueryPool(pcb, qp, 0, 2);
+                    vkCmdWriteTimestamp(pcb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+                    if (!plan.record(pcb, i, 1)) { std::fprintf(stderr, "record: %s\n", plan.error.c_str()); return 1; }
+                    vk.barrier(pcb);
+                    vkCmdWriteTimestamp(pcb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+                    if (!vk.submit(pcb)) { std::fprintf(stderr, "submit: %s\n", vk.error.c_str()); return 1; }
+                    uint64_t ts[2];
+                    vkGetQueryPoolResults(vk.device, qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                    if (t >= 2) total[i] += double(ts[1] - ts[0]) * props.limits.timestampPeriod * 1e-6;
+                }
+                if (t == frames - 1) {
+                    double sum = 0;
+                    for (size_t i = 0; i < plan.passes(); ++i) {
+                        std::printf("pass %2zu %-44s %7.3f ms\n", i, plan.passLabel(i).c_str(), total[i] / (frames - 2));
+                        sum += total[i] / (frames - 2);
+                    }
+                    std::printf("sum %.3f ms\n", sum);
+                }
+                continue;
+            }
             VkCommandBuffer cb = vk.begin();
             vkCmdResetQueryPool(cb, qp, 0, 2);
             vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);

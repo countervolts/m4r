@@ -29,7 +29,7 @@ FGEN=false; FGIN=nofg; FGOUT=nofg
 if [[ -n "${M4R_FG_PLAN:-}" ]]; then
   ln -s "$(realpath "$M4R_FG_PLAN")" "$APP/m4r/plans/fg-${OW}x${OH}-${IW}x${IH}"
   FGEN=true; FGIN=upscaler; FGOUT=metalfx
-  export M4R_HARNESS_SWAPCHAIN=1 M4R_HARNESS_REVERSED_DEPTH=1 M4R_LOG=m4r.log
+  export M4R_HARNESS_SWAPCHAIN=1 M4R_LOG=m4r.log
   if [[ -n "${M4R_FG_DUMP:-}" ]]; then mkdir -p "$APP/dumps"; export M4R_DUMP_FG=dumps; fi   # depth/motion as m4r saw them
 fi
 cat > "$APP/OptiScaler.ini" <<EOF
@@ -50,6 +50,7 @@ LogToFile=true
 LogLevel=${M4R_OPTI_LOGLEVEL:-1}
 EOF
 
+export M4R_HARNESS_REVERSED_DEPTH=1   # the fixtures use reversed depth; m4r picks its upscaler plan by it (bbr-... vs bbr-...-fwd)
 export STEAM_COMPAT_CLIENT_INSTALL_PATH="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$HOME/.local/share/Steam}"
 export STEAM_COMPAT_DATA_PATH="$COMPAT"
 export WINEDLLOVERRIDES="dxgi=n,b"

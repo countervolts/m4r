@@ -15,9 +15,10 @@ struct m4r_context {
     Context vk;
     Runtime rt{vk};
     std::string dir, error;
-    std::unique_ptr<Plan> bbr, fg;
+    std::unique_ptr<Plan> bbr[2], fg;   // bbr[1]: plan for reversed depth, bbr[0]: forward depth (plans are specialised for it)
     uint32_t bbrSize[4] = {}, fgSize[4] = {};
-    uint64_t bbrFrame = 0, fgFrame = 0;
+    bool bbrInit = false;
+    uint64_t bbrFrame[2] = {}, fgFrame = 0;
     float prevDt = 1.0f / 60.0f;
     std::map<VkImage, Texture> wrapped;
     Texture exposureOne;   // 1x1 exposure 1.0 when the game provides none
@@ -159,7 +160,7 @@ M4R_API void m4r_destroy(m4r_context* c) {
     if (!c) return;
     flushDump(c);
     if (c->dumpDepth.buffer) { c->vk.destroyBuffer(c->dumpDepth); c->vk.destroyBuffer(c->dumpMotion); }
-    c->bbr.reset(); c->fg.reset();
+    c->bbr[0].reset(); c->bbr[1].reset(); c->fg.reset();
     for (auto& [img, t] : c->wrapped) c->vk.destroyTexture(t);
     if (c->exposureOne.image) c->vk.destroyTexture(c->exposureOne);
     for (Texture* t : {&c->frames[0], &c->frames[1], &c->generated})
@@ -173,25 +174,37 @@ M4R_API const char* m4r_last_error(m4r_context* c) { return c ? c->error.c_str()
 
 M4R_API int m4r_upscale_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t iw, uint32_t ih) {
     const uint32_t s[4] = {ow, oh, iw, ih};
-    if (c->bbr && !std::memcmp(s, c->bbrSize, sizeof s)) return 0;
-    auto p = std::make_unique<Plan>(c->rt);
-    if (!p->load(c->dir + "/" + sizeName("bbr", s))) { c->error = p->error; return 1; }
+    if (c->bbrInit && !std::memcmp(s, c->bbrSize, sizeof s)) return 0;
+    // The plan depends on the depth convention (the kernels differ), so each one has its own: bbr-WxH-wxh for reversed depth
+    // (what most engines use), bbr-WxH-wxh-fwd for forward depth. Either is enough here; m4r_upscale picks by desc->depth_reversed.
+    std::unique_ptr<Plan> plans[2];
+    std::string why;
+    for (int rev = 0; rev < 2; ++rev) {
+        auto p = std::make_unique<Plan>(c->rt);
+        if (p->load(c->dir + "/" + sizeName("bbr", s) + (rev ? "" : "-fwd"))) plans[rev] = std::move(p);
+        else why += (why.empty() ? "" : "; ") + p->error;
+    }
+    if (!plans[0] && !plans[1]) { c->error = why; return 1; }
     if (!c->exposureOne.image) {
         if (!c->vk.createTexture(c->exposureOne, VK_FORMAT_R32_SFLOAT, 1, 1)) { c->error = "exposure texture"; return 1; }
     }
-    c->bbr = std::move(p);
+    c->bbr[0] = std::move(plans[0]); c->bbr[1] = std::move(plans[1]);
     std::memcpy(c->bbrSize, s, sizeof s);
-    c->bbrFrame = 0;
+    c->bbrInit = true;
+    c->bbrFrame[0] = c->bbrFrame[1] = 0;
     return 0;
 }
 
 M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_desc* d) {
-    if (!c->bbr) { c->error = "m4r_upscale_init not called"; return 1; }
-    Plan& p = *c->bbr;
+    if (!c->bbrInit) { c->error = "m4r_upscale_init not called"; return 1; }
+    const int rev = d->depth_reversed ? 1 : 0;
+    if (!c->bbr[rev]) { c->error = std::string("no plan for ") + (rev ? "reversed" : "forward") + " depth (prepare it with --reversed-depth " + (rev ? "1" : "0") + ")"; return 1; }
+    Plan& p = *c->bbr[rev];
+    uint64_t& frame = c->bbrFrame[rev];
     const Texture *color = c->wrap(d->color), *depth = c->wrap(d->depth), *motion = c->wrap(d->motion), *out = c->wrap(d->output);
     if (!color || !depth || !motion || !out) { c->error = "missing input or output image"; return 1; }
     const Texture* exposure = d->exposure.image ? c->wrap(d->exposure) : &c->exposureOne;
-    if (c->bbrFrame == 0 && !d->exposure.image) {   // exposure 1.0: cleared to 1 in the first recorded frame
+    if (frame == 0 && !d->exposure.image) {   // exposure 1.0: cleared to 1 in the first recorded frame
         c->vk.toGeneral(cb, c->exposureOne);
         VkClearColorValue one{{1.0f, 1.0f, 1.0f, 1.0f}};
         VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -203,13 +216,13 @@ M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_de
     BRNetShaderParams bp = bbrParams(int(s[0]), int(s[1]), int(s[2]), int(s[3]), int(d->content_width), int(d->content_height),
                                      d->jitter_x, d->jitter_y, d->motion_scale_x, d->motion_scale_y);
     const float pre = d->pre_exposure > 0 ? d->pre_exposure : 1.0f;
-    const uint8_t reset = (d->reset || c->bbrFrame == 0) ? 1 : 0;
+    const uint8_t reset = (d->reset || frame == 0) ? 1 : 0;
     const float cpf[2] = {float(d->content_width) / s[0], float(d->content_height) / s[1]};
     p.bindBuffer("params", c->rt.transient(&bp, sizeof bp));
     p.bindBuffer("preexp", c->rt.transient(&pre, 4));
     p.bindBuffer("reset", c->rt.transient(&reset, 1));
     p.bindBuffer("cpf", c->rt.transient(cpf, 8));
-    p.setParity(int(c->bbrFrame & 1));
+    p.setParity(int(frame & 1));
     LayoutGuard g{cb};
     for (const m4r_image* im : {&d->color, &d->depth, &d->motion, &d->exposure, &d->output}) g.add(*im);
     g.begin();
@@ -217,7 +230,7 @@ M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_de
     c->vk.barrier(cb);
     g.end();
     if (!ok) { c->error = p.error; return 1; }
-    ++c->bbrFrame;
+    ++frame;
     return 0;
 }
 

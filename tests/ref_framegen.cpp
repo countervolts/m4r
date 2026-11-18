@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
             ud2.color = image(ucolor); ud2.depth = image(udepth); ud2.motion = image(umotion); ud2.output = image(uout);
             ud2.content_width = iw; ud2.content_height = ih;
             ud2.jitter_x = float(halton(t + 1, 2)); ud2.jitter_y = float(halton(t + 1, 3));
-            ud2.motion_scale_x = ud2.motion_scale_y = 1.0f; ud2.pre_exposure = 1.0f; ud2.reset = t == 0;
+            ud2.motion_scale_x = ud2.motion_scale_y = 1.0f; ud2.pre_exposure = 1.0f; ud2.reset = t == 0; ud2.depth_reversed = 1;   // the fixtures use reversed depth
             VkCommandBuffer ucb = vk.begin();
             if (m4r_upscale(ctx, ucb, &ud2) != 0 || !vk.submit(ucb)) { std::fprintf(stderr, "frame %d: upscale: %s\n", t, m4r_last_error(ctx)); rc = 1; break; }
         }
