@@ -111,6 +111,26 @@ bool Plan::load(const std::string& dir) {
             return fail("unknown directive " + w);
         }
     }
+    // Metal bindings stay in place from one dispatch to the next (MetalFX binds the parameter buffer once for several
+    // kernels). Give every pass the bindings its kernel's arguments need, so that any range of passes can be recorded alone.
+    std::map<int, Bind> buffers, textures;
+    for (auto& p : passes_) {
+        for (auto& b : p.binds) {
+            if (b.kind == 'b' || b.kind == 'y') buffers[int(b.index)] = b;
+            else if (b.kind == 't') textures[int(b.index)] = b;
+        }
+        for (const Arg& a : p.kernel->args) {
+            if (a.location < 0) continue;
+            const bool isBuffer = a.kind == Arg::Buffer, isTexture = a.kind == Arg::Texture;
+            if (!isBuffer && !isTexture) continue;
+            bool bound = false;
+            for (auto& b : p.binds)
+                if (int(b.index) == a.location && (isBuffer ? (b.kind == 'b' || b.kind == 'y') : b.kind == 't')) bound = true;
+            if (bound) continue;
+            auto& have = isBuffer ? buffers : textures;
+            if (auto it = have.find(a.location); it != have.end()) p.binds.push_back(it->second);
+        }
+    }
     return true;
 }
 

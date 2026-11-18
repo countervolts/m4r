@@ -118,6 +118,31 @@ int main(int argc, char** argv) {
             std::memcpy(plan.buffer("cpf")->map, cpf, 8);
             plan.setParity(t);
             rt.resetTransient();
+            if (std::getenv("M4R_PASS_TIME")) {
+                // debug: GPU time of every pass (one submission each), averaged over the frames after the first
+                static std::vector<double> total(plan.passes(), 0.0);
+                for (size_t i = 0; i < plan.passes(); ++i) {
+                    VkCommandBuffer pcb = vk.begin();
+                    vkCmdResetQueryPool(pcb, qp, 0, 2);
+                    vkCmdWriteTimestamp(pcb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+                    if (!plan.record(pcb, i, 1)) { std::fprintf(stderr, "record: %s\n", plan.error.c_str()); return 1; }
+                    vk.barrier(pcb);
+                    vkCmdWriteTimestamp(pcb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+                    if (!vk.submit(pcb)) { std::fprintf(stderr, "submit: %s\n", vk.error.c_str()); return 1; }
+                    uint64_t ts[2];
+                    vkGetQueryPoolResults(vk.device, qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                    if (t > 0) total[i] += double(ts[1] - ts[0]) * props.limits.timestampPeriod * 1e-6;
+                }
+                if (t == frames - 1) {
+                    double sum = 0;
+                    for (size_t i = 0; i < plan.passes(); ++i) {
+                        std::printf("pass %2zu %-48s %7.3f ms\n", i, plan.passLabel(i).c_str(), total[i] / (frames - 1));
+                        sum += total[i] / (frames - 1);
+                    }
+                    std::printf("sum %.3f ms\n", sum);
+                }
+                continue;
+            }
             if (std::getenv("M4R_PASS_HASH")) {
                 // debug: one submission per pass, then a hash of every buffer and texture that changed
                 std::map<std::string, uint64_t> last;

@@ -2,7 +2,7 @@
 """Frame-interpolation fixture from the moving-camera scene (tests/scene_motion.py): unjittered colour frames at
 integer times (output size), depth and motion at input size, and the true in-between frames at t - 0.5.
 Writes build/fixtures/fg/: color-NN.rgba16f, depth-NN.r32f, mv-NN.rg16f (input pixels, previous - current), mid-NN.rgba16f.
-env: M4R_OW/M4R_OH output size, M4R_IW/M4R_IH input size, M4R_N frames, M4R_OBJ=mv for a moving sphere"""
+env: M4R_FG_DIR output directory name under build/fixtures (default fg), M4R_OW/M4R_OH output size, M4R_IW/M4R_IH input size, M4R_N frames, M4R_OBJ=mv for a moving sphere"""
 # SPDX-License-Identifier: GPL-3.0-only
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -10,7 +10,7 @@ os.environ.setdefault('M4R_MOTION_DIR', 'fg')
 import scene_motion as s  # noqa: E402
 
 if __name__ == '__main__':
-    out = s.ROOT / 'build' / 'fixtures' / 'fg'
+    out = s.ROOT / 'build' / 'fixtures' / os.environ.get('M4R_FG_DIR', 'fg')
     out.mkdir(parents=True, exist_ok=True)
     for t in range(s.N):
         s.CUR[0] = t

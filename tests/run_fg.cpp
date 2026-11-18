@@ -76,6 +76,8 @@ int main(int argc, char** argv) {
             }
             Texture& cur = color[t & 1];
             vk.upload(cur, c.data(), c.size()); vk.upload(depth, d.data(), d.size()); vk.upload(motion, m.data(), m.size());
+            const bool noWarmup = std::getenv("RUNFG_NO_WARMUP") != nullptr;   // like m4r_framegen_capture: the first call is for frame 1
+            if (noWarmup && t == 0) continue;
             plan.bindTexture("color", &cur);
             plan.bindTexture("prevcolor", &color[(t + 1) & 1]);
             FGParams p{};
@@ -93,7 +95,7 @@ int main(int argc, char** argv) {
             p.contentDimensions[0] = uint16_t(iw); p.contentDimensions[1] = uint16_t(ih);
             p.outputDimensions[0] = uint16_t(ow); p.outputDimensions[1] = uint16_t(oh);
             std::memcpy(plan.buffer("fgparams")->map, &p, sizeof p);
-            plan.setParity(t);
+            plan.setParity(noWarmup ? t - 1 : t);
             rt.resetTransient();
             VkCommandBuffer cb = vk.begin();
             vkCmdResetQueryPool(cb, qp, 0, 2);

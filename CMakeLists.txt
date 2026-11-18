@@ -50,3 +50,6 @@ target_link_libraries(run_bbr m4r_runtime)
 
 add_executable(run_fg tests/run_fg.cpp)
 target_link_libraries(run_fg m4r_runtime)
+
+add_executable(ref_framegen tests/ref_framegen.cpp)
+target_link_libraries(ref_framegen m4r_runtime ${CMAKE_DL_LIBS})

@@ -25,7 +25,7 @@ is re-trained, approximated or replaced.
 | Runtime (Vulkan + vkhip, Metal binding model, pass plans) | works: translated `copyTexture` is bit-exact on an RX 7700 XT |
 | ML temporal scaler (BBR: tBBRNet + sBBRNet) | **works offline**: full 27-pass pipeline, 640x360 → 1280x720 at 28.27 dB vs a supersampled reference (bilinear 21.9 dB), bit-identical from run to run, 5.3 ms per frame before optimisation |
 | OptiScaler "MetalFX" upscaler (`patches/optiscaler/`) | **works in a test harness under Proton** (vkd3d-proton): 28.27 dB, about 6.3 ms per frame with submit and wait; not tried in a game yet |
-| OptiScaler "MetalFX FG" output | written and compiled; not tested end to end yet |
+| OptiScaler "MetalFX FG" output | **works in a test harness under Proton**: real frames restored bit-exactly, generated frames about 24.5–25.1 dB against the true in-between frame (blend 21.7 dB); not tried in a game yet |
 | Frame interpolation | **works offline**: 30 passes, 31.9–32.1 dB vs true in-between frames (frame blend 22.3 dB), 0.87 ms at 1280x720 |
 | Spatial scaler, temporal V3, denoiser | later |
 

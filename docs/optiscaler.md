@@ -68,7 +68,7 @@ shown back to back. How well that paces is a guess; it is not a replacement for 
 | | |
 |---|---|
 | Upscaler through OptiScaler under Proton | works with the test harness: 640x360 → 1280x720, 28.27 dB against a supersampled reference (bilinear 21.9 dB), about 6.3 ms per frame including submit and wait. **Not tried in a game yet.** |
-| Frame generation output | compiles, links and is selectable; **not exercised end to end yet** (the harness has no swapchain mode) |
+| Frame generation output | **works in the test harness** (swapchain, 20 frames, 1280x720, OptiFG with the Upscaler input): from the first active frame every present becomes two; each real frame is put back bit-exactly; generated frames equal a native replay of the same parameters (8 of 9 bit for bit, one frame differs in 15 values); about 24.5–25.1 dB against the true in-between frame where blending gives 21.7 dB. **Not tried in a game yet.** |
 | Menu entries | added; not seen on screen yet |
 
 Known limits: display-resolution motion vectors (the upscaler logs a warning, frame generation skips the frame),
@@ -77,7 +77,36 @@ including the HUD (no hudless input), no dynamic resolution.
 
 The pipeline is deterministic: repeated runs give bit-identical frames (`tests/check_determinism.sh`).
 
+## Frame generation behaviour seen in the test
+
+- The first generated frame after a reset is a copy of the current frame: there is no history yet (the offline runner shows the
+  same). Other frames can be copies too: the histogram analysis compares nine 256-bin histograms of consecutive frames and sets
+  a bit for each where the sum of absolute differences reaches `w*h*80/900` of the input; if any bit is set the warp stage copies
+  the current frame (the sketch is in docs/metalfx-framegen.md). On the test scene one frame in nine (18) trips it. This is
+  Apple's logic, executed as written, and a harmless fallback.
+- **Open, small:** in one frame (12) the generated frame differs from the native replay in 6 to 15 values (a few pixels around
+  y=385..388, up to 0.18 in value, 73 dB PSNR), consistently in the harness run and consistently in the replay, never in the
+  other frames. What I ruled out: the inputs (depth, motion vectors and the back buffer are bit-identical to the fixture, dumped
+  inside m4r with `M4R_DUMP_FG`), the kernel parameter bytes (identical, logged with `M4R_LOG`), uninitialised video memory
+  (junk-filled before the replay), GPU timing and occupancy (the replay is identical under load and with large LDS
+  reservations), the upscaler running before it, and the queue family. A race between writers in a motion-vector splat pass is
+  the most likely explanation, but I have not shown it.
+
 ## Testing
+
+Frame generation, through OptiScaler under Proton, then compared with a native replay of the same frames and parameters:
+
+```bash
+M4R_FG_PLAN=build/fg-1280x720 tests/run_optiscaler.sh "$PROTON_DIR" build-opti/OptiScaler.dll build-win/m4r.dll \
+    build/bbr-1280x720 build/fixtures/motion20 20          # build/fixtures/motion20: M4R_N=20 M4R_OBJ=mv M4R_MOTION_DIR=motion20 python3 tests/scene_motion.py
+MID_DIR=build/fixtures/fg20 BBR_PLAN=build/bbr-1280x720 \
+    tests/check_framegen.sh build-harness/app build/fixtures/motion20 build/fg-1280x720 20   # fg20: M4R_FG_DIR=fg20 M4R_N=20 M4R_OBJ=mv python3 tests/scene_fg.py
+```
+
+OptiScaler pauses frame generation for 10 frames after it activates, so the run needs more than 14 frames. The harness paces
+itself at 60 fps and keeps its frames in memory until the end so that OptiScaler sees plausible frame times.
+
+Upscaler only:
 
 ```bash
 tests/build_harness.sh                               # clang-cl + xwin -> build-harness/d3d12_harness.exe

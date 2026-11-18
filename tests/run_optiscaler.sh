@@ -2,6 +2,9 @@
 # End-to-end test: the D3D12 harness calls OptiScaler's NGX entry points under Proton, OptiScaler's upscaler is MetalFX
 # (m4r). Everything is staged in a fresh app directory; the Proton install is not modified.
 # usage: tests/run_optiscaler.sh PROTON_DIR OPTISCALER_DLL M4R_DLL PLAN_DIR FIXTURE_DIR [FRAMES IN_W IN_H OUT_W OUT_H]
+# M4R_FG_PLAN=<fg plan dir>: also turns on MetalFX frame generation (FGInput=upscaler, FGOutput=metalfx), gives the harness a
+# swapchain and writes m4r's frame generation parameters to <app>/m4r.log (compare with tests/check_framegen.sh).
+# M4R_FG_DUMP=1 additionally saves the depth and motion vectors m4r received to <app>/dumps.
 # SPDX-License-Identifier: GPL-3.0-only
 set -euo pipefail
 if [[ $# -lt 5 ]]; then
@@ -22,13 +25,20 @@ cp -f "$OPTI" "$APP/dxgi.dll"
 cp -f "$M4R" "$APP/m4r/m4r.dll"
 ln -s "$PLAN" "$APP/m4r/plans/bbr-${OW}x${OH}-${IW}x${IH}"
 ln -s "$FIX" "$APP/fixture"
+FGEN=false; FGIN=nofg; FGOUT=nofg
+if [[ -n "${M4R_FG_PLAN:-}" ]]; then
+  ln -s "$(realpath "$M4R_FG_PLAN")" "$APP/m4r/plans/fg-${OW}x${OH}-${IW}x${IH}"
+  FGEN=true; FGIN=upscaler; FGOUT=metalfx
+  export M4R_HARNESS_SWAPCHAIN=1 M4R_HARNESS_REVERSED_DEPTH=1 M4R_LOG=m4r.log
+  if [[ -n "${M4R_FG_DUMP:-}" ]]; then mkdir -p "$APP/dumps"; export M4R_DUMP_FG=dumps; fi   # depth/motion as m4r saw them
+fi
 cat > "$APP/OptiScaler.ini" <<EOF
 [Upscalers]
 Dx12Upscaler=metalfx
 [FrameGen]
-Enabled=false
-FGInput=nofg
-FGOutput=nofg
+Enabled=$FGEN
+FGInput=$FGIN
+FGOutput=$FGOUT
 [Spoofing]
 Dxgi=false
 [Plugins]

@@ -3,6 +3,9 @@
 #include "plan.h"
 #include "params.h"
 #include "m4r.h"
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 
@@ -21,6 +24,10 @@ struct m4r_context {
     // present-time frame generation: the last two finished frames and the generated frame (RGBA16F, display size)
     Texture frames[2], generated;
     int current = -1;
+    // M4R_DUMP_FG=<dir>: depth and motion vectors as the frame generation saw them, written when the GPU is done with them
+    Buffer dumpDepth, dumpMotion;
+    int dumpPending = -1, dumpCount = 0;
+    uint32_t dumpW = 0, dumpH = 0;
 
     const Texture* wrap(const m4r_image& im) {
         if (!im.image) return nullptr;
@@ -32,6 +39,32 @@ struct m4r_context {
         return &(wrapped[im.image] = t);
     }
 };
+
+// M4R_LOG=<file>: one line per frame generation call, so tests can replay the same parameters
+static void logLine(const char* fmt, ...) {
+    const char* path = std::getenv("M4R_LOG");
+    if (!path) return;
+    FILE* f = std::fopen(path, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(f, fmt, ap);
+    va_end(ap);
+    std::fclose(f);
+}
+
+static void flushDump(m4r_context* c) {
+    if (c->dumpPending < 0) return;
+    const char* dir = std::getenv("M4R_DUMP_FG");
+    if (dir) {
+        char nm[512];
+        std::snprintf(nm, sizeof nm, "%s/in-depth-%02d.r32f", dir, c->dumpPending);
+        if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(c->dumpDepth.map, 1, size_t(c->dumpW) * c->dumpH * 4, f); std::fclose(f); }
+        std::snprintf(nm, sizeof nm, "%s/in-motion-%02d.rg16f", dir, c->dumpPending);
+        if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(c->dumpMotion.map, 1, size_t(c->dumpW) * c->dumpH * 4, f); std::fclose(f); }
+    }
+    c->dumpPending = -1;
+}
 
 // moves caller images to GENERAL for m4r's passes and back afterwards
 struct LayoutGuard {
@@ -124,6 +157,8 @@ M4R_API int m4r_create(m4r_context** out, PFN_vkGetInstanceProcAddr gipa, VkInst
 
 M4R_API void m4r_destroy(m4r_context* c) {
     if (!c) return;
+    flushDump(c);
+    if (c->dumpDepth.buffer) { c->vk.destroyBuffer(c->dumpDepth); c->vk.destroyBuffer(c->dumpMotion); }
     c->bbr.reset(); c->fg.reset();
     for (auto& [img, t] : c->wrapped) c->vk.destroyTexture(t);
     if (c->exposureOne.image) c->vk.destroyTexture(c->exposureOne);
@@ -211,6 +246,12 @@ M4R_API int m4r_interpolate(m4r_context* c, VkCommandBuffer cb, const m4r_interp
                                        d->depth_reversed != 0, dt, c->prevDt, d->near_plane > 0 ? d->near_plane : 0.1f,
                                        d->far_plane > 0 ? d->far_plane : 1000.0f);
     c->prevDt = dt;
+    if (std::getenv("M4R_LOG")) {
+        std::string hex;
+        char b[3];
+        for (size_t i = 0; i < sizeof fp; ++i) { std::snprintf(b, sizeof b, "%02x", reinterpret_cast<const uint8_t*>(&fp)[i]); hex += b; }
+        logLine("interpolate params=%s\n", hex.c_str());
+    }
     p.bindBuffer("fgparams", c->rt.transient(&fp, sizeof fp));
     p.setParity(int(c->fgFrame & 1));
     LayoutGuard g{cb};
@@ -225,6 +266,12 @@ M4R_API int m4r_interpolate(m4r_context* c, VkCommandBuffer cb, const m4r_interp
 }
 
 M4R_API int m4r_framegen_capture(m4r_context* c, VkCommandBuffer cb, const m4r_framegen_desc* d) {
+    if (std::getenv("M4R_DUMP_FG")) flushDump(c);   // the previous capture's commands have finished
+    if (c->fg && std::getenv("M4R_LOG")) {   // the histogram analysis of the previous interpolation: bit i = histogram group i changed
+        uint32_t w = 0xffffffffu;               // beyond the rejection threshold (frame change word, hist + 0x4800)
+        if (Buffer* b = c->fg->buffer("hist")) std::memcpy(&w, static_cast<uint8_t*>(b->map) + 0x4800, 4);
+        logLine("framechange %u\n", w);
+    }
     const m4r_image& bb = d->backbuffer;
     if (!bb.image || !d->depth.image || !d->motion.image) { c->error = "missing backbuffer, depth or motion vectors"; return -1; }
     if (m4r_interpolate_init(c, bb.width, bb.height, d->depth.width, d->depth.height) != 0) return -1;
@@ -255,7 +302,33 @@ M4R_API int m4r_framegen_capture(m4r_context* c, VkCommandBuffer cb, const m4r_f
         if (m4r_interpolate(c, cb, &in) != 0) return -1;
         blit(cb, c->generated.image, VK_IMAGE_LAYOUT_GENERAL, bb.image, bb.layout, bb.width, bb.height);
     }
+    if (generate && std::getenv("M4R_DUMP_FG")) {
+        const uint32_t w = d->depth.width, h = d->depth.height;
+        if (c->dumpW != w || c->dumpH != h) {
+            if (c->dumpDepth.buffer) { c->vk.destroyBuffer(c->dumpDepth); c->vk.destroyBuffer(c->dumpMotion); }
+            c->vk.createBuffer(c->dumpDepth, size_t(w) * h * 4, true);
+            c->vk.createBuffer(c->dumpMotion, size_t(w) * h * 4, true);
+            c->dumpW = w; c->dumpH = h;
+        }
+        LayoutGuard g{cb};
+        g.add(d->depth); g.add(d->motion);
+        g.begin();
+        const bool depthFmt = d->depth.format == VK_FORMAT_D32_SFLOAT || d->depth.format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        VkBufferImageCopy r{};
+        r.imageSubresource = {VkImageAspectFlags(depthFmt ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
+        r.imageExtent = {w, h, 1};
+        vkCmdCopyImageToBuffer(cb, d->depth.image, VK_IMAGE_LAYOUT_GENERAL, c->dumpDepth.buffer, 1, &r);
+        r.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vkCmdCopyImageToBuffer(cb, d->motion.image, VK_IMAGE_LAYOUT_GENERAL, c->dumpMotion.buffer, 1, &r);
+        c->vk.barrier(cb);
+        g.end();
+        c->dumpPending = c->dumpCount;
+    }
+    ++c->dumpCount;
     c->current = next;
+    logLine("capture bb=%ux%u depth=%ux%u mvscale=%.9g,%.9g dt=%.9g near=%.9g far=%.9g rev=%d reset=%d generated=%d\n",
+            bb.width, bb.height, d->depth.width, d->depth.height, d->motion_scale_x, d->motion_scale_y, d->delta_time,
+            d->near_plane, d->far_plane, d->depth_reversed, d->reset, generate ? 1 : 0);
     return generate ? 1 : 0;
 }
 

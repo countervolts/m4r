@@ -3,6 +3,11 @@
 // m4r in <app>/m4r (tests/run_optiscaler.sh does that).
 // Inputs are the fixture sequence of tests/scene_motion.py (input-NN.rgba16f, depth-NN.r32f, mvlo-NN.rg16f).
 // usage: d3d12_harness.exe <ngx dll> <fixture dir> <out dir> <frames> <in w> <in h> <out w> <out h>
+// M4R_HARNESS_SWAPCHAIN=1: also opens a window with a flip-model FP16 swapchain on the same queue, copies each upscaled
+// frame into the back buffer and presents it (OptiScaler's frame generation output hooks that present), then reads back
+// the two buffers a present can touch: bbk-NN (the buffer that was presented first: the generated frame when one was made)
+// and bbk1-NN (the next one: the real frame, put back by the output). Present advances the buffer index by the number of
+// frames actually presented, which is logged as `presents`.
 // Built with clang-cl (MSVC ABI), so NVSDK_NGX_Parameter's virtual Set/Get can be called directly.
 // SPDX-License-Identifier: GPL-3.0-only
 #include <windows.h>
@@ -130,6 +135,32 @@ int main(int argc, char** argv) {
     CHECK(g.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g.fence)));
     g.event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
 
+    const bool swap = std::getenv("M4R_HARNESS_SWAPCHAIN") != nullptr;
+    HWND hwnd = nullptr;
+    IDXGISwapChain3* sc = nullptr;
+    ID3D12Resource* backbuffers[3] = {};
+    constexpr UINT kBuffers = 3;
+    if (swap) {
+        WNDCLASSA wc{};
+        wc.lpfnWndProc = DefWindowProcA;
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.lpszClassName = "m4rharness";
+        RegisterClassA(&wc);
+        hwnd = CreateWindowExA(0, wc.lpszClassName, "m4r harness", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, int(ow) + 16, int(oh) + 39,
+                               nullptr, nullptr, wc.hInstance, nullptr);
+        if (!hwnd) { std::printf("CreateWindow failed: %lu\n", GetLastError()); return 1; }
+        IDXGIFactory2* factory = nullptr;
+        CHECK(CreateDXGIFactory1(IID_PPV_ARGS(&factory)));
+        DXGI_SWAP_CHAIN_DESC1 sd{};
+        sd.Width = ow; sd.Height = oh; sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.BufferCount = kBuffers; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        IDXGISwapChain1* sc1 = nullptr;
+        CHECK(factory->CreateSwapChainForHwnd(g.queue, hwnd, &sd, nullptr, nullptr, &sc1));
+        CHECK(sc1->QueryInterface(IID_PPV_ARGS(&sc)));
+        for (UINT i = 0; i < kBuffers; ++i) CHECK(sc->GetBuffer(i, IID_PPV_ARGS(&backbuffers[i])));
+        std::printf("swapchain %ux%u, %u buffers\n", ow, oh, kBuffers);
+    }
+
     HMODULE ngx = LoadLibraryA(argv[1]);
     if (!ngx) { std::printf("LoadLibrary(%s) failed: %lu\n", argv[1], GetLastError()); return 1; }
 #define NGX_FN(name) auto name = reinterpret_cast<decltype(&::name)>(reinterpret_cast<void*>(GetProcAddress(ngx, #name)))
@@ -164,7 +195,9 @@ int main(int argc, char** argv) {
     p->Set(NVSDK_NGX_Parameter_OutWidth, ow);
     p->Set(NVSDK_NGX_Parameter_OutHeight, oh);
     p->Set(NVSDK_NGX_Parameter_PerfQualityValue, int(NVSDK_NGX_PerfQuality_Value_MaxPerf));
-    p->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, int(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_IsHDR));
+    int createFlags = int(NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_IsHDR);
+    if (std::getenv("M4R_HARNESS_REVERSED_DEPTH")) createFlags |= int(NVSDK_NGX_DLSS_Feature_Flags_DepthInverted);   // the fixtures' depth is reversed
+    p->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, createFlags);
     p->Set(NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects, 0);
     NVSDK_NGX_Handle* feature = nullptr;
     r = NVSDK_NGX_D3D12_CreateFeature(g.list, NVSDK_NGX_Feature_SuperSampling, p, &feature);
@@ -185,8 +218,22 @@ int main(int argc, char** argv) {
 
     std::vector<uint8_t> out(size_t(ow) * oh * 8);
     int rc = 0;
+    // swapchain mode keeps the frames in memory and writes them at the end, and paces the loop like a 60 fps game, so
+    // OptiScaler sees plausible frame times (it feeds them to frame generation)
+    struct Saved { std::string name; std::vector<uint8_t> data; };
+    std::vector<Saved> saved;
+    const auto save = [&](const char* nm, const std::vector<uint8_t>& d) {
+        if (swap) saved.push_back({outDir + nm, d});
+        else if (FILE* f = std::fopen((outDir + nm).c_str(), "wb")) { std::fwrite(d.data(), 1, d.size(), f); std::fclose(f); }
+    };
+    const double frameMs = std::getenv("M4R_HARNESS_FRAME_MS") ? std::atof(std::getenv("M4R_HARNESS_FRAME_MS")) : 1000.0 / 60.0;
+    auto frameStart = std::chrono::steady_clock::now();
     for (int t = 0; t < frames && rc == 0; ++t) {
         char nm[64];
+        if (swap) {
+            while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frameStart).count() < frameMs) Sleep(0);
+            frameStart = std::chrono::steady_clock::now();
+        }
         std::snprintf(nm, sizeof nm, "/input-%02d.rgba16f", t); auto c = readAll(fx + nm);
         std::snprintf(nm, sizeof nm, "/depth-%02d.r32f", t); auto d = readAll(fx + nm);
         std::snprintf(nm, sizeof nm, "/mvlo-%02d.rg16f", t); auto m = readAll(fx + nm);
@@ -227,10 +274,39 @@ int main(int argc, char** argv) {
         for (UINT y = 0; y < oh; ++y) std::memcpy(out.data() + size_t(y) * ow * 8, rb + size_t(y) * Gpu::pitch(ow, 8), size_t(ow) * 8);
         readback->Unmap(0, nullptr);
         std::snprintf(nm, sizeof nm, "/out-%02d.rgba16f", t);
-        if (FILE* f = std::fopen((outDir + nm).c_str(), "wb")) { std::fwrite(out.data(), 1, out.size(), f); std::fclose(f); }
+        save(nm, out);
         std::printf("frame %d: EvaluateFeature ok (call %.0f us, call + submit + wait %.2f ms)\n", t,
                     std::chrono::duration<double, std::micro>(t1 - t0).count(), std::chrono::duration<double, std::milli>(t2 - t0).count());
+        if (swap) {
+            MSG msg;
+            while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageA(&msg); }
+            const UINT k = sc->GetCurrentBackBufferIndex();
+            g.barrier(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            g.barrier(backbuffers[k], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+            g.list->CopyResource(backbuffers[k], output);
+            g.barrier(backbuffers[k], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+            g.barrier(output, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            if (!g.run()) { std::printf("frame %d: copy to the back buffer failed\n", t); rc = 1; break; }
+            const HRESULT hr = sc->Present(0, 0);
+            const UINT after = sc->GetCurrentBackBufferIndex();
+            const UINT presents = (after + kBuffers - k) % kBuffers;
+            std::printf("frame %d: Present -> 0x%08lx, buffer %u -> %u, presents %u\n", t, hr, k, after, presents);
+            for (UINT j = 0; j < 2; ++j) {
+                ID3D12Resource* bb = backbuffers[(k + j) % kBuffers];
+                g.barrier(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                g.copy(readback, bb, DXGI_FORMAT_R16G16B16A16_FLOAT, ow, oh, 8, false);
+                g.barrier(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+                if (!g.run()) { std::printf("frame %d: back buffer readback failed\n", t); rc = 1; break; }
+                readback->Map(0, nullptr, reinterpret_cast<void**>(&rb));
+                for (UINT y = 0; y < oh; ++y) std::memcpy(out.data() + size_t(y) * ow * 8, rb + size_t(y) * Gpu::pitch(ow, 8), size_t(ow) * 8);
+                readback->Unmap(0, nullptr);
+                std::snprintf(nm, sizeof nm, j == 0 ? "/bbk-%02d.rgba16f" : "/bbk1-%02d.rgba16f", t);
+                save(nm, out);
+            }
+        }
     }
+    for (const Saved& sv : saved)
+        if (FILE* f = std::fopen(sv.name.c_str(), "wb")) { std::fwrite(sv.data.data(), 1, sv.data.size(), f); std::fclose(f); }
     if (NVSDK_NGX_D3D12_ReleaseFeature) NVSDK_NGX_D3D12_ReleaseFeature(feature);
     if (NVSDK_NGX_D3D12_DestroyParameters) NVSDK_NGX_D3D12_DestroyParameters(p);
     if (NVSDK_NGX_D3D12_Shutdown1) NVSDK_NGX_D3D12_Shutdown1(g.device);
