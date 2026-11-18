@@ -36,7 +36,7 @@ BUILTINS = {
     'air.thread_position_in_grid', 'air.thread_position_in_threadgroup', 'air.threadgroup_position_in_grid',
     'air.thread_index_in_threadgroup', 'air.threads_per_threadgroup', 'air.threadgroups_per_grid',
     'air.threads_per_grid', 'air.simdgroup_index_in_threadgroup', 'air.thread_index_in_simdgroup',
-    'air.simdgroups_per_threadgroup', 'air.threads_per_simdgroup',
+    'air.simdgroups_per_threadgroup', 'air.threads_per_simdgroup', 'air.position',
 }
 
 
@@ -74,9 +74,9 @@ def md_items(body):
 
 def kernel_info(text, kernel):
     nodes = md_nodes(text)
-    km = re.search(r'^!air\.kernel = !\{(.*)\}$', text, re.M)
+    km = re.search(r'^!air\.(?:kernel|fragment) = !\{(.*)\}$', text, re.M)
     if not km:
-        raise ValueError('no !air.kernel')
+        raise ValueError('no !air.kernel or !air.fragment')
     for ref in md_items(km.group(1)):
         items = md_items(nodes[int(ref[1:])])
         if items[0].endswith('@' + kernel) or items[0].endswith('@"' + kernel + '"'):
@@ -190,6 +190,13 @@ def translate(text, kernel, constants, tg, wave=32):
     """Return (amdgpu IR text, manifest dict)."""
     args = kernel_info(text, kernel)
     fcs = function_constants(text)
+    is_fragment = re.search(r'^!air\.fragment = ', text, re.M) is not None
+    uses_imageblock = '@air.store.implicit_imageblock' in text
+    intrinsics.CTX['tg'] = tg
+    if uses_imageblock:
+        # tile kernels: the imageblock is the render pass's colour attachment; stores go to a render-target texture
+        text = re.sub(r'(call void @air\.store\.implicit_imageblock\.\w+\()', r'\1ptr addrspace(1) %__m4r_rt, ', text)
+        text = re.sub(r'(declare void @air\.store\.implicit_imageblock\.\w+\()', r'\1ptr addrspace(1), ', text)
     manifest = {'kernel': kernel, 'threadgroup': tg, 'wave': wave, 'constants': {}, 'args': [], 'samplers': []}
 
     # 1. function constants
@@ -296,13 +303,16 @@ def translate(text, kernel, constants, tg, wave=32):
     text += 'attributes #900 = { alwaysinline nounwind }\n'
 
     # 9. kernel wrapper
-    m = re.search(r'^define (?:[\w ]*?)void @' + re.escape(kernel) + r'\((.*)\)(.*)\{$', text, re.M)
+    m = re.search(r'^define (?:[\w ]*?)(void|<\d+ x \w+>) @' + re.escape(kernel) + r'\((.*)\)(.*)\{$', text, re.M)
     if not m:
         raise ValueError('kernel definition not found')
-    params = [intrinsics.clean_type(p).rsplit(' ', 1)[0] if p.strip() else p for p in intrinsics.split_params(m.group(1))]
-    params = [re.sub(r'\s*%\d+$', '', intrinsics.clean_type(p)).strip() for p in intrinsics.split_params(m.group(1))]
+    ret_type = m.group(1)
+    params = [re.sub(r'\s*%\d+$', '', intrinsics.clean_type(p)).strip() for p in intrinsics.split_params(m.group(2))]
     inner = '__air_' + kernel
-    text = text[:m.start()] + m.group(0).replace('define ', 'define internal ', 1).replace('@' + kernel + '(', '@' + inner + '(', 1) + text[m.end():]
+    head = m.group(0).replace('define ', 'define internal ', 1).replace('@' + kernel + '(', '@' + inner + '(', 1)
+    if uses_imageblock:
+        head = head.replace(m.group(2) + ')', m.group(2) + ', ptr addrspace(1) %__m4r_rt)', 1)
+    text = text[:m.start()] + head + text[m.end():]
 
     by_index = {a['index']: a for a in args}
     kparams, call_args, pre = [], [], []
@@ -314,6 +324,9 @@ def translate(text, kernel, constants, tg, wave=32):
         if kind in BUILTINS:
             call_args.append((ptype, f'%b{i}'))
             pre.append(('builtin', i, kind, ptype))
+            continue
+        if kind == 'air.imageblock':
+            call_args.append((ptype, 'poison'))
             continue
         if kind == 'air.buffer' and a.get('address_space') == 3:
             lds_args.append(i)
@@ -334,6 +347,13 @@ def translate(text, kernel, constants, tg, wave=32):
             slot += 1
             continue
         raise ValueError(f'{kernel}: unsupported argument {i} kind {kind}')
+    if is_fragment or uses_imageblock:
+        kparams.append('ptr addrspace(1) %krt')
+        manifest['args'].append({'slot': slot, 'offset': slot * 8, 'kind': 'texture', 'location': 255,
+                                 'name': '__rendertarget', 'access': 'write'})
+        slot += 1
+        if uses_imageblock:
+            call_args.append(('ptr addrspace(1)', '%krt'))
     grid_off = slot * 8
     manifest['grid_offset'] = grid_off
     kparams += ['i32 %gx', 'i32 %gy', 'i32 %gz']
@@ -394,6 +414,14 @@ def translate(text, kernel, constants, tg, wave=32):
             comps = [str(nsg)]
         elif kind == 'air.threads_per_simdgroup':
             comps = [str(wave)]
+        elif kind == 'air.position':
+            w.append(f'  %pfx{i} = uitofp i32 %px to float')
+            w.append(f'  %pfy{i} = uitofp i32 %py to float')
+            w.append(f'  %pcx{i} = fadd float %pfx{i}, 0.5')
+            w.append(f'  %pcy{i} = fadd float %pfy{i}, 0.5')
+            w.append(f'  %b{i}v0 = insertelement <4 x float> <float 0.0, float 0.0, float 0.0, float 1.0>, float %pcx{i}, i32 0')
+            w.append(f'  %b{i} = insertelement <4 x float> %b{i}v0, float %pcy{i}, i32 1')
+            continue
         vals = []
         for k, cv in enumerate(comps):
             if e == 'i32':
@@ -415,7 +443,20 @@ def translate(text, kernel, constants, tg, wave=32):
                 cur = nm
             w.append(f'  %b{i} = shufflevector {ptype} {cur}, {ptype} poison, <{n} x i32> <' + ', '.join(f'i32 {k}' for k in range(n)) + '>')
     ca = ', '.join(f'{t} {v}' for t, v in call_args)
-    w.append(f'  call void @{inner}({ca})')
+    if ret_type == 'void':
+        w.append(f'  call void @{inner}({ca})')
+    else:
+        # fragment function: its colour goes to the render target at this pixel
+        w.append(f'  %frag = call {ret_type} @{inner}({ca})')
+        rt_store = intrinsics.rt_store_def(ret_type)
+        text += '\n' + rt_store[0] + '\n'
+        extra_rt = rt_store[1]
+        w.append(f'  call void @__m4r_rt_write({ret_type} %frag, ptr addrspace(1) %krt, i32 %px, i32 %py)')
+        for d in extra_rt:
+            nm = re.search(r'@([\w.]+)\(', d).group(1)
+            if nm not in existing:
+                text += d + '\n'
+                existing.add(nm)
     w.append('  br label %done')
     w.append('done:')
     w.append('  ret void')
@@ -449,17 +490,17 @@ def compile_ir(text, out_path, mcpu='gfx1101', wave=32, keep=None, opt_level='3'
         if keep:
             open(keep + '.amdgpu.ll', 'w').write(text)
         run(['llvm-as', ll, '-o', bc])
-        run(['opt', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr=+wavefrontsize{wave}', bc, '-o', bc])
+        run(['opt', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr=+wavefrontsize{wave},-real-true16', bc, '-o', bc])
         dis = run(['llvm-dis', bc, '-o', '-']).decode()
         if 'llvm.global_ctors' in dis and re.search(r'@llvm\.global_ctors = appending global \[[1-9]', dis):
             raise RuntimeError('static initialiser of function constants was not folded')
         if keep:
             open(keep + '.opt.ll', 'w').write(dis)
-        run(['llc', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr=+wavefrontsize{wave}',
+        run(['llc', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr=+wavefrontsize{wave},-real-true16',
              '-filetype=obj', bc, '-o', obj])
         if keep:
             open(keep + '.s', 'wb').write(run(['llc', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}',
-                                                f'-mattr=+wavefrontsize{wave}', bc, '-o', '-']))
+                                                f'-mattr=+wavefrontsize{wave},-real-true16', bc, '-o', '-']))
         run(['ld.lld', '-shared', obj, '-o', out_path])
 
 

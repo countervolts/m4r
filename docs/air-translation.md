@@ -57,10 +57,18 @@ From the seven distinct states MetalFX uses and the coordinates the kernels pass
 | 15 | `coord::pixel` | kernels using it pass pixel-space coordinates, the others normalised ones |
 | high 16 bits of word 0 | `0x7bff` (half max), presumably the LOD clamp | inferred |
 
+## Fragment functions and tile kernels
+
+- A fragment function (e.g. `copyImage`) runs as compute: `air.position` is the pixel centre, and the returned
+  colour is stored into a render-target texture passed as a hidden argument (Metal binding 255 in plans).
+- A tile kernel's implicit imageblock store (`warpImage`) writes the same render target at
+  workgroup · tile + in-tile coordinate; m4r dispatches one threadgroup per tile.
+- LLVM 23's gfx11 true-16-bit register mode miscompiles `findOpticalMotionVectorsV3/Ref` ("expected inline
+  constant"); kernels are built with `-real-true16`.
+
 ## Not done yet
 
-- imageblock/tile kernels (`unified_*_tile`, `warpImage`'s implicit imageblock): need a rewrite to LDS.
-- `findOpticalMotionVectorsV3/Ref` fail in instruction selection ("expected inline constant").
+- explicit imageblock reads and `write_imageblock_slice_to_texture` (`unified_*_tile`, temporal V3 only).
 - Metal's partial edge threadgroups: Metal shrinks `threads_per_threadgroup` at the grid edge; the translation
   reports the shrunk size but forms SIMD groups from the full threadgroup shape.
 - Floating-point reduction order in `simd_sum` and the exact rounding of Apple's texture filtering differ from

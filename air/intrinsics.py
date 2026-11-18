@@ -39,7 +39,7 @@ ATTR_WORDS = r'\b(noundef|nocapture|readonly|writeonly|readnone|nonnull|noalias|
 
 def clean_type(t):
     t = re.sub(ATTR_WORDS, '', t)
-    t = re.sub(r'"[^"]*"(="[^"]*")?', '', t)
+    t = re.sub(r'(?<![%@])"[^"]*"(="[^"]*")?', '', t)   # attribute strings, not quoted type names
     return ' '.join(t.split())
 
 
@@ -577,6 +577,32 @@ def wg_barrier(b, s):
     return None
 
 
+def imageblock_store(b, s):
+    """air.store.implicit_imageblock(rt, value, index, coord-in-tile, ...): store to the render target at
+    workgroup * tile + coord (m4r dispatches one threadgroup per tile)."""
+    vt = s.params[1]
+    d = desc(b, '%a0', storage=True)
+    tx, ty = CTX['tg'][0], CTX['tg'][1]
+    gx = intr(b, 'i32', 'llvm.amdgcn.workgroup.id.x', [])
+    gy = intr(b, 'i32', 'llvm.amdgcn.workgroup.id.y', [])
+    lx, ly = coords_i32(b, s.params[3], '%a3')
+    ox = b.v(f'mul i32 {gx}, {tx}'); oy = b.v(f'mul i32 {gy}, {ty}')
+    x = b.v(f'add i32 {ox}, {lx}'); y = b.v(f'add i32 {oy}, {ly}')
+    intr(b, 'void', f'llvm.amdgcn.image.store.2d.{ivsuffix(fp_twin(vt))}.i32',
+         [(fp_twin(vt), '%a1'), ('i32', '15'), ('i32', x), ('i32', y), ('<8 x i32>', d), ('i32', '0'), ('i32', '0')])
+    return None
+
+
+def rt_store_def(vt):
+    """@__m4r_rt_write(value, rt, x, y): a fragment function's return value to the render target."""
+    b = Body()
+    d = desc(b, '%rt', storage=True)
+    intr(b, 'void', f'llvm.amdgcn.image.store.2d.{ivsuffix(fp_twin(vt))}.i32',
+         [(fp_twin(vt), '%v'), ('i32', '15'), ('i32', '%x'), ('i32', '%y'), ('<8 x i32>', d), ('i32', '0'), ('i32', '0')])
+    text = [f'define internal void @__m4r_rt_write({vt} %v, ptr addrspace(1) %rt, i32 %x, i32 %y) #900 {{'] + b.lines + ['  ret void', '}']
+    return '\n'.join(text), b.decls
+
+
 def identity(b, s):
     return '%a0'
 
@@ -645,6 +671,7 @@ TABLE = [
     (r'air\.atomic\.local\.load\.', atomic_load_local),
     (r'air\.atomic\.local\.store\.', atomic_store_local),
     (r'air\.wg\.barrier$', wg_barrier),
+    (r'air\.store\.implicit_imageblock\.', imageblock_store),
 ]
 
 
@@ -677,7 +704,8 @@ def implement(decl_line):
 # `load/store.with.emask` move 4 consecutive elements; element i takes part when bit i of (mask & mask2) is set
 # (masked-off loads return 0). MetalFX passes either 15 or 0 as the first mask and 15 as the second.
 
-MXU_MODE = {'mode': 'lds'}   # 'lds' (table-driven) or 'probe'
+MXU_MODE = {'mode': 'lds'}
+CTX = {'tg': [1, 1, 1]}   # threadgroup (= tile) size of the kernel being translated   # 'lds' (table-driven) or 'probe'
 
 
 def emask_load(b, s):
