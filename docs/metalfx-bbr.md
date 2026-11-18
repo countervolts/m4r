@@ -124,8 +124,8 @@ input scale). Kernel `SBBRNet`.
 `tests/run_bbr.cpp` runs the whole plan (`tools/prepare_bbr.py`: exposure, tensor builds, tBBRNet, sBBRNet, flow
 splat/diff, history warp, overshoot clamp, AnisoGaussian composite, sacneh prefilter; 27 passes) on the
 moving-camera fixture from `tests/scene_motion.py` (adapted from x4r): 640x360 → 1280x720, 8 frames,
-**28.2 dB** sRGB PSNR against the 2x2-supersampled reference on the last frame (bilinear: 21.9 dB), 5.3 ms per
-frame on an RX 7700 XT with the unoptimised GEMM.
+**28.27 dB** sRGB PSNR against the 2x2-supersampled reference on the last frame (bilinear: 21.9 dB), 1.7 ms per
+frame on an RX 7700 XT (5.3 ms with the first, dot-product GEMM lowering; see docs/mxu.md).
 
 - `jitterOffset` is the **negative** of the sub-pixel offset the frame was rendered with (with the positive sign the
   same run gives 22.7 dB and a visibly blurred, offset history).

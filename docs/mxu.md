@@ -22,11 +22,28 @@ reproduce a numpy convolution exactly on random data (`tests/verify_conv.py`, ma
 **Not verified:** `fgemm16x16x16` is assumed to use the same layout (it is only used by the first layer's
 `Conv3x3Stride1Enc0FQSplit` and by `SBBRNet`); the s8 variant (type 75) is not exercised by the BBR network.
 
-## Lowering (first version)
+## Lowering
 
-Each GEMM writes A and Bᵀ to a per-wave LDS tile in logical order and computes every accumulator element with
-`v_dot4_{u,i}32_{u,i}8` (`v_dot2_f32_f16` for fgemm). This is correct but slow; the next step is RDNA3 WMMA
-(`v_wmma_i32_16x16x16_iu8`, `v_wmma_f32_16x16x16_f16`) with the operands permuted from Apple's layout to WMMA's.
+Apple's lane layout (measured, `air/mxu_layout.py`) has a closed form in the lane bits, which the lowering uses instead of table
+lookups (`_mxu_closed_forms_ok` checks it against the tables every time): a lane holds, for A and for the accumulator, 4
+consecutive columns/k of rows `r` and `r + 8`, and for B^T, 4 consecutive columns at `k` and `k + 8`, with
+`r = lane bits (1, 2, 4) -> (bit 1 of lane, bit 2, bit 4)` and `k0 / c0 = 4 * lane[0] + 8 * lane[3]`.
+
+- **Integer GEMM (u8/s8, i32 accumulators): RDNA3 WMMA** (`v_wmma_i32_16x16x16_iu8`). WMMA wants lane `l` to hold row or column
+  `l & 15` with all 16 k, so A (two dword stores) and B^T (eight byte stores) are scattered through the wave's LDS slot, read
+  back as two 16-byte rows, multiplied, and the result written to LDS row-major and read back in Apple's layout (two 16-byte
+  loads) and added to the accumulator. Integer sums do not depend on the order, so this is **bit-identical** to the dot-product
+  lowering it replaced (`M4R_MXU_INT=dot` builds that one); checked on the numpy convolution (`tests/verify_conv.py`) and on
+  every output frame of the full pipeline. The integer convolutions went from 3.3 ms to 0.45 ms per frame.
+- **fp16 GEMM (f16 inputs, f32 accumulators): a chain of `v_dot2_f32_f16`** over k in increasing order, as before, but with
+  the closed-form layout: each lane loads its 2 rows of A and 4 columns of B once instead of 32 operand vectors and 8 table
+  lookups. Same arithmetic, so bit-identical to the table version (`M4R_MXU_FP16=table`); `SBBRNet` 1.16 → 0.57 ms, the first
+  layer 0.32 → 0.14 ms. **WMMA is not used here on purpose:** `v_wmma_f32_16x16x16_f16` adds the products in an order and with
+  roundings the ISA does not specify, so its f32 sums would differ from the dot2 chain in the last bits, which is a change of
+  the numerics, not only of speed.
+
+Whole frame (640x360 → 1280x720, RX 7700 XT): 5.3 ms before, 1.7 ms now (`M4R_PASS_TIME=1 build/run_bbr ...` prints the time of
+every pass).
 
 ## LDS slots
 

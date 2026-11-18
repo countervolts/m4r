@@ -12,6 +12,7 @@ Conventions shared with m4r_air.py:
   * a sampler argument is a `ptr addrspace(4)` to a 16-byte sampler descriptor (S#).
   * SIMD groups are wave32 waves; lane = mbcnt over the full mask.
 """
+import os
 import re
 
 FLOATS = {'half': 'f16', 'float': 'f32'}
@@ -704,7 +705,8 @@ def implement(decl_line):
 # `load/store.with.emask` move 4 consecutive elements; element i takes part when bit i of (mask & mask2) is set
 # (masked-off loads return 0). MetalFX passes either 15 or 0 as the first mask and 15 as the second.
 
-MXU_MODE = {'mode': 'lds'}
+MXU_MODE = {'mode': 'lds', 'int': os.environ.get('M4R_MXU_INT', 'wmma'),   # integer GEMM: 'wmma' or 'dot' (udot4/sdot4)
+            'fp16': os.environ.get('M4R_MXU_FP16', 'closed')}   # fp16 GEMM: 'closed' (closed-form layout) or 'table'
 CTX = {'tg': [1, 1, 1]}   # threadgroup (= tile) size of the kernel being translated   # 'lds' (table-driven) or 'probe'
 
 
@@ -762,6 +764,187 @@ def _layout_index(b, table, lane, slot):
     return b.v(f'zext i8 {v} to i32')
 
 
+def _mxu_closed_forms_ok():
+    """The measured lane layout (air/mxu_layout.py) has a closed form in the lane bits; the lowering below uses it."""
+    import mxu_layout
+    for lane in range(32):
+        a0 = ((lane & 1) << 2) | ((lane & 2) << 3) | ((lane & 4) << 3) | (lane & 8) | ((lane & 16) << 2)
+        c0 = ((lane & 1) << 2) | (lane & 8)
+        kk = ((lane & 2) >> 1) | ((lane & 4) >> 1) | ((lane & 16) >> 2)
+        for sl in range(8):
+            if mxu_layout.A[lane * 8 + sl] != a0 + (sl & 3) + (128 if sl >= 4 else 0): return False
+            if mxu_layout.C[lane * 8 + sl] != a0 + (sl & 3) + (128 if sl >= 4 else 0): return False
+            if mxu_layout.BT[lane * 8 + sl] != ((c0 + (sl & 3)) << 4) + kk + (8 if sl >= 4 else 0): return False
+    return True
+
+
+WMMA_I8 = 'llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v4i32'
+
+
+def _igemm_wmma(b, lane):
+    """D = C + A.B for 16x16x16 u8/s8 with RDNA3 WMMA. Exact (integer), so equal to the dot-product lowering. The operands
+    still go through LDS: Apple's lane layout holds 4 consecutive k of two rows of A, but WMMA wants a whole row of k per lane."""
+    assert _mxu_closed_forms_ok(), 'air/mxu_layout.py no longer matches the closed forms in _igemm_wmma'
+    A, B, C = '%a4', '%a6', '%a8'
+    base = _lds_wave_base(b, MXU_WAVE_BYTES)
+
+    def lane_bits(mask, shift):
+        t = b.v(f'and i32 {lane}, {mask}')
+        if shift > 0:
+            return b.v(f'shl i32 {t}, {shift}')
+        return b.v(f'lshr i32 {t}, {-shift}') if shift < 0 else t
+
+    def at(off_expr, align):   # pointer into the wave's LDS slot
+        return b.v(f'getelementptr inbounds i8, ptr addrspace(3) {base}, i32 {off_expr}')
+
+    # tile coordinates of this lane in Apple's layout
+    a0 = b.v(f'or i32 {lane_bits(1, 2)}, {lane_bits(2, 3)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(4, 3)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(8, 0)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(16, 2)}')          # row * 16 + k of the first element of A (and of C)
+    c0 = b.v(f'or i32 {lane_bits(1, 2)}, {lane_bits(8, 0)}')
+    kk = b.v(f'or i32 {lane_bits(2, -1)}, {lane_bits(4, -1)}')
+    kk = b.v(f'or i32 {kk}, {lane_bits(16, -2)}')
+    b0 = b.v(f'shl i32 {c0}, 4')
+    b0 = b.v(f'add i32 {b0}, {kk}')                         # col * 16 + k of the first element of B^T
+
+    # A: two dwords (4 consecutive k) at rows r and r + 8
+    a2 = b.v(f'bitcast i64 {A} to <2 x i32>')
+    for half in range(2):
+        x = b.v(f'extractelement <2 x i32> {a2}, i32 {half}')
+        p = at(b.v(f'add i32 {a0}, {128 * half}'), 4)
+        b.emit(f'store i32 {x}, ptr addrspace(3) {p}, align 4')
+    # B^T: 8 bytes, 4 consecutive columns at k and k + 8
+    bv = b.v(f'bitcast i64 {B} to <8 x i8>')
+    for sl in range(8):
+        x = b.v(f'extractelement <8 x i8> {bv}, i32 {sl}')
+        p = at(b.v(f'add i32 {b0}, {256 + (sl & 3) * 16 + (8 if sl >= 4 else 0)}'), 1)
+        b.emit(f'store i8 {x}, ptr addrspace(3) {p}, align 1')
+    b.emit('fence syncscope("wavefront") release')
+    b.emit('fence syncscope("wavefront") acquire')
+
+    # WMMA wants lane l (and l + 16) to hold row / column (l & 15) of A / B, all 16 k
+    l16 = b.v(f'and i32 {lane}, 15')
+    row_off = b.v(f'shl i32 {l16}, 4')
+    xa = b.v(f'load <4 x i32>, ptr addrspace(3) {at(row_off, 16)}, align 16')
+    xb = b.v(f'load <4 x i32>, ptr addrspace(3) {at(b.v(f"add i32 {row_off}, 256"), 16)}, align 16')
+    sa = b.v('icmp eq i16 %a5, 75')
+    sb = b.v('icmp eq i16 %a7, 75')
+    b.decls.add(f'declare <8 x i32> @{WMMA_I8}(i1 immarg, <4 x i32>, i1 immarg, <4 x i32>, <8 x i32>, i1 immarg)')
+    b.emit(f'br i1 {sa}, label %wm_a1, label %wm_a0')
+    results = []
+    for ia in (0, 1):
+        b.emit(f'wm_a{ia}:')
+        b.emit(f'br i1 {sb}, label %wm_{ia}1, label %wm_{ia}0')
+    for ia in (0, 1):
+        for ib in (0, 1):
+            b.emit(f'wm_{ia}{ib}:')
+            r = b.v(f'call <8 x i32> @{WMMA_I8}(i1 {"true" if ia else "false"}, <4 x i32> {xa}, i1 {"true" if ib else "false"}, '
+                    f'<4 x i32> {xb}, <8 x i32> zeroinitializer, i1 false)')
+            b.emit('br label %wm_end')
+            results.append((r, f'wm_{ia}{ib}'))
+    b.emit('wm_end:')
+    d = b.v('phi <8 x i32> ' + ', '.join(f'[ {r}, %{lbl} ]' for r, lbl in results))
+
+    # D: lane holds column (lane & 15) and rows 2 * i + (lane >> 4); write it row-major over the operand tiles
+    hi = b.v(f'lshr i32 {lane}, 4')
+    for i in range(8):
+        x = b.v(f'extractelement <8 x i32> {d}, i32 {i}')
+        row = b.v(f'add i32 {hi}, {2 * i}')
+        o = b.v(f'shl i32 {row}, 4')
+        o = b.v(f'add i32 {o}, {l16}')
+        o = b.v(f'shl i32 {o}, 2')
+        b.emit(f'store i32 {x}, ptr addrspace(3) {at(o, 4)}, align 4')
+    b.emit('fence syncscope("wavefront") release')
+    b.emit('fence syncscope("wavefront") acquire')
+    # back to Apple's layout: 4 consecutive columns of rows r and r + 8
+    o = b.v(f'shl i32 {a0}, 2')
+    g0 = b.v(f'load <4 x i32>, ptr addrspace(3) {at(o, 16)}, align 16')
+    g1 = b.v(f'load <4 x i32>, ptr addrspace(3) {at(b.v(f"add i32 {o}, 512"), 16)}, align 16')
+    g = b.v(f'shufflevector <4 x i32> {g0}, <4 x i32> {g1}, <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>')
+    out = b.v(f'add <8 x i32> {C}, {g}')
+    b.emit('fence syncscope("wavefront") release')   # the slot is reused by the next GEMM
+    b.emit('fence syncscope("wavefront") acquire')
+    return out
+
+
+def _fgemm_dot2(b, lane):
+    """D = C + A.B for 16x16x16 fp16 with f32 accumulators, as a chain of v_dot2_f32_f16 over k in increasing order (the same
+    arithmetic as before this lowering used the closed-form layout, so results are bit-identical to it): a lane holds rows
+    r and r + 8 and columns c0 .. c0 + 3 of the result, so it needs only 2 rows of A and 4 columns of B (each 32 bytes)."""
+    assert _mxu_closed_forms_ok(), 'air/mxu_layout.py no longer matches the closed forms'
+    A, B, C = '%a0', '%a2', '%a4'
+    base = _lds_wave_base(b, MXU_WAVE_BYTES)
+
+    def lane_bits(mask, shift):
+        t = b.v(f'and i32 {lane}, {mask}')
+        if shift > 0:
+            return b.v(f'shl i32 {t}, {shift}')
+        return b.v(f'lshr i32 {t}, {-shift}') if shift < 0 else t
+
+    def at(off_expr):
+        return b.v(f'getelementptr inbounds i8, ptr addrspace(3) {base}, i32 {off_expr}')
+
+    a0 = b.v(f'or i32 {lane_bits(1, 2)}, {lane_bits(2, 3)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(4, 3)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(8, 0)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(16, 2)}')          # row * 16 + k0 (elements) of A's and C's first element
+    c0 = b.v(f'or i32 {lane_bits(1, 2)}, {lane_bits(8, 0)}')
+    kk = b.v(f'or i32 {lane_bits(2, -1)}, {lane_bits(4, -1)}')
+    kk = b.v(f'or i32 {kk}, {lane_bits(16, -2)}')
+    b0 = b.v(f'shl i32 {c0}, 4')
+    b0 = b.v(f'add i32 {b0}, {kk}')                         # col * 16 + k (elements) of B^T's first element
+
+    # A tile [row][k] halves at byte 0, B^T tile [col][k] at byte 512: 4 consecutive k of rows r and r + 8
+    for half in range(2):
+        x = b.v(f'shufflevector <8 x half> {A}, <8 x half> poison, <4 x i32> <i32 {4 * half}, i32 {4 * half + 1}, i32 {4 * half + 2}, i32 {4 * half + 3}>')
+        o = b.v(f'add i32 {a0}, {128 * half}')
+        o = b.v(f'shl i32 {o}, 1')
+        b.emit(f'store <4 x half> {x}, ptr addrspace(3) {at(o)}, align 8')
+    for sl in range(8):
+        x = b.v(f'extractelement <8 x half> {B}, i32 {sl}')
+        o = b.v(f'add i32 {b0}, {(sl & 3) * 16 + (8 if sl >= 4 else 0)}')
+        o = b.v(f'shl i32 {o}, 1')
+        o = b.v(f'add i32 {o}, 512')
+        b.emit(f'store half {x}, ptr addrspace(3) {at(o)}, align 2')
+    b.emit('fence syncscope("wavefront") release')
+    b.emit('fence syncscope("wavefront") acquire')
+
+    row0 = b.v(f'lshr i32 {a0}, 4')                          # first row of this lane's results
+    col0 = b.v(f'and i32 {a0}, 15')                          # first column
+    arow = []   # the 2 rows of A this lane needs, each as 8 x <2 x half> pairs in k order
+    for h in range(2):
+        r = b.v(f'add i32 {row0}, {8 * h}')
+        o = b.v(f'shl i32 {r}, 5')
+        lo = b.v(f'load <8 x half>, ptr addrspace(3) {at(o)}, align 16')
+        hi = b.v(f'load <8 x half>, ptr addrspace(3) {at(b.v(f"add i32 {o}, 16"))}, align 16')
+        arow.append((lo, hi))
+    bcol = []   # the 4 columns of B
+    for j in range(4):
+        c = b.v(f'add i32 {col0}, {j}')
+        o = b.v(f'shl i32 {c}, 5')
+        o = b.v(f'add i32 {o}, 512')
+        lo = b.v(f'load <8 x half>, ptr addrspace(3) {at(o)}, align 16')
+        hi = b.v(f'load <8 x half>, ptr addrspace(3) {at(b.v(f"add i32 {o}, 16"))}, align 16')
+        bcol.append((lo, hi))
+
+    def pair(vec, q):   # elements 2q, 2q + 1 of a 16-element row held as (lo, hi) halves of 8
+        src = vec[0] if q < 4 else vec[1]
+        e = (q % 4) * 2
+        return b.v(f'shufflevector <8 x half> {src}, <8 x half> poison, <2 x i32> <i32 {e}, i32 {e + 1}>')
+
+    out = C
+    for sl in range(8):
+        acc = b.v(f'extractelement <8 x float> {C}, i32 {sl}')
+        ar, bc = arow[sl // 4], bcol[sl & 3]
+        for q in range(8):
+            acc = intr(b, 'float', 'llvm.amdgcn.fdot2', [('<2 x half>', pair(ar, q)), ('<2 x half>', pair(bc, q)), ('float', acc), ('i1', 'false')])
+        out = b.v(f'insertelement <8 x float> {out}, float {acc}, i32 {sl}')
+    b.emit('fence syncscope("wavefront") release')   # the slot is reused by the next GEMM
+    b.emit('fence syncscope("wavefront") acquire')
+    return out
+
+
 def mxu_gemm(kind):
     """kind 'i' (8 x i8 per lane packed in i64, i32 accumulators) or 'f' (8 x half, f32 accumulators)."""
     def f(b, s):
@@ -801,6 +984,10 @@ def mxu_gemm(kind):
                     v = b.v(f'uitofp i32 {v} to float')
                 ids = b.v(f'insertelement {at} {ids}, {"i32" if kind == "i" else "float"} {v}, i32 {sl}')
             return b.v(f'select i1 {allz}, {at} {ids}, {at} {C}')
+        if kind == 'i' and MXU_MODE['int'] == 'wmma':
+            return _igemm_wmma(b, lane)
+        if kind == 'f' and MXU_MODE['fp16'] == 'closed':
+            return _fgemm_dot2(b, lane)
         # table-driven: scatter A and B into LDS in logical [row][k] / [col][k] order, then dot products
         base = _lds_wave_base(b, MXU_WAVE_BYTES)
         for (vv, table, off) in ((av, '__m4r_mxu_a', 0), (bv, '__m4r_mxu_bt', 256 * esz)):

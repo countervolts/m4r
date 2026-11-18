@@ -67,7 +67,7 @@ shown back to back. How well that paces is a guess; it is not a replacement for 
 
 | | |
 |---|---|
-| Upscaler through OptiScaler under Proton | works with the test harness: 640x360 → 1280x720, 28.27 dB against a supersampled reference (bilinear 21.9 dB), about 6.3 ms per frame including submit and wait. **Not tried in a game yet.** |
+| Upscaler through OptiScaler under Proton | works with the test harness: 640x360 → 1280x720, 28.27 dB against a supersampled reference (bilinear 21.9 dB), about 2.7 ms per frame including submit and wait. **Not tried in a game yet.** |
 | Frame generation output | **works in the test harness** (swapchain, 20 frames, 1280x720, OptiFG with the Upscaler input): from the first active frame every present becomes two; each real frame is put back bit-exactly; generated frames equal a native replay of the same parameters (8 of 9 bit for bit, one frame differs in 15 values); about 24.5–25.1 dB against the true in-between frame where blending gives 21.7 dB. **Not tried in a game yet.** |
 | Menu entries | added; not seen on screen yet |
 
