@@ -110,10 +110,10 @@ index 7ff5af6..885c040 100644
      std::vector<IUnknown*> scBuffers;
 diff --git a/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.cpp b/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.cpp
 new file mode 100644
-index 0000000..cc19a4c
+index 0000000..d1f54fa
 --- /dev/null
 +++ b/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.cpp
-@@ -0,0 +1,573 @@
+@@ -0,0 +1,618 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include "pch.h"
 +#include "MetalFXFG_Dx12.h"
@@ -240,7 +240,15 @@ index 0000000..cc19a4c
 +        }
 +    }
 +
-+    // The command lists m4r records into
++    CreateRing(InDevice);
++}
++
++// The command lists m4r records into, and the fence that tells when an allocator can be reused
++void MetalFXFG_Dx12::CreateRing(ID3D12Device* InDevice)
++{
++    if (_list[0] != nullptr || InDevice == nullptr)
++        return;
++
 +    for (UINT i = 0; i < Slots; i++)
 +    {
 +        InDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_alloc[i]));
@@ -251,6 +259,7 @@ index 0000000..cc19a4c
 +    }
 +    InDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_fence));
 +    _fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
++    _slot = 0;
 +}
 +
 +bool MetalFXFG_Dx12::CreateSwapchainInternal(IDXGIFactory* factory, ID3D12CommandQueue* cmdQueue,
@@ -320,6 +329,7 @@ index 0000000..cc19a4c
 +
 +void MetalFXFG_Dx12::Activate()
 +{
++    LOG_DEBUG("MetalFX FG: Activate, active {}, paused {}, frame {}", _isActive, IsPaused(), _frameCount);
 +    if (!_isActive)
 +    {
 +        UpdateTarget();
@@ -330,6 +340,7 @@ index 0000000..cc19a4c
 +
 +void MetalFXFG_Dx12::Deactivate()
 +{
++    LOG_DEBUG("MetalFX FG: Deactivate, active {}, paused {}, frame {}", _isActive, IsPaused(), _frameCount);
 +    if (_isActive)
 +    {
 +        _isActive = false;
@@ -339,12 +350,14 @@ index 0000000..cc19a4c
 +
 +void MetalFXFG_Dx12::DestroyFGContext()
 +{
++    LOG_DEBUG("MetalFX FG: DestroyFGContext, active {}, paused {}, frame {}", _isActive, IsPaused(), _frameCount);
 +    Deactivate();
 +    ReleaseObjects();
 +}
 +
 +bool MetalFXFG_Dx12::Shutdown()
 +{
++    LOG_DEBUG("MetalFX FG: Shutdown, active {}, paused {}, frame {}", _isActive, IsPaused(), _frameCount);
 +    MenuOverlayDx::CleanupRenderTarget(true, NULL);
 +    DestroyFGContext();
 +    return true;
@@ -361,6 +374,7 @@ index 0000000..cc19a4c
 +
 +    if (Config::Instance()->IsFGEnabled())
 +    {
++        LOG_TRACE("MetalFX FG: EvaluateState, active {}, paused {}, frame {}, target {}", _isActive, IsPaused(), _frameCount, _targetFrame);
 +        if (_device == nullptr)
 +            CreateContext(device, fgConstants);
 +
@@ -395,7 +409,12 @@ index 0000000..cc19a4c
 +ID3D12GraphicsCommandList* MetalFXFG_Dx12::BeginList()
 +{
 +    if (_list[0] == nullptr || _fence == nullptr)
++        CreateRing(_device);   // released with the other objects when the feature went away; the device is still known
++    if (_list[0] == nullptr || _fence == nullptr)
++    {
++        LOG_ERROR("MetalFX FG: no command lists");
 +        return nullptr;
++    }
 +
 +    _cur = _slot++ % Slots;
 +    if (_slotFence[_cur] != 0 && _fence->GetCompletedValue() < _slotFence[_cur])
@@ -453,6 +472,7 @@ index 0000000..cc19a4c
 +{
 +    auto& state = State::Instance();
 +    auto fIndex = GetIndex();
++    LOG_TRACE("MetalFX FG: Present, frame {}, active {}, paused {}, this {:X}", _frameCount, _isActive, IsPaused(), (size_t) this);
 +
 +    // Execute what hudfix or UI composition recorded for this frame
 +    if (_gameCommandQueue != nullptr)
@@ -477,17 +497,25 @@ index 0000000..cc19a4c
 +
 +    // Returning false: the caller still presents the real frame
 +    if (_real == nullptr || _gameCommandQueue == nullptr || _device == nullptr)
++    {
++        LOG_TRACE("MetalFX FG: not ready, swapchain {:X}, queue {:X}, device {:X}", (size_t) _real, (size_t) _gameCommandQueue, (size_t) _device);
 +        return false;
++    }
 +
 +    if (!IsActive() || IsPaused())
 +    {
++        LOG_TRACE("MetalFX FG: not presenting, active {}, paused {} (frame {}, target {})", IsActive(), IsPaused(), _frameCount,
++                  _targetFrame);
 +        _needReset = true;
 +        return false;
 +    }
 +
 +    auto& m4r = M4RProxy::Get();
 +    if (m4r.module == nullptr || m4r.framegenCapture == nullptr || m4r.framegenRestore == nullptr)
++    {
++        LOG_TRACE("MetalFX FG: m4r.dll is not usable");
 +        return false;
++    }
 +
 +    auto depth = GetResource(FG_ResourceType::Depth, fIndex);
 +    auto velocity = GetResource(FG_ResourceType::Velocity, fIndex);
@@ -495,6 +523,7 @@ index 0000000..cc19a4c
 +        velocity->validity == FG_ResourceValidity::ValidNow)
 +    {
 +        // no usable depth or motion vectors this frame (menus, loading): the next one starts over
++        LOG_TRACE("MetalFX FG: no usable depth or motion vectors for frame {}", _frameCount);
 +        _needReset = true;
 +        return false;
 +    }
@@ -502,7 +531,10 @@ index 0000000..cc19a4c
 +    if (_ctx == nullptr)
 +    {
 +        if (_ctxFailed)
++        {
++            LOG_TRACE("MetalFX FG: the m4r context could not be created before");
 +            return false;
++        }
 +
 +        _ctx = M4RD3D12::Create(_device, &_interop);
 +        if (_ctx == nullptr)
@@ -514,14 +546,21 @@ index 0000000..cc19a4c
 +
 +    ComPtr<ID3D12Resource> backbuffer;
 +    if (FAILED(_real->GetBuffer(_real->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&backbuffer))))
++    {
++        LOG_TRACE("MetalFX FG: no back buffer");
 +        return false;
++    }
 +
 +    m4r_framegen_desc d {};
 +    d.backbuffer = M4RD3D12::Image(_interop, backbuffer.Get(), D3D12_RESOURCE_STATE_PRESENT);
 +    d.depth = M4RD3D12::Image(_interop, depth->GetResource(), depth->state);
 +    d.motion = M4RD3D12::Image(_interop, velocity->GetResource(), velocity->state);
 +    if (!d.backbuffer.image || !d.depth.image || !d.motion.image)
++    {
++        LOG_TRACE("MetalFX FG: no Vulkan image for the back buffer ({:X}), depth ({:X}) or motion vectors ({:X})",
++                  (size_t) d.backbuffer.image, (size_t) d.depth.image, (size_t) d.motion.image);
 +        return false;
++    }
 +
 +    if (d.motion.width != d.depth.width || d.motion.height != d.depth.height)
 +    {
@@ -529,6 +568,8 @@ index 0000000..cc19a4c
 +            LOG_WARN("MetalFX FG: motion vectors ({}x{}) are not the depth size ({}x{}), display-resolution motion "
 +                     "vectors are not supported yet",
 +                     d.motion.width, d.motion.height, d.depth.width, d.depth.height);
++        else
++            LOG_TRACE("MetalFX FG: motion vectors and depth differ in size");
 +        _warnedMV = true;
 +        _needReset = true;
 +        return false;
@@ -537,7 +578,10 @@ index 0000000..cc19a4c
 +    const UINT64 key = ((UINT64) d.backbuffer.width << 48) ^ ((UINT64) d.backbuffer.height << 32) ^
 +                       ((UINT64) d.depth.width << 16) ^ d.depth.height;
 +    if (key == _failedKey)
++    {
++        LOG_TRACE("MetalFX FG: skipping, this size failed before");
 +        return false;
++    }
 +
 +    d.motion_scale_x = _mvScaleX[fIndex] != 0.0f ? _mvScaleX[fIndex] : 1.0f;
 +    d.motion_scale_y = _mvScaleY[fIndex] != 0.0f ? _mvScaleY[fIndex] : 1.0f;
@@ -577,6 +621,7 @@ index 0000000..cc19a4c
 +    }
 +
 +    _needReset = false;
++    LOG_TRACE("MetalFX FG: frame {} captured, generated {}", _frameCount, generated);
 +    if (generated == 0)
 +        return false;
 +
@@ -689,10 +734,10 @@ index 0000000..cc19a4c
 +void MetalFXFG_Dx12::SetCommandQueue(FG_ResourceType type, ID3D12CommandQueue* queue) { _gameCommandQueue = queue; }
 diff --git a/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.h b/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.h
 new file mode 100644
-index 0000000..c064c9e
+index 0000000..341512b
 --- /dev/null
 +++ b/OptiScaler/framegen/metalfx/MetalFXFG_Dx12.h
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,69 @@
 +#pragma once
 +// MetalFX frame interpolation (Apple's FrameGenImpl kernels run by m4r) as an OptiScaler FG output for D3D12 games
 +// under vkd3d-proton. At each present the finished frame is captured; once the previous frame is known, the generated
@@ -723,6 +768,7 @@ index 0000000..c064c9e
 +    UINT _slot = 0;
 +    UINT _cur = 0;
 +
++    void CreateRing(ID3D12Device* device);
 +    ID3D12GraphicsCommandList* BeginList();
 +    bool Submit(ID3D12GraphicsCommandList* list);
 +    void WaitIdle();

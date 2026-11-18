@@ -3,6 +3,8 @@
 // m4r in <app>/m4r (tests/run_optiscaler.sh does that).
 // Inputs are the fixture sequence of tests/scene_motion.py (input-NN.rgba16f, depth-NN.r32f, mvlo-NN.rg16f).
 // usage: d3d12_harness.exe <ngx dll> <fixture dir> <out dir> <frames> <in w> <in h> <out w> <out h>
+// M4R_HARNESS_WRAP=N: loops over the first N fixture frames (with a reset at each wrap), for runs longer than the fixture.
+// M4R_HARNESS_RECREATE=N: releases and creates the upscaler feature again at frame N (as a game does when DLSS is toggled).
 // M4R_HARNESS_SWAPCHAIN=1: also opens a window with a flip-model FP16 swapchain on the same queue, copies each upscaled
 // frame into the back buffer and presents it (OptiScaler's frame generation output hooks that present), then reads back
 // the two buffers a present can touch: bbk-NN (the buffer that was presented first: the generated frame when one was made)
@@ -218,6 +220,8 @@ int main(int argc, char** argv) {
 
     std::vector<uint8_t> out(size_t(ow) * oh * 8);
     int rc = 0;
+    const int wrap = std::getenv("M4R_HARNESS_WRAP") ? std::atoi(std::getenv("M4R_HARNESS_WRAP")) : 0;
+    const int recreateAt = std::getenv("M4R_HARNESS_RECREATE") ? std::atoi(std::getenv("M4R_HARNESS_RECREATE")) : 0;   // frame at which the feature is recreated
     // swapchain mode keeps the frames in memory and writes them at the end, and paces the loop like a 60 fps game, so
     // OptiScaler sees plausible frame times (it feeds them to frame generation)
     struct Saved { std::string name; std::vector<uint8_t> data; };
@@ -230,13 +234,22 @@ int main(int argc, char** argv) {
     auto frameStart = std::chrono::steady_clock::now();
     for (int t = 0; t < frames && rc == 0; ++t) {
         char nm[64];
+        if (recreateAt > 0 && t == recreateAt) {
+            // a game switching DLSS off and on, or changing the quality mode: the feature is destroyed and created again
+            if (NVSDK_NGX_D3D12_ReleaseFeature) NVSDK_NGX_D3D12_ReleaseFeature(feature);
+            feature = nullptr;
+            r = NVSDK_NGX_D3D12_CreateFeature(g.list, NVSDK_NGX_Feature_SuperSampling, p, &feature);
+            std::printf("frame %d: feature recreated -> 0x%08x\n", t, unsigned(r));
+            if (NVSDK_NGX_FAILED(r) || !g.run()) { rc = 1; break; }
+        }
         if (swap) {
             while (std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frameStart).count() < frameMs) Sleep(0);
             frameStart = std::chrono::steady_clock::now();
         }
-        std::snprintf(nm, sizeof nm, "/input-%02d.rgba16f", t); auto c = readAll(fx + nm);
-        std::snprintf(nm, sizeof nm, "/depth-%02d.r32f", t); auto d = readAll(fx + nm);
-        std::snprintf(nm, sizeof nm, "/mvlo-%02d.rg16f", t); auto m = readAll(fx + nm);
+        const int ft = wrap > 0 ? t % wrap : t;   // fixture frame
+        std::snprintf(nm, sizeof nm, "/input-%02d.rgba16f", ft); auto c = readAll(fx + nm);
+        std::snprintf(nm, sizeof nm, "/depth-%02d.r32f", ft); auto d = readAll(fx + nm);
+        std::snprintf(nm, sizeof nm, "/mvlo-%02d.rg16f", ft); auto m = readAll(fx + nm);
         if (c.size() != size_t(iw) * ih * 8 || d.size() != size_t(iw) * ih * 4 || m.size() != size_t(iw) * ih * 4) {
             std::printf("frame %d: fixture size mismatch\n", t);
             return 1;
@@ -252,11 +265,11 @@ int main(int argc, char** argv) {
         p->Set(NVSDK_NGX_Parameter_Depth, depth);
         p->Set(NVSDK_NGX_Parameter_MotionVectors, motion);
         p->Set(NVSDK_NGX_Parameter_Output, output);
-        p->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, jsign * float(halton(t + 1, 2)));
-        p->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, jsign * float(halton(t + 1, 3)));
+        p->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, jsign * float(halton(ft + 1, 2)));
+        p->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, jsign * float(halton(ft + 1, 3)));
         p->Set(NVSDK_NGX_Parameter_MV_Scale_X, 1.0f);
         p->Set(NVSDK_NGX_Parameter_MV_Scale_Y, 1.0f);
-        p->Set(NVSDK_NGX_Parameter_Reset, t == 0 ? 1 : 0);
+        p->Set(NVSDK_NGX_Parameter_Reset, ft == 0 ? 1 : 0);
         p->Set(NVSDK_NGX_Parameter_Sharpness, 0.0f);
         p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, iw);
         p->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, ih);
