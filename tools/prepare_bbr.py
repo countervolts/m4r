@@ -244,6 +244,9 @@ def build(args):
     json.dump({'output': [ow, oh], 'input': list(args.input), 'temporal': [tw, th], 'spatial': [sw, sh],
                'history_pitch': 32 * ((2 * ow + 63) // 64), 'reversed_depth': args.reversed_depth},
               open(os.path.join(out, 'sizes.json'), 'w'))
+    shader = os.path.join(os.path.dirname(HERE), 'shaders', 'sacneh.comp')
+    subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', shader, '-o', os.path.join(out, 'sacneh.spv')],
+                   check=True, capture_output=True)
     decl = [l for l in plan if l.split(' ', 1)[0] in ('buffer', 'texture', 'kernel', 'glsl')]
     rest = [l for l in plan if l.split(' ', 1)[0] not in ('buffer', 'texture', 'kernel', 'glsl')]
     open(os.path.join(out, 'plan.txt'), 'w').write('\n'.join(decl + rest) + '\n')

@@ -69,13 +69,8 @@ bool Plan::load(const std::string& dir) {
             ls >> name >> fmt >> tw >> th;
             Texture t;
             if (!vk.createTexture(t, formatByName(fmt), tw, th)) return fail("texture " + name);
-            VkCommandBuffer cb = vk.begin();
-            vk.toGeneral(cb, t);
-            VkClearColorValue zero{};
-            VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            vkCmdClearColorImage(cb, t.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &r);
-            if (!vk.submit(cb)) return fail("clear " + name);
             textures_[name] = t;
+            uninitialised_.push_back(name);   // transitioned and cleared in the first recorded frame
         } else if (w == "kernel") {
             std::string name, path, opt;
             ls >> name >> path;
@@ -120,6 +115,14 @@ bool Plan::load(const std::string& dir) {
 }
 
 bool Plan::record(VkCommandBuffer cb) {
+    for (auto& n : uninitialised_) {
+        Texture& t = textures_[n];
+        rt_.vk().toGeneral(cb, t);
+        VkClearColorValue zero{};
+        VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, t.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &r);
+    }
+    uninitialised_.clear();
     Encoder enc(rt_, cb);
     for (auto& p : passes_) {
         enc.setKernel(p.kernel);

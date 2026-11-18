@@ -38,6 +38,7 @@ private:
     std::vector<Pass> passes_;
     std::map<std::string, std::pair<std::string, VkDeviceSize>> views_;
     int parity_ = 0;
+    std::vector<std::string> uninitialised_;
     std::string pick(const std::string& n) const {
         auto bar = n.find('|');
         return bar == std::string::npos ? n : (parity_ ? n.substr(bar + 1) : n.substr(0, bar));

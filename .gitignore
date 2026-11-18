@@ -26,3 +26,6 @@ __pycache__/
 *.dll
 *.exe
 *.so
+/external/
+/build-*/
+.xwin-cache/

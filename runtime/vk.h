@@ -1,7 +1,7 @@
 // m4r: minimal Vulkan context for running translated MetalFX kernels (Linux harness and in-game backend).
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
-#include <vulkan/vulkan.h>
+#include "vkfn.h"
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -47,6 +47,10 @@ struct Context {
     VkDeviceSize recordsUsed = 0;
 
     bool create();               // own instance and device (harness)
+    // use an existing device (inside a game); no work is submitted to its queues
+    bool adopt(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t family);
+    // a view and descriptor record for an image owned by someone else (not destroyed by destroyTexture's owner check)
+    bool wrap(Texture& t, VkImage image, VkFormat format, uint32_t w, uint32_t h);
     void destroy();
 
     uint32_t memoryType(uint32_t bits, VkMemoryPropertyFlags want) const;

@@ -20,6 +20,7 @@ uint32_t formatBytes(VkFormat f) {
 }
 
 bool Context::create() {
+    if (!loadVulkan(nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE)) { error = "vulkan entry points"; return false; }
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "m4r";
     app.apiVersion = VK_API_VERSION_1_3;
@@ -76,13 +77,36 @@ bool Context::create() {
     return createBuffer(records, 1 << 20, true);
 }
 
+bool Context::adopt(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t family) {
+    instance = inst; physical = phys; device = dev; queueFamily = family; ownsDevice = false;
+    vkGetPhysicalDeviceMemoryProperties(physical, &memProps);
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &descProps};
+    vkGetPhysicalDeviceProperties2(physical, &p2);
+    getDescriptor = reinterpret_cast<PFN_vkGetDescriptorEXT>(vkGetDeviceProcAddr(device, "vkGetDescriptorEXT"));
+    if (!getDescriptor) { error = "VK_EXT_descriptor_buffer is not enabled on the game's device"; return false; }
+    if (descProps.sampledImageDescriptorSize > 32 || descProps.storageImageDescriptorSize > 32 || descProps.samplerDescriptorSize > 16) {
+        error = "descriptor sizes larger than the record layout"; return false;
+    }
+    return createBuffer(records, 1 << 20, true);
+}
+
+bool Context::wrap(Texture& t, VkImage image, VkFormat format, uint32_t w, uint32_t h) {
+    t = Texture{};
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = image; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = format;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(device, &vci, nullptr, &t.view) != VK_SUCCESS) { error = "image view"; return false; }
+    t.image = image; t.format = format; t.width = w; t.height = h; t.owned = false;
+    return writeRecord(t);
+}
+
 void Context::destroy() {
     if (!device) return;
     vkDeviceWaitIdle(device);
     destroyBuffer(records);
     if (pool) vkDestroyCommandPool(device, pool, nullptr);
     if (ownsDevice) vkDestroyDevice(device, nullptr);
-    if (instance) vkDestroyInstance(instance, nullptr);
+    if (ownsDevice && instance) vkDestroyInstance(instance, nullptr);
     device = VK_NULL_HANDLE;
 }
 
@@ -195,6 +219,7 @@ bool Context::samplerDescriptor(const VkSamplerCreateInfo& ci, uint8_t out[16], 
 }
 
 void Context::destroyTexture(Texture& t) {
+    if (!t.owned && t.view) vkDestroyImageView(device, t.view, nullptr);
     if (t.owned) {
         if (t.view) vkDestroyImageView(device, t.view, nullptr);
         if (t.image) vkDestroyImage(device, t.image, nullptr);

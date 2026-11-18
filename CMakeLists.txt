@@ -2,7 +2,9 @@ cmake_minimum_required(VERSION 3.20)
 project(m4r CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-find_package(Vulkan REQUIRED)
+if(NOT WIN32)
+  find_package(Vulkan REQUIRED)
+endif()
 find_program(GLSLANG glslangValidator REQUIRED)
 find_package(Python3 REQUIRED)
 
@@ -19,7 +21,18 @@ add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/sacneh.spv
   DEPENDS ${CMAKE_SOURCE_DIR}/shaders/sacneh.comp)
 add_custom_target(shaders ALL DEPENDS ${CMAKE_BINARY_DIR}/sacneh.spv)
 
-add_library(m4r_runtime STATIC runtime/vk.cpp runtime/kernel.cpp runtime/plan.cpp runtime/vkhip/vkhip.cpp ${DONOR_HDR})
+set(M4R_RUNTIME_SOURCES runtime/vk.cpp runtime/vkfn.cpp runtime/kernel.cpp runtime/plan.cpp runtime/m4r_api.cpp
+    runtime/vkhip/vkhip.cpp ${DONOR_HDR})
+if(WIN32)
+  # m4r.dll for OptiScaler under Proton: Vulkan entry points come from the game's device
+  add_library(m4r SHARED ${M4R_RUNTIME_SOURCES})
+  target_compile_definitions(m4r PRIVATE M4R_DYNAMIC_VK VK_NO_PROTOTYPES)
+  target_include_directories(m4r PRIVATE runtime ${CMAKE_BINARY_DIR}/gen ${M4R_VULKAN_INCLUDE})
+  target_link_options(m4r PRIVATE -static -static-libgcc -static-libstdc++)
+  set_target_properties(m4r PROPERTIES PREFIX "")
+  return()
+endif()
+add_library(m4r_runtime STATIC ${M4R_RUNTIME_SOURCES})
 target_include_directories(m4r_runtime PUBLIC runtime ${CMAKE_BINARY_DIR}/gen)
 target_link_libraries(m4r_runtime PUBLIC Vulkan::Vulkan)
 
