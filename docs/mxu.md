@@ -28,6 +28,24 @@ Each GEMM writes A and Bᵀ to a per-wave LDS tile in logical order and computes
 `v_dot4_{u,i}32_{u,i}8` (`v_dot2_f32_f16` for fgemm). This is correct but slow; the next step is RDNA3 WMMA
 (`v_wmma_i32_16x16x16_iu8`, `v_wmma_f32_16x16x16_f16`) with the operands permuted from Apple's layout to WMMA's.
 
+## LDS slots
+
+Each wave scatters its operands into its own slot of one LDS array (`__m4r_mxu`), and every GEMM kind uses the same slot
+size: 1024 bytes (an fp16 tile needs A and B^T at 256 halves each), with one slot per wave of the threadgroup.
+
+Slots used to be sized per kind (512 bytes for integer GEMMs, 1024 for fp16). A kernel that mixes both, SBBRNet (layer 0 is
+integer, the rest fp16), then had a wave in an fp16 layer overlapping the next wave's integer slot. While the waves of a
+threadgroup ran in lockstep nothing happened, so small dispatches looked fine (up to about 80 threadgroups of SBBRNet);
+with more contention the waves drifted apart and the output became random: 15% of the bytes of the sBBRNet output wrong, the
+final image 28.0 to 28.2 dB from run to run. The conv kernels use integer GEMMs only and were never affected.
+
+How it was found, in case something similar shows up: `M4R_PASS_HASH=1 build/run_bbr <plan> <fixtures> 1 -1` submits one
+pass at a time and prints a hash of every buffer and texture that changed, so two runs show the first pass that differs
+(SBBRNet). Dispatching that pass alone, in 8-group ranges, in chunks, with extra LDS, with all registers pre-filled with junk,
+with padded buffers and with zeroed LDS tiles ruled out, in turn, scratch memory (`tests/test_scratch.cpp` with
+`tests/scratch_test.ll` shows that private memory works in injected pipelines with 14,400 waves), shared-memory size, undefined
+values, stale registers and out-of-bounds access. `tests/check_determinism.sh <plan> <fixtures>` is the regression check.
+
 ## vkhip note
 
 vkhip's donor shader indexed its shared array with the thread id, so ACO allocated only threadgroup-size × 4 bytes

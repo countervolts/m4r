@@ -18,11 +18,14 @@ public:
     void bindBuffer(const std::string& name, VkDeviceAddress a) { extBuf_[name] = a; }
     Buffer* buffer(const std::string& name);
     Texture* texture(const std::string& name);
-    // Records every pass into cb (one barrier between passes).
-    bool record(VkCommandBuffer cb);
+    // Records the passes [first, first + count) into cb (one barrier between passes); all of them by default.
+    bool record(VkCommandBuffer cb, size_t first = 0, size_t count = size_t(-1));
     // ping-pong resources are written "a|b" in the plan: a on even, b on odd parity (MetalFX flips once per frame)
     void setParity(int p) { parity_ = p & 1; }
     size_t passes() const { return passes_.size(); }
+    const std::string& passLabel(size_t i) const { return passes_[i].label; }
+    const std::map<std::string, Buffer>& buffers() const { return buffers_; }
+    const std::map<std::string, Texture>& textures() const { return textures_; }
     const std::map<std::string, Kernel*>& kernels() const { return kernels_; }
     std::string error;
 

@@ -23,8 +23,8 @@ is re-trained, approximated or replaced.
 | AIR → AMDGPU translator (`air/`) | 79 of 82 compute kernels compile for gfx1101; tile/imageblock kernels not yet |
 | Apple MXU matrix instructions (`llvm.agx3.igemm/fgemm`) | lane layout measured; MetalFX's int8 conv kernels match a reference convolution exactly ([docs/mxu.md](docs/mxu.md)) |
 | Runtime (Vulkan + vkhip, Metal binding model, pass plans) | works: translated `copyTexture` is bit-exact on an RX 7700 XT |
-| ML temporal scaler (BBR: tBBRNet + sBBRNet) | **works offline**: full 27-pass pipeline, 640x360 → 1280x720 at 28.2 dB vs a supersampled reference (bilinear 21.9 dB), 5.3 ms per frame before optimisation |
-| OptiScaler "MetalFX" upscaler (`patches/optiscaler/`) | **works in a test harness under Proton** (vkd3d-proton): 28.0–28.2 dB, about 6.3 ms per frame with submit and wait; not tried in a game yet |
+| ML temporal scaler (BBR: tBBRNet + sBBRNet) | **works offline**: full 27-pass pipeline, 640x360 → 1280x720 at 28.27 dB vs a supersampled reference (bilinear 21.9 dB), bit-identical from run to run, 5.3 ms per frame before optimisation |
+| OptiScaler "MetalFX" upscaler (`patches/optiscaler/`) | **works in a test harness under Proton** (vkd3d-proton): 28.27 dB, about 6.3 ms per frame with submit and wait; not tried in a game yet |
 | OptiScaler "MetalFX FG" output | written and compiled; not tested end to end yet |
 | Frame interpolation | **works offline**: 30 passes, 31.9–32.1 dB vs true in-between frames (frame blend 22.3 dB), 0.87 ms at 1280x720 |
 | Spatial scaler, temporal V3, denoiser | later |

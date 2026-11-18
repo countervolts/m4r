@@ -114,7 +114,7 @@ bool Plan::load(const std::string& dir) {
     return true;
 }
 
-bool Plan::record(VkCommandBuffer cb) {
+bool Plan::record(VkCommandBuffer cb, size_t first, size_t count) {
     for (auto& n : uninitialised_) {
         Texture& t = textures_[n];
         rt_.vk().toGeneral(cb, t);
@@ -124,7 +124,8 @@ bool Plan::record(VkCommandBuffer cb) {
     }
     uninitialised_.clear();
     Encoder enc(rt_, cb);
-    for (auto& p : passes_) {
+    for (size_t pi = first; pi < passes_.size() && pi - first < count; ++pi) {
+        Pass& p = passes_[pi];
         enc.setKernel(p.kernel);
         for (auto& bb : p.binds) {
             Bind b = bb;

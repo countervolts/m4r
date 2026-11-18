@@ -741,6 +741,11 @@ def plain_load(b, s):
     return b.v(f'load {s.ret}, ptr addrspace(1) %a0, align 1')
 
 
+# One LDS slot per wave, the same size for every GEMM kind: an fp16 tile (A and B^T, 256 half each) needs 1024 bytes and a
+# kernel may mix integer and fp16 GEMMs (SBBRNet), so slots sized per kind would overlap between waves in different layers.
+MXU_WAVE_BYTES = 1024
+
+
 def _lds_wave_base(b, bytes_per_wave):
     lid = intr(b, 'i32', 'llvm.amdgcn.workitem.id.x', [])
     w = b.v(f'lshr i32 {lid}, 5')
@@ -797,7 +802,7 @@ def mxu_gemm(kind):
                 ids = b.v(f'insertelement {at} {ids}, {"i32" if kind == "i" else "float"} {v}, i32 {sl}')
             return b.v(f'select i1 {allz}, {at} {ids}, {at} {C}')
         # table-driven: scatter A and B into LDS in logical [row][k] / [col][k] order, then dot products
-        base = _lds_wave_base(b, 512 * esz)
+        base = _lds_wave_base(b, MXU_WAVE_BYTES)
         for (vv, table, off) in ((av, '__m4r_mxu_a', 0), (bv, '__m4r_mxu_bt', 256 * esz)):
             for sl in range(8):
                 x = b.v(f'extractelement <8 x {et}> {vv}, i32 {sl}')

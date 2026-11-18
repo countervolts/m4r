@@ -67,7 +67,7 @@ shown back to back. How well that paces is a guess; it is not a replacement for 
 
 | | |
 |---|---|
-| Upscaler through OptiScaler under Proton | works with the test harness: 640x360 → 1280x720, 28.0–28.2 dB against a supersampled reference (bilinear 21.9 dB), about 6.3 ms per frame including submit and wait. **Not tried in a game yet.** |
+| Upscaler through OptiScaler under Proton | works with the test harness: 640x360 → 1280x720, 28.27 dB against a supersampled reference (bilinear 21.9 dB), about 6.3 ms per frame including submit and wait. **Not tried in a game yet.** |
 | Frame generation output | compiles, links and is selectable; **not exercised end to end yet** (the harness has no swapchain mode) |
 | Menu entries | added; not seen on screen yet |
 
@@ -75,10 +75,7 @@ Known limits: display-resolution motion vectors (the upscaler logs a warning, fr
 one plan per resolution pair, vkd3d-proton only, RDNA3 only (gfx1101 tested), frame generation interpolates the final image
 including the HUD (no hudless input), no dynamic resolution.
 
-Run-to-run, the pipeline is **not deterministic**: the same input gives 28.0–28.2 dB and different output hashes, already
-at frame 0 of the offline runner. The integer min/max atomics of the flow splat are order independent, so the cause is
-something else (a missing barrier or an uninitialised buffer are the suspects). Not found yet; it must be before
-bit-exact checks of faster kernels mean anything.
+The pipeline is deterministic: repeated runs give bit-identical frames (`tests/check_determinism.sh`).
 
 ## Testing
 

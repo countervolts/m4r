@@ -286,7 +286,8 @@ def translate(text, kernel, constants, tg, wave=32):
     if agx:
         defs.append(intrinsics.mask_helpers())
         extra_decls = {d for d in extra_decls if '@__m4r_mask' not in d}
-        defs.append('@__m4r_mxu = internal addrspace(3) global [8192 x i8] poison, align 16')
+        mxu_waves = max(1, (tg[0] * tg[1] * tg[2] + 31) // 32)
+        defs.append(f'@__m4r_mxu = internal addrspace(3) global [{intrinsics.MXU_WAVE_BYTES * mxu_waves} x i8] poison, align 16')
         if intrinsics.MXU_MODE['mode'] == 'probe':
             defs.append('@__m4r_probe = protected addrspace(1) externally_initialized global [1024 x i8] zeroinitializer, align 16')
         else:

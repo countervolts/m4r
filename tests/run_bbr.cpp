@@ -2,12 +2,17 @@
 // usage: run_bbr <plan dir> <fixture dir> <frames> [jitter sign +1/-1]
 // fixture: input-NN.rgba16f (input size), depth-NN.r32f, mvlo-NN.rg16f (input pixels, previous - current);
 // writes <plan dir>/out-NN.rgba16f (output size).
+// Debug modes (environment): M4R_PASS_HASH=1 submits one pass at a time and prints a hash of every buffer/texture that
+// changed after each pass; with M4R_REPEAT=<pass> M4R_DUMP_BUF=<buffer> M4R_DUMP_DIR=<dir> it runs the plan up to that pass,
+// then that pass 5 times, writing the buffer after each run to <dir>/rN.bin (M4R_REPEAT_COUNT=<n> repeats n passes,
+// M4R_REPEAT_PRE=<pass> runs another pass before each repeat).
 // SPDX-License-Identifier: GPL-3.0-only
 #include "plan.h"
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 using namespace m4r;
@@ -15,6 +20,13 @@ using namespace m4r;
 static std::vector<uint8_t> readAll(const std::string& p) {
     std::ifstream f(p, std::ios::binary);
     return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+// FNV-1a, for the M4R_PASS_HASH debug mode
+static uint64_t fnv(const void* d, size_t n, uint64_t h = 0xcbf29ce484222325ull) {
+    const uint8_t* p = static_cast<const uint8_t*>(d);
+    for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 0x100000001b3ull;
+    return h;
 }
 
 static double halton(int i, int b) {
@@ -106,6 +118,64 @@ int main(int argc, char** argv) {
             std::memcpy(plan.buffer("cpf")->map, cpf, 8);
             plan.setParity(t);
             rt.resetTransient();
+            if (std::getenv("M4R_PASS_HASH")) {
+                // debug: one submission per pass, then a hash of every buffer and texture that changed
+                std::map<std::string, uint64_t> last;
+                // M4R_REPEAT=<pass> M4R_DUMP_BUF=<buffer> M4R_DUMP_DIR=<dir>: run up to that pass, then run it 5 times
+                // and write the buffer after each run to <dir>/rN.bin
+                const char* repEnv = std::getenv("M4R_REPEAT");
+                const int repPass = repEnv ? std::atoi(repEnv) : -1;
+                for (size_t i = 0; i < plan.passes(); ++i) {
+                    if (repPass >= 0 && int(i) >= repPass) {
+                        const char* bufName = std::getenv("M4R_DUMP_BUF");
+                        const std::string dumpDir = std::getenv("M4R_DUMP_DIR") ? std::getenv("M4R_DUMP_DIR") : ".";
+                        Buffer* db = bufName ? plan.buffer(bufName) : nullptr;
+                        for (int r = 0; r < 5 && db; ++r) {
+                            VkCommandBuffer rcb = vk.begin();
+                            // M4R_REPEAT_PRE=<pass>: run that pass first each time (e.g. one that leaves junk in registers)
+                            if (const char* pre = std::getenv("M4R_REPEAT_PRE")) {
+                                plan.record(rcb, size_t(std::atoi(pre)), 1);
+                                vk.barrier(rcb);
+                            }
+                            // M4R_REPEAT_COUNT=<n>: the pass under test is n consecutive passes
+                            const size_t cnt = std::getenv("M4R_REPEAT_COUNT") ? size_t(std::atoi(std::getenv("M4R_REPEAT_COUNT"))) : 1;
+                            for (size_t c = 0; c < cnt; ++c) {
+                                plan.record(rcb, i + c, 1);
+                                vk.barrier(rcb);
+                            }
+                            vk.submit(rcb);
+                            std::vector<uint8_t> copy(db->size);
+                            std::memcpy(copy.data(), db->map, db->size);
+                            std::ofstream(dumpDir + "/r" + std::to_string(r) + ".bin", std::ios::binary)
+                                .write(reinterpret_cast<char*>(copy.data()), copy.size());
+                        }
+                        return 0;
+                    }
+                    VkCommandBuffer pcb = vk.begin();
+                    if (!plan.record(pcb, i, 1)) { std::fprintf(stderr, "record: %s\n", plan.error.c_str()); return 1; }
+                    vk.barrier(pcb);
+                    if (!vk.submit(pcb)) { std::fprintf(stderr, "submit: %s\n", vk.error.c_str()); return 1; }
+                    if (repPass >= 0) continue;   // repeat mode: no hashing before the pass under test
+                    std::printf("frame %d pass %zu %s:", t, i, plan.passLabel(i).c_str());
+                    for (auto& [n, b] : plan.buffers()) {
+                        std::vector<uint8_t> copy(b.size);   // one bulk read: byte-wise reads of mapped device memory crawl
+                        std::memcpy(copy.data(), b.map, b.size);
+                        uint64_t h = fnv(copy.data(), copy.size());
+                        if (!last.count("b:" + n) || last["b:" + n] != h) std::printf(" b:%s=%08x", n.c_str(), unsigned(h));
+                        last["b:" + n] = h;
+                    }
+                    for (auto& [n, tex] : plan.textures()) {
+                        std::vector<uint8_t> px(size_t(tex.width) * tex.height * formatBytes(tex.format));
+                        Texture copy = tex;
+                        vk.download(copy, px.data(), px.size());
+                        uint64_t h = fnv(px.data(), px.size());
+                        if (!last.count("t:" + n) || last["t:" + n] != h) std::printf(" t:%s=%08x", n.c_str(), unsigned(h));
+                        last["t:" + n] = h;
+                    }
+                    std::printf("\n");
+                }
+                continue;
+            }
             VkCommandBuffer cb = vk.begin();
             vkCmdResetQueryPool(cb, qp, 0, 2);
             vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
