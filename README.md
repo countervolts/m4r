@@ -22,7 +22,7 @@ is re-trained, approximated or replaced.
 | AIR → AMDGPU translator (`air/`) | 79 of 82 compute kernels compile for gfx1101; tile/imageblock kernels not yet |
 | Apple MXU matrix instructions (`llvm.agx3.igemm/fgemm`) | lane layout measured; MetalFX's int8 conv kernels match a reference convolution exactly ([docs/mxu.md](docs/mxu.md)) |
 | Runtime (Vulkan + vkhip, Metal binding model, pass plans) | works: translated `copyTexture` is bit-exact on an RX 7700 XT |
-| ML temporal scaler (BBR: tBBRNet + sBBRNet) | tBBRNet (11 layers, 14 dispatches) runs: 3.5 ms at 1280x720 output with the unoptimised GEMM; pre/post passes and sBBRNet being wired up ([docs/metalfx-bbr.md](docs/metalfx-bbr.md)) |
+| ML temporal scaler (BBR: tBBRNet + sBBRNet) | **works offline**: full 27-pass pipeline, 640x360 → 1280x720 at 28.2 dB vs a supersampled reference (bilinear 21.9 dB), 5.3 ms per frame before optimisation |
 | OptiScaler "MetalFX" upscaler | not started |
 | Frame interpolation | kernels compile; host logic not read yet |
 | Spatial scaler, temporal V3, denoiser | later |

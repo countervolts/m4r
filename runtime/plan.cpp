@@ -82,6 +82,13 @@ bool Plan::load(const std::string& dir) {
             Kernel* k = rt_.load(dir + "/" + path);
             if (!k) return fail(rt_.error);
             kernels_[name] = k;
+        } else if (w == "glsl") {      // glsl NAME path.spv tx ty tz
+            std::string name, path;
+            uint32_t tx, ty, tz;
+            ls >> name >> path >> tx >> ty >> tz;
+            Kernel* k = rt_.loadGlsl(dir + "/" + path, tx, ty, tz);
+            if (!k) return fail(rt_.error);
+            kernels_[name] = k;
         } else if (w == "pass") {
             Pass p;
             std::string kname, mode;
@@ -94,7 +101,7 @@ bool Plan::load(const std::string& dir) {
         } else if (w == "buf" || w == "tex" || w == "bytes") {
             if (!cur) return fail("binding outside a pass");
             Bind b;
-            b.kind = w[0];
+            b.kind = w == "bytes" ? 'y' : w[0];
             ls >> b.index >> b.name;
             if (w == "bytes") b.bytes = hexBytes(b.name);
             cur->binds.push_back(b);
@@ -109,7 +116,9 @@ bool Plan::record(VkCommandBuffer cb) {
     Encoder enc(rt_, cb);
     for (auto& p : passes_) {
         enc.setKernel(p.kernel);
-        for (auto& b : p.binds) {
+        for (auto& bb : p.binds) {
+            Bind b = bb;
+            if (b.kind != 'y') b.name = pick(b.name);
             if (b.kind == 'b') {
                 auto e = extBuf_.find(b.name);
                 if (e != extBuf_.end()) { enc.setBuffer(e->second, b.index); continue; }

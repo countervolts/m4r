@@ -29,6 +29,9 @@ struct Kernel {
     Buffer data;              // the code object's globals (constexpr sampler descriptors live here)
     VkPipeline pipeline = VK_NULL_HANDLE;
     std::vector<VkSampler> keep;
+    // m4r's own GLSL kernels (passes that are not Metal kernels, e.g. MPSGraph parts): argument block is
+    // 8 x u64 (buffer addresses / texture records by binding index 0-7), then u32 constants from setBytes 8-15
+    bool glsl = false;
 };
 
 // Metal sampler state words (as stored in AIR constexpr samplers) -> Vulkan sampler. Bit layout inferred from
@@ -42,6 +45,8 @@ public:
     void destroy();
     // loads <base>.hsaco + <base>.args; kernels are cached by base path
     Kernel* load(const std::string& base);
+    // a SPIR-V compute shader using the same push-constant ABI (one 64-bit argument-block pointer)
+    Kernel* loadGlsl(const std::string& spv, uint32_t tx, uint32_t ty, uint32_t tz);
     Context& vk() { return vk_; }
     VkPipelineLayout layout() const { return layout_; }
     // transient per-frame memory for argument blocks and setBytes data
@@ -66,7 +71,10 @@ public:
     void setKernel(Kernel* k) { k_ = k; }
     void setBuffer(VkDeviceAddress a, uint32_t index) { buffers_[index] = a; }
     void setBuffer(const Buffer& b, uint32_t index, VkDeviceSize offset = 0) { buffers_[index] = b.address + offset; }
-    void setBytes(const void* data, size_t bytes, uint32_t index) { buffers_[index] = rt_.transient(data, bytes); }
+    void setBytes(const void* data, size_t bytes, uint32_t index) {
+        buffers_[index] = rt_.transient(data, bytes);
+        raw_[index].assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + bytes);
+    }
     void setTexture(const Texture* t, uint32_t index) { textures_[index] = t ? t->record : 0; }
     void setThreadgroupMemory(uint32_t bytes, uint32_t index) { lds_[index] = bytes; }
     bool dispatchThreads(uint32_t x, uint32_t y = 1, uint32_t z = 1);       // Metal dispatchThreads (grid in threads)
@@ -80,6 +88,7 @@ private:
     Kernel* k_ = nullptr;
     std::map<uint32_t, VkDeviceAddress> buffers_, textures_;
     std::map<uint32_t, uint32_t> lds_;
+    std::map<uint32_t, std::vector<uint8_t>> raw_;
 };
 
 } // namespace m4r

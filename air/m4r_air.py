@@ -193,12 +193,14 @@ def translate(text, kernel, constants, tg, wave=32):
     manifest = {'kernel': kernel, 'threadgroup': tg, 'wave': wave, 'constants': {}, 'args': [], 'samplers': []}
 
     # 1. function constants
+    # constants by name, or by Metal index as '#<n>' (MTLFunctionConstantValues setConstantValue:atIndex:);
+    # index entries that a kernel does not declare are ignored, as Metal does
     by_name = {fc['name']: fc for fc in fcs}
     for name in constants:
-        if name not in by_name:
+        if not name.startswith('#') and name not in by_name:
             raise ValueError(f'{kernel}: unknown function constant {name}; have {sorted(by_name)}')
     for fc in fcs:
-        val = constants.get(fc['name'], 0)
+        val = constants.get(fc['name'], constants.get('#%d' % fc['index'], 0))
         manifest['constants'][fc['name']] = val
         lt, lit = fc_literal(fc['type'], val)
         pat = re.compile(r'^(@' + re.escape(fc['global']) + r' = )[^\n]*$', re.M)

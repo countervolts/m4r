@@ -138,6 +138,28 @@ Kernel* Runtime::load(const std::string& base) {
     return raw;
 }
 
+Kernel* Runtime::loadGlsl(const std::string& spv, uint32_t tx, uint32_t ty, uint32_t tz) {
+    auto it = kernels_.find(spv);
+    if (it != kernels_.end()) return it->second.get();
+    auto code = readFile(spv);
+    if (code.empty() || code.size() % 4) { error = spv + " missing"; return nullptr; }
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = code.size(); smi.pCode = reinterpret_cast<const uint32_t*>(code.data());
+    VkShaderModule mod;
+    if (vkCreateShaderModule(vk_.device, &smi, nullptr, &mod) != VK_SUCCESS) { error = spv + ": module"; return nullptr; }
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, mod, "main", nullptr};
+    ci.layout = layout_;
+    auto k = std::make_unique<Kernel>();
+    k->glsl = true; k->name = spv; k->tg[0] = tx; k->tg[1] = ty; k->tg[2] = tz;
+    VkResult r = vkCreateComputePipelines(vk_.device, VK_NULL_HANDLE, 1, &ci, nullptr, &k->pipeline);
+    vkDestroyShaderModule(vk_.device, mod, nullptr);
+    if (r != VK_SUCCESS) { error = spv + ": pipeline"; return nullptr; }
+    Kernel* raw = k.get();
+    kernels_[spv] = std::move(k);
+    return raw;
+}
+
 bool Encoder::dispatchThreads(uint32_t x, uint32_t y, uint32_t z) {
     if (!k_) { error = "no kernel"; return false; }
     return dispatch(x, y, z, (x + k_->tg[0] - 1) / k_->tg[0], (y + k_->tg[1] - 1) / k_->tg[1], (z + k_->tg[2] - 1) / k_->tg[2]);
@@ -150,6 +172,29 @@ bool Encoder::dispatchThreadgroups(uint32_t x, uint32_t y, uint32_t z) {
 
 bool Encoder::dispatch(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t nx, uint32_t ny, uint32_t nz) {
     if (!nx || !ny || !nz) return true;
+    if (k_->glsl) {
+        uint8_t block[8 * 8 + 8 * 4 + 16] = {};
+        for (uint32_t i = 0; i < 8; ++i) {
+            uint64_t v = 0;
+            auto b = buffers_.find(i);
+            auto t = textures_.find(i);
+            if (b != buffers_.end()) v = b->second;
+            else if (t != textures_.end()) v = t->second;
+            std::memcpy(block + 8 * i, &v, 8);
+        }
+        for (uint32_t i = 8; i < 16; ++i) {
+            auto r = raw_.find(i);
+            if (r != raw_.end()) std::memcpy(block + 64 + 4 * (i - 8), r->second.data(), std::min<size_t>(4, r->second.size()));
+        }
+        const uint32_t grid[3] = {gx, gy, gz};
+        std::memcpy(block + 96, grid, 12);
+        VkDeviceAddress args = rt_.transient(block, sizeof(block), 64);
+        rt_.vk().barrier(cb_);
+        vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, k_->pipeline);
+        vkCmdPushConstants(cb_, rt_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &args);
+        vkCmdDispatch(cb_, nx, ny, nz);
+        return true;
+    }
     std::vector<uint8_t> block(k_->kernargSize, 0);
     uint32_t ldsOffset = (k_->kd.lds + 15) & ~15u;
     for (const auto& a : k_->args) {

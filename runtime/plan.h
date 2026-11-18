@@ -20,6 +20,8 @@ public:
     Texture* texture(const std::string& name);
     // Records every pass into cb (one barrier between passes).
     bool record(VkCommandBuffer cb);
+    // ping-pong resources are written "a|b" in the plan: a on even, b on odd parity (MetalFX flips once per frame)
+    void setParity(int p) { parity_ = p & 1; }
     size_t passes() const { return passes_.size(); }
     const std::map<std::string, Kernel*>& kernels() const { return kernels_; }
     std::string error;
@@ -34,6 +36,11 @@ private:
     std::map<std::string, const Texture*> extTex_;
     std::map<std::string, VkDeviceAddress> extBuf_;
     std::vector<Pass> passes_;
+    int parity_ = 0;
+    std::string pick(const std::string& n) const {
+        auto bar = n.find('|');
+        return bar == std::string::npos ? n : (parity_ ? n.substr(bar + 1) : n.substr(0, bar));
+    }
 };
 
 VkFormat formatByName(const std::string& n);

@@ -82,6 +82,13 @@ class Model:
         a = self.syms['__ZL' + name]
         return struct.unpack('<' + fmt * n, self.macho.read(a, struct.calcsize(fmt) * n))
 
+    def sacneh(self):
+        """the two 19-tap filters of emit_sacneh_constants.dat (graph constants tensor7 and tensor10, channel 0)"""
+        d = np.fromfile(os.path.join(self.res, 'emit_sacneh_constants.dat'), np.uint8)
+        x = d[0x30:0x30 + 38].view(np.float16)
+        y = d[0x30 + 0x4c:0x30 + 0x4c + 38].view(np.float16)
+        return x.copy(), y.copy()
+
     def u8(self, off, n):
         return self.tbbr[off:off + n].copy()
 
@@ -166,6 +173,7 @@ def build(args):
     plan.append(f'texture rnn_tex R8G8_UNORM {ow // 2} {oh // 2}')
     plan.append(f'# network {tw}x{th} (temporal), spatial {sw}x{sh}, output {ow}x{oh}')
 
+    plan.append('#PRE')
     # ---- tBBRNet
     H, W = th, tw
     acts = {}
@@ -232,9 +240,136 @@ def build(args):
             binds += ['tex 3 temporal_tex', 'tex 4 rnn_tex']
         dispatch(k, 'threads', (threads, 1, 1), binds)
 
-    json.dump({'output': [ow, oh], 'temporal': [tw, th], 'spatial': [sw, sh]}, open(os.path.join(out, 'sizes.json'), 'w'))
-    open(os.path.join(out, 'plan.txt'), 'w').write('\n'.join(plan) + '\n')
+    frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes=(ow, oh, sw, sh, tw, th, fused))
+    json.dump({'output': [ow, oh], 'input': list(args.input), 'temporal': [tw, th], 'spatial': [sw, sh],
+               'history_pitch': 32 * ((2 * ow + 63) // 64), 'reversed_depth': args.reversed_depth},
+              open(os.path.join(out, 'sizes.json'), 'w'))
+    decl = [l for l in plan if l.split(' ', 1)[0] in ('buffer', 'texture', 'kernel', 'glsl')]
+    rest = [l for l in plan if l.split(' ', 1)[0] not in ('buffer', 'texture', 'kernel', 'glsl')]
+    open(os.path.join(out, 'plan.txt'), 'w').write('\n'.join(decl + rest) + '\n')
     print(f'{len(kernels)} kernels, plan with {sum(1 for p in plan if p.startswith("pass"))} passes -> {out}')
+
+
+def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
+    """Everything around the networks: BBRNet_Filter::encodePre / sBBRNet / encodeMid / encodePost and the
+    sacneh history prefilter (see docs/metalfx-bbr.md for where each binding comes from)."""
+    ow, oh, sw, sh, tw, th, fused = sizes
+    iw, ih = args.input
+    rev = 1 if args.reversed_depth else 0
+    fc = {'#13': 1, '#30': 1, '#31': 1, '#32': 1, '#33': 1, '#34': fused, '#14': 0, '#17': 0, '#16': 0, '#19': 0,
+          '#25': 0, '#26': 0, '#22': 0, '#9': 0.0328}
+    pre = []
+
+    def tex(name, fmt, w, h):
+        plan.insert(0, f'texture {name} {fmt} {w} {h}')
+
+    def buf_init(name, data):
+        blob(name, data)
+        plan.insert(0, plan.pop())        # declare before use
+
+    tex('crr', 'R16G16B16A16_SFLOAT', iw, ih); tex('flowd', 'R16G16_SFLOAT', iw, ih)
+    tex('fah', 'R16G16B16A16_SFLOAT', ow, oh); tex('clampt', 'R16G16B16A16_SFLOAT', ow, oh)
+    tex('hist', 'R16G16B16A16_SFLOAT', ow, oh)
+    tex('ema0', 'R16_SFLOAT', ow // 2, oh // 2); tex('ema1', 'R16_SFLOAT', ow // 2, oh // 2)
+    tex('hw0', 'R8G8_UNORM', ow, oh); tex('hw1', 'R8G8_UNORM', ow, oh)
+    tex('splat', 'R16G16_SFLOAT', iw, ih); tex('diff', 'R8_UNORM', iw, ih)
+    one = np.array([1.0], np.float16)
+    buf_init('exp0', one); buf_init('exp1', one)
+    for n, sz in (('splatbuf', iw * ih * 4), ('hinv', 16), ('lumabuf', 8192), ('params', 144), ('preexp', 16),
+                  ('reset', 16), ('cpf', 16)):
+        plan.insert(0, f'buffer {n} {sz}')
+    hp = 32 * ((2 * ow + 63) // 64)
+    for n in ('hist_t0', 'hist_t1', 'hist_tmp'):
+        plan.insert(0, f'buffer {n} {oh * hp * 4}')
+
+    def d(fn, mode, grid, binds, extra=None, tg=(8, 8, 1)):
+        c = dict(fc); c.update(extra or {})
+        k = kernel(fn, c, list(tg))
+        pre.append(f'pass {k} {mode} {grid[0]} {grid[1]} {grid[2]}')
+        pre.extend('  ' + b for b in binds)
+
+    # encodePre: exposure from the game's exposure texture (1.0 when the game has none)
+    d('exposure_texture_to_buffer', 'threads', (1, 1, 1),
+      ['tex 0 exposure', 'buf 0 exp0|exp1', 'buf 1 exp1|exp0', 'buf 2 hinv', 'buf 3 reset'], tg=(32, 1, 1))
+    d('bbrnet_build_tensors_low_resolution', 'threads', (iw + 2, ih + 2, 1),
+      ['tex 0 color', 'tex 1 depth', 'tex 2 motion', 'tex 3 crr', 'tex 4 flowd',
+       'bytes 0 ' + struct.pack('<f', 1.0 if rev else -1.0).hex(), 'buf 1 params', 'buf 2 preexp',
+       'buf 3 exp0|exp1', 'buf 4 exp1|exp0'])
+    d('buildSpatialTensor', 'threads', (ow, oh, 1), ['buf 0 spatial_in', 'tex 0 crr', 'buf 1 params'])
+    d('buildTemporalTensor', 'threads', (((ow + 15) >> 1) & ~7, ((oh + 15) >> 1) & ~7, 1),
+      ['tex 0 crr', 'tex 1 flowd', 'tex 2 hist', 'tex 4 ema0|ema1', 'tex 6 ema1|ema0', 'tex 8 temporal_tex',
+       'tex 9 rnn_tex', 'buf 0 temporal_in', 'buf 1 params', 'buf 2 temporal_out', 'buf 3 exp0|exp1',
+       'buf 4 exp1|exp0', 'buf 5 hinv', 'buf 6 temporal_in_u8', 'buf 7 temporal_in_f16'], tg=(16, 16, 1))
+    i = plan.index('#PRE')
+    plan[i:i + 1] = pre
+    pre.clear()
+
+    # sBBRNet (5-layer per-pixel MLP, fp16 intermediates)
+    LK = m.table('7kLayerK', 'H', 5)
+    WO, BO, SO, ZO = (m.table(n, 'Q', 5) for n in ('14kWeightOffsets', '12kBiasOffsets', '13kScaleOffsets', '10kZPOffsets'))
+    AZ, AS = m.table('6kActZP', 'B', 5), m.table('9kActScale', 'f', 5)
+    in_scale = sbbr_input_scale(m)
+    s8 = m.sbbr
+    w8, sc, bi, zp, w16, b16 = [], [], [], [], [], []
+    for li in range(5):
+        K = LK[li]
+        W = s8[WO[li]:WO[li] + 64 * K].copy()
+        scales = s8[SO[li]:SO[li] + 2 * K].view(np.float16).copy()
+        z = s8[ZO[li]:ZO[li] + K].copy()
+        b = s8[BO[li]:BO[li] + 2 * K].view(np.float16).copy()
+        a_s, a_z = (in_scale, 0.0) if li == 0 else (AS[li - 1], float(AZ[li - 1]))
+        w8.append(W); sc.append(scales); zp.append(z); bi.append(fold_bias(b, W, z, scales, K, 64, 1, 1, a_s, a_z))
+        if li > 0:
+            w16.append(dequant_fp16(W, z, scales, K)); b16.append(b)
+    blob('s_w', np.concatenate(w8)); blob('s_s', np.concatenate(sc)); blob('s_b', np.concatenate(bi))
+    blob('s_z', np.concatenate(zp)); blob('s_w16', np.concatenate(w16)); blob('s_b16', np.concatenate(b16))
+    Hs, Ws = sh >> 2, sw >> 2
+    k = kernel('SBBRNet', {'Hs': Hs, 'Ws': Ws, 'QsI': in_scale, 'NmatsHW': 1, 'inputIsFP16': 0, 'inputIsNCHW': 0,
+                           'outputIsFP16': 0, 'outputIsNCHW': 0, 'fp16Intermediate': 1}, [128, 1, 1])
+    tiles = (Hs * Ws + 15) // 16
+    dispatch(k, 'threads', (((tiles + 3) // 4) * 128, 1, 1), ['buf 0 spatial_in', 'buf 1 s_w', 'buf 2 spatial_out',
+                                                              'buf 3 s_s', 'buf 4 s_b', 'buf 5 s_z', 'buf 6 s_w16', 'buf 7 s_b16'])
+
+    # encodeMid
+    if not rev:
+        d('brnetv3_flow_splat_init_forward_z', 'threads', (iw * ih, 1, 1), ['buf 0 splatbuf'], tg=(64, 1, 1))
+    d('BBRNet_flow_splat', 'threads', (iw, ih, 1), ['tex 0 flowd', 'tex 1 depth', 'buf 0 splatbuf', 'buf 1 params'], {'#5': rev})
+    d('brnetv3_flow_splat_texture', 'threads', (iw, ih, 1), ['tex 0 flowd', 'tex 1 splat', 'buf 0 splatbuf'])
+    d('BBRNet_flow_diff_texture', 'threads', (iw, ih, 1), ['tex 0 flowd', 'tex 1 splat', 'tex 2 diff'])
+    d('BBRNetWarpHistory', 'threads', (ow, (oh + 3) // 4, 1),
+      ['tex 0 crr', 'tex 2 flowd', 'tex 3 fah', 'tex 6 hist', 'tex 7 color', 'buf 2 exp0|exp1', 'buf 3 exp1|exp0',
+       'buf 4 hinv', 'buf 5 preexp', 'buf 6 hist_t0'], tg=(16, 8, 1))
+    d('BBRNetComputeOvershootClamp', 'threads', (ow, oh, 1), ['tex 2 flowd', 'tex 6 hist', 'tex 7 color', 'tex 8 clampt'], tg=(16, 16, 1))
+    # encodePost
+    post = ['buf 0 params', 'tex 0 crr', 'tex 1 fah', 'tex 6 hw0|hw1', 'tex 3 output', 'tex 4 hist', 'tex 8 hw1|hw0',
+            'tex 5 diff', 'tex 7 flowd', 'tex 10 clampt', 'tex 11 temporal_tex', 'buf 1 cpf', 'buf 2 hinv',
+            'buf 3 preexp', 'buf 4 exp0|exp1', 'buf 6 spatial_out', 'buf 10 hist_t1']
+    if not fused:
+        post += ['tex 9 rnn_tex', 'buf 5 temporal_out']
+    d('BBRNetAnisoGaussian', 'threads', ((ow + 15) & ~15, (oh + 15) & ~15, 1), post, tg=(16, 16, 1))
+    pre.append('glsl sacneh sacneh.spv 8 8 1')
+    taps = m.sacneh()
+    blob('sac_x', taps[0]); blob('sac_y', taps[1])
+    for axis, (src, dst, tp) in enumerate((('hist_t1', 'hist_tmp', 'sac_x'), ('hist_tmp', 'hist_t0', 'sac_y'))):
+        pre.append(f'pass sacneh threads {ow} {oh} 2')
+        pre += [f'  buf 0 {src}', f'  buf 1 {dst}', f'  buf 2 {tp}'] + [
+            f'  bytes {8 + j} ' + struct.pack('<I', v).hex() for j, v in enumerate((ow, oh, hp, oh * hp, axis, 2))]
+    plan.extend(pre)
+
+
+def sbbr_input_scale(m):
+    """QsI of SBBRNet: the float immediate -[SBBRNet_MLP setupMetalWithLibrary:] stores (mov/movk pair)."""
+    funcs = bbr_params.objdump(m.bin)
+    ins = next(v for k, v in funcs.items() if 'SBBRNet_MLP setupMetalWithLibrary' in k)
+    val = None
+    for addr, op, a in ins:
+        if op == 'mov' and a.startswith('w8, #'):
+            val = int(a.split('#')[1].split()[0], 0)
+        elif op == 'movk' and a.startswith('w8,') and val is not None:
+            hi = int(a.split('#')[1].split(',')[0], 0)
+            val = (val & 0xffff) | (hi << 16)
+            return struct.unpack('<f', struct.pack('<I', val))[0]
+    raise SystemExit('SBBRNet input scale not found')
 
 
 if __name__ == '__main__':
@@ -244,4 +379,6 @@ if __name__ == '__main__':
     ap.add_argument('--output', required=True, type=lambda s: [int(x) for x in s.split('x')])
     ap.add_argument('--out', required=True)
     ap.add_argument('--force', action='store_true')
+    ap.add_argument('--input', required=True, type=lambda s: [int(x) for x in s.split('x')], help='max input size')
+    ap.add_argument('--reversed-depth', type=int, default=1)
     build(ap.parse_args())

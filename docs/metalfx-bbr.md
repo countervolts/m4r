@@ -119,6 +119,22 @@ Five per-pixel layers of 64 inputs (K = 64, 64, 64, 64, 128), weights [64][K], t
 as for tBBRNet with the previous layer's activation zero point and scale (layer 0: zero point 0 and a fixed
 input scale). Kernel `SBBRNet`.
 
+## End-to-end result
+
+`tests/run_bbr.cpp` runs the whole plan (`tools/prepare_bbr.py`: exposure, tensor builds, tBBRNet, sBBRNet, flow
+splat/diff, history warp, overshoot clamp, AnisoGaussian composite, sacneh prefilter; 27 passes) on the
+moving-camera fixture from `tests/scene_motion.py` (adapted from x4r): 640x360 → 1280x720, 8 frames,
+**28.2 dB** sRGB PSNR against the 2x2-supersampled reference on the last frame (bilinear: 21.9 dB), 5.3 ms per
+frame on an RX 7700 XT with the unoptimised GEMM.
+
+- `jitterOffset` is the **negative** of the sub-pixel offset the frame was rendered with (with the positive sign the
+  same run gives 22.7 dB and a visibly blurred, offset history).
+- `motionVectorScale` (1, 1) with vectors in input pixels pointing to the previous position, as the header says.
+- The `sacneh` overlap network is a separable 19-tap filter (taps symmetric, alternating, summing to 1: an inverse
+  B-spline prefilter) on the 2-plane fp16 history tensor, from AnisoGaussian's output (+0xf8) to WarpHistory's input
+  (+0xf0); m4r runs it as its own GLSL pass (`shaders/sacneh.comp`) with the taps read from
+  `emit_sacneh_constants.dat`.
+
 ## Open
 
 - encodePost details, the `sacneh` overlap network

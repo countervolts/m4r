@@ -297,7 +297,7 @@ VkPipeline createPipeline(const Device& vk, VkPipelineLayout layout, const Modul
                     const uint32_t lds = rd<uint32_t>(object, CFG + LDS_SIZE), scratch = rd<uint32_t>(object, CFG + SCRATCH);
                     const uint32_t rsrc1 = rd<uint32_t>(object, CFG + RSRC1), fmode = rd<uint32_t>(object, CFG + FLOAT_MODE);
                     const uint32_t declared = std::max(1u, (kernel.lds + 3) / 4) * 4;
-                    const bool ldsOk = lds >= declared && lds < declared + 1024;
+                    const bool ldsOk = (lds >= declared && lds < declared + 1024) || (kernel.lds == 0 && lds == 0);
                     const bool sane = sgprs && sgprs <= 128 && vgprs && vgprs <= 256 && ((rsrc1 & 0x3f) + 1) * 8 >= vgprs &&
                                       ((rsrc1 & 0x3f) + 1) * 8 < vgprs + 8 && ldsOk &&
                                       ((donorRsrc2 & RSRC2_LDS_MASK) != 0) == (lds != 0) && scratch == 0 && fmode < 256 &&
