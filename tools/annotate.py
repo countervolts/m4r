@@ -34,7 +34,11 @@ def desc(a,isldr,width):
         if width==16: return f'{s or ""}i{struct.unpack("<4I",raw)} f{tuple(round(x,6) for x in struct.unpack("<4f",raw))}'
     if s: return s
     return sn and f'{sn}+{hex(a)}'
-STUBS={0x258004690:'setComputePipelineState:',0x258015f70:'setTexture:atIndex:',0x258004620:'setBytes:length:atIndex:',0x258015ad0:'setBuffer:offset:atIndex:',0x258014e60:'dispatchThreadgroups?:threadsPerThreadgroup:',0x2580592c0:'retain',0x2580592b0:'release',0x2580591e0:'retainAutoreleased?',0x258001e20:'dispatchThreads:threadsPerThreadgroup:'}
+STUBS={0x258004690:'setComputePipelineState:',0x258015f70:'setTexture:atIndex:',0x258004620:'setBytes:length:atIndex:',0x258015ad0:'setBuffer:offset:atIndex:',0x258014e60:'dispatchThreadgroups?:threadsPerThreadgroup:',0x2580592c0:'retain',0x2580592b0:'release',0x2580591e0:'retainAutoreleased?',0x258001e20:'dispatchThreads:threadsPerThreadgroup:',
+ 0x2580059a0:'texture2DDescriptorWithPixelFormat:width:height:mipmapped:',0x2580052d0:'setUsage:',0x258004670:'setStorageMode:',
+ 0x2580157f0:'newTextureWithDescriptor:',0x258004e90:'setPixelFormat:',0x2580053e0:'setWidth:',0x258004a30:'setHeight:',
+ 0x258003960:'newBufferWithLength:options:',0x258001920:'contents',0x258016160:'subdataWithRange:',0x258003360:'length',
+ 0x258004b10:'pushDebugGroup:',0x258015b30:'setConstantValue:type:atIndex:'}
 def load_funcs():
     out = subprocess.run(['llvm-objdump', '-d', '--no-show-raw-insn', BIN], capture_output=True, text=True).stdout
     funcs = {}; cur = None

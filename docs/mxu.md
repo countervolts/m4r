@@ -1,0 +1,35 @@
+# Apple's MXU matrix instructions on RDNA3
+
+MetalFX's network kernels (`Conv*`, `SBBRNet`, `MaxPoolConv`, ...) call Apple GPU intrinsics directly:
+
+| intrinsic | operands per lane (SIMD group of 32) | meaning |
+|---|---|---|
+| `llvm.agx3.igemm.v8i32.i64.i64.v8i32(16,16,16, 9, A, ta, B, tb, C, 9)` | A, B: 8 × int8 packed in i64; C: 8 × i32 | D = C + A·B, 16×16×16; type 11 = u8, 75 = s8 (inferred) |
+| `llvm.agx3.fgemm16x16x16.v8f16.v8f16(A, 0, B, 0, C)` | A, B: 8 × half; C: 8 × float | D = C + A·B in f32 |
+| `llvm.agx3.load/store.with.emask.global.v4i8/v4i16(p, m, 15, size)` | 4 consecutive elements | element i active when bit i of `m & 15` is set; masked loads give 0 |
+| `llvm.agx2.device.load.cachectl` | | plain load |
+
+## Lane layout
+
+Which matrix element each lane/slot holds is the hardware's convention. `tests/probe_mxu.py` measures it from
+MetalFX's own `Conv3x3Stride2U8`: a probe build records the A and B operands of one SIMD group and gives each
+accumulator element its id; label-encoded inputs then show the (pixel, channel), (channel, output channel) and
+(pixel, output channel) of every element. The result is `air/mxu_layout.py` (three permutations of the 16×16 tile).
+
+**Verified:** with that layout, the translated `Conv3x3Stride2U8` and `Conv3x3Stride1U8` (block-major weights)
+reproduce a numpy convolution exactly on random data (`tests/verify_conv.py`, max difference 0).
+
+**Not verified:** `fgemm16x16x16` is assumed to use the same layout (it is only used by the first layer's
+`Conv3x3Stride1Enc0FQSplit` and by `SBBRNet`); the s8 variant (type 75) is not exercised by the BBR network.
+
+## Lowering (first version)
+
+Each GEMM writes A and Bᵀ to a per-wave LDS tile in logical order and computes every accumulator element with
+`v_dot4_{u,i}32_{u,i}8` (`v_dot2_f32_f16` for fgemm). This is correct but slow; the next step is RDNA3 WMMA
+(`v_wmma_i32_16x16x16_iu8`, `v_wmma_f32_16x16x16_f16`) with the operands permuted from Apple's layout to WMMA's.
+
+## vkhip note
+
+vkhip's donor shader indexed its shared array with the thread id, so ACO allocated only threadgroup-size × 4 bytes
+of LDS; kernels with more LDS than that (the GEMM tiles here) overflowed into other waves. The donor now indexes
+with a value the compiler cannot bound.

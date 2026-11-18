@@ -154,15 +154,17 @@ bool Module::parse(const std::vector<uint8_t>& f) {
         i += 4;
     }
     if (readsRodata) {
-        // the data image starts at .rodata: its contents, then the image so far at its own offset
-        if (dataHi <= dataLo || s[rodata].addr >= dataLo) { error = ".rodata does not precede the data"; return false; }
-        const uint64_t lo = s[rodata].addr;
-        if (dataHi - lo > 256 * 1024 * 1024) { error = "code object data allocation exceeds limit"; return false; }
-        std::vector<uint8_t> image(dataHi - lo, 0);
-        std::memcpy(image.data(), f.data() + s[rodata].offset, s[rodata].size);
-        std::memcpy(image.data() + (dataLo - lo), dataInit.data(), dataInit.size());
+        // m4r: the data image spans .rodata and the writable data, in whichever order the linker placed them
+        const uint64_t rlo = s[rodata].addr, rhi = rlo + s[rodata].size;
+        const bool hasData = dataHi > dataLo;
+        const uint64_t lo = hasData ? std::min(rlo, dataLo) : rlo, hi = hasData ? std::max(rhi, dataHi) : rhi;
+        if (hi - lo > 256 * 1024 * 1024) { error = "code object data allocation exceeds limit"; return false; }
+        std::vector<uint8_t> image(hi - lo, 0);
+        std::memcpy(image.data() + (rlo - lo), f.data() + s[rodata].offset, s[rodata].size);
+        if (hasData) std::memcpy(image.data() + (dataLo - lo), dataInit.data(), dataInit.size());
         dataInit = std::move(image);
         dataLo = lo;
+        dataHi = hi;
     }
     for (const auto& [name, k] : kernels) {
         if (k.entry < textVa || k.entry >= textVa + this->text.size() || (k.entry - textVa) % 4) { error = name + ": entry outside .text"; return false; }
@@ -295,8 +297,9 @@ VkPipeline createPipeline(const Device& vk, VkPipelineLayout layout, const Modul
                     const uint32_t lds = rd<uint32_t>(object, CFG + LDS_SIZE), scratch = rd<uint32_t>(object, CFG + SCRATCH);
                     const uint32_t rsrc1 = rd<uint32_t>(object, CFG + RSRC1), fmode = rd<uint32_t>(object, CFG + FLOAT_MODE);
                     const uint32_t declared = std::max(1u, (kernel.lds + 3) / 4) * 4;
+                    const bool ldsOk = lds >= declared && lds < declared + 1024;
                     const bool sane = sgprs && sgprs <= 128 && vgprs && vgprs <= 256 && ((rsrc1 & 0x3f) + 1) * 8 >= vgprs &&
-                                      ((rsrc1 & 0x3f) + 1) * 8 < vgprs + 8 && lds >= declared && lds < declared + 1024 &&
+                                      ((rsrc1 & 0x3f) + 1) * 8 < vgprs + 8 && ldsOk &&
                                       ((donorRsrc2 & RSRC2_LDS_MASK) != 0) == (lds != 0) && scratch == 0 && fmode < 256 &&
                                       object[CFG + WGP_MODE] <= 1 && ((rsrc1 >> 12) & 0xff) == fmode;
                     if (!sane) {

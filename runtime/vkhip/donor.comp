@@ -11,7 +11,10 @@ shared uint scratch[LDS_WORDS];
 void main() {
     uint tid=gl_LocalInvocationIndex;
     uint i=gl_WorkGroupID.x + gl_WorkGroupID.y + gl_WorkGroupID.z + tid;
-    scratch[tid % LDS_WORDS]=pc.args.words[i] + PIPELINE_ID;
+    // m4r: an index the compiler cannot bound, so the whole LDS_WORDS array is allocated (ACO otherwise shrinks it
+    // to the range the thread ids reach)
+    uint at=pc.args.words[i] % LDS_WORDS;
+    scratch[at]=pc.args.words[i] + PIPELINE_ID;
     barrier();
-    pc.args.words[i]=scratch[(tid+1) % LDS_WORDS];
+    pc.args.words[i]=scratch[(at+1) % LDS_WORDS];
 }

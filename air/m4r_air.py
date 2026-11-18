@@ -266,6 +266,24 @@ def translate(text, kernel, constants, tg, wave=32):
         defs.append(body)
         extra_decls |= decls
         text = text.replace(line + '\n', '')
+    text = text.replace('@llvm.agx', '@m4r.agx')   # llvm.* names cannot be defined
+    text = re.sub(r'\bimmarg\b ?', '', text)       # nor carry immarg
+    agx = re.findall(r'^declare [^\n]*@m4r\.agx[^\n]*$', text, re.M)
+    for line in agx:
+        body, decls = intrinsics.implement_agx(line)
+        defs.append(body)
+        extra_decls |= decls
+        text = text.replace(line + '\n', '')
+    if agx:
+        defs.append(intrinsics.mask_helpers())
+        extra_decls = {d for d in extra_decls if '@__m4r_mask' not in d}
+        defs.append('@__m4r_mxu = internal addrspace(3) global [8192 x i8] poison, align 16')
+        if intrinsics.MXU_MODE['mode'] == 'probe':
+            defs.append('@__m4r_probe = protected addrspace(1) externally_initialized global [1024 x i8] zeroinitializer, align 16')
+        else:
+            import mxu_layout
+            for name, tab in (('__m4r_mxu_a', mxu_layout.A), ('__m4r_mxu_bt', mxu_layout.BT), ('__m4r_mxu_c', mxu_layout.C)):
+                defs.append(f'@{name} = internal addrspace(4) constant [256 x i8] [' + ', '.join(f'i8 {v if v < 128 else v - 256}' for v in tab) + '], align 16')
     existing = set(re.findall(r'^declare [^\n]*@(llvm\.[\w.]+)\(', text, re.M))
     for d in sorted(extra_decls):
         nm = re.search(r'@(llvm\.[\w.]+)\(', d).group(1)
@@ -469,7 +487,10 @@ def main():
     ap.add_argument('--tg', default='32,1,1', help='threadgroup size x,y,z')
     ap.add_argument('-D', action='append', default=[], help='function constant name=value')
     ap.add_argument('--keep', action='store_true', help='also write the intermediate IR and assembly')
+    ap.add_argument('--mxu-probe', action='store_true', help='build the MXU layout probe (tests/probe_mxu.py)')
     a = ap.parse_args()
+    if a.mxu_probe:
+        intrinsics.MXU_MODE['mode'] = 'probe'
     data = open(a.source, 'rb').read()
     if data[:4] == b'MTLB':
         import metallib

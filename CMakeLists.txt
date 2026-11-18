@@ -14,9 +14,12 @@ add_custom_command(OUTPUT ${DONOR_HDR}
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/spv_header.py ${CMAKE_BINARY_DIR}/gen/donor.spv ${DONOR_HDR} donor_spv
   DEPENDS ${CMAKE_SOURCE_DIR}/runtime/vkhip/donor.comp ${CMAKE_SOURCE_DIR}/scripts/spv_header.py)
 
-add_library(m4r_runtime STATIC runtime/vk.cpp runtime/kernel.cpp runtime/vkhip/vkhip.cpp ${DONOR_HDR})
+add_library(m4r_runtime STATIC runtime/vk.cpp runtime/kernel.cpp runtime/plan.cpp runtime/vkhip/vkhip.cpp ${DONOR_HDR})
 target_include_directories(m4r_runtime PUBLIC runtime ${CMAKE_BINARY_DIR}/gen)
 target_link_libraries(m4r_runtime PUBLIC Vulkan::Vulkan)
 
 add_executable(test_kernel tests/test_kernel.cpp)
 target_link_libraries(test_kernel m4r_runtime)
+
+add_executable(test_plan tests/test_plan.cpp)
+target_link_libraries(test_plan m4r_runtime)

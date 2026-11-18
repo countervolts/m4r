@@ -663,3 +663,195 @@ def implement(decl_line):
             text.append('}')
             return '\n'.join(text), b.decls
     raise NotImplementedError(s.name)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Apple GPU (AGX) intrinsics used by MetalFX's MXU kernels.
+#
+# `llvm.agx3.igemm` / `llvm.agx3.fgemm16x16x16` are 16x16x16 matrix multiply-accumulates over a SIMD group: each
+# of the 32 lanes holds 8 elements of A, of B and of the accumulator. Which (row, column) a lane's element is,
+# is the hardware's convention; tests/probe_mxu.py measures it from MetalFX's own kernels (see
+# docs/mxu.md) and air/mxu_layout.py holds the result. The lowering below exchanges the operands through LDS in
+# that layout and computes each accumulator element with dot-product instructions.
+#
+# `load/store.with.emask` move 4 consecutive elements; element i takes part when bit i of (mask & mask2) is set
+# (masked-off loads return 0). MetalFX passes either 15 or 0 as the first mask and 15 as the second.
+
+MXU_MODE = {'mode': 'lds'}   # 'lds' (table-driven) or 'probe'
+
+
+def emask_load(b, s):
+    t = s.ret
+    n, e = vec(t)
+    m = b.v('and i16 %a1, %a2')
+    out = 'zeroinitializer'
+    for i in range(n):
+        bit = b.v(f'and i16 {m}, {1 << i}')
+        on = b.v(f'icmp ne i16 {bit}, 0')
+        p = b.v(f'getelementptr inbounds {e}, ptr addrspace(1) %a0, i64 {i}')
+        out_i = b.v(f'call {e} @__m4r_maskload_{e}(i1 {on}, ptr addrspace(1) {p})')
+        out = b.v(f'insertelement {t} {out}, {e} {out_i}, i32 {i}')
+    b.decls.add(f'declare {e} @__m4r_maskload_{e}(i1, ptr addrspace(1))')
+    return out
+
+
+def emask_store(b, s):
+    t = s.params[1]
+    n, e = vec(t)
+    m = b.v('and i16 %a2, %a3')
+    for i in range(n):
+        bit = b.v(f'and i16 {m}, {1 << i}')
+        on = b.v(f'icmp ne i16 {bit}, 0')
+        p = b.v(f'getelementptr inbounds {e}, ptr addrspace(1) %a0, i64 {i}')
+        x = b.v(f'extractelement {t} %a1, i32 {i}')
+        b.emit(f'call void @__m4r_maskstore_{e}(i1 {on}, ptr addrspace(1) {p}, {e} {x})')
+    b.decls.add(f'declare void @__m4r_maskstore_{e}(i1, ptr addrspace(1), {e})')
+    return None
+
+
+def plain_load(b, s):
+    return b.v(f'load {s.ret}, ptr addrspace(1) %a0, align 1')
+
+
+def _lds_wave_base(b, bytes_per_wave):
+    lid = intr(b, 'i32', 'llvm.amdgcn.workitem.id.x', [])
+    w = b.v(f'lshr i32 {lid}, 5')
+    off = b.v(f'mul i32 {w}, {bytes_per_wave}')
+    return b.v(f'getelementptr inbounds i8, ptr addrspace(3) @__m4r_mxu, i32 {off}')
+
+
+def _layout_index(b, table, lane, slot):
+    """byte index into the 256-element tile for (lane, slot) from a 256-entry i8 table global."""
+    idx = b.v(f'mul i32 {lane}, 8')
+    idx = b.v(f'add i32 {idx}, {slot}')
+    p = b.v(f'getelementptr inbounds [256 x i8], ptr addrspace(4) @{table}, i32 0, i32 {idx}')
+    v = b.v(f'load i8, ptr addrspace(4) {p}, align 1')
+    return b.v(f'zext i8 {v} to i32')
+
+
+def mxu_gemm(kind):
+    """kind 'i' (8 x i8 per lane packed in i64, i32 accumulators) or 'f' (8 x half, f32 accumulators)."""
+    def f(b, s):
+        if kind == 'i':
+            A, B, C = '%a4', '%a6', '%a8'
+            # operand type immediates: 11 = u8, 75 = s8 (the only pairs MetalFX uses: 11/11 and 75/75)
+            signed = b.v('icmp eq i16 %a5, 75')
+            et, esz, at = 'i8', 1, '<8 x i32>'
+            av = b.v(f'bitcast i64 {A} to <8 x i8>')
+            bv = b.v(f'bitcast i64 {B} to <8 x i8>')
+        else:
+            A, B, C = '%a0', '%a2', '%a4'
+            et, esz, at = 'half', 2, '<8 x float>'
+            av, bv = A, B
+        lane = lane_id(b)
+        if MXU_MODE['mode'] == 'probe':
+            # record the operands of SIMD group 0 of threadgroup 0 (last call wins) and give every accumulator its id
+            wg = intr(b, 'i32', 'llvm.amdgcn.workgroup.id.x', [])
+            lid = intr(b, 'i32', 'llvm.amdgcn.workitem.id.x', [])
+            first = b.v(f'or i32 {wg}, {lid}')
+            sg0 = b.v(f'icmp ult i32 {first}, 32')
+            for opi, (vv, base) in enumerate(((av, 0), (bv, 256 * esz))):
+                for sl in range(8):
+                    x = b.v(f'extractelement <8 x {et}> {vv}, i32 {sl}')
+                    o = b.v(f'mul i32 {lane}, {8 * esz}')
+                    o = b.v(f'add i32 {o}, {base + sl * esz}')
+                    p = b.v(f'getelementptr inbounds i8, ptr addrspace(1) @__m4r_probe, i32 {o}')
+                    b.emit(f'call void @__m4r_maskstore_{et}(i1 {sg0}, ptr addrspace(1) {p}, {et} {x})')
+            b.decls.add(f'declare void @__m4r_maskstore_{et}(i1, ptr addrspace(1), {et})')
+            zero = b.v(f'icmp eq {at} {C}, zeroinitializer')
+            allz = intr(b, 'i1', 'llvm.vector.reduce.and.v8i1', [('<8 x i1>', zero)])
+            ids = 'poison'
+            for sl in range(8):
+                v = b.v(f'mul i32 {lane}, 8')
+                v = b.v(f'add i32 {v}, {sl}')
+                if kind == 'f':
+                    v = b.v(f'uitofp i32 {v} to float')
+                ids = b.v(f'insertelement {at} {ids}, {"i32" if kind == "i" else "float"} {v}, i32 {sl}')
+            return b.v(f'select i1 {allz}, {at} {ids}, {at} {C}')
+        # table-driven: scatter A and B into LDS in logical [row][k] / [col][k] order, then dot products
+        base = _lds_wave_base(b, 512 * esz)
+        for (vv, table, off) in ((av, '__m4r_mxu_a', 0), (bv, '__m4r_mxu_bt', 256 * esz)):
+            for sl in range(8):
+                x = b.v(f'extractelement <8 x {et}> {vv}, i32 {sl}')
+                idx = _layout_index(b, table, lane, sl)
+                o = b.v(f'mul i32 {idx}, {esz}')
+                o = b.v(f'add i32 {o}, {off}')
+                p = b.v(f'getelementptr inbounds i8, ptr addrspace(3) {base}, i32 {o}')
+                b.emit(f'store {et} {x}, ptr addrspace(3) {p}, align {esz}')
+        b.emit('fence syncscope("wavefront") release')
+        b.emit('fence syncscope("wavefront") acquire')
+        out = C
+        for sl in range(8):
+            rc = _layout_index(b, '__m4r_mxu_c', lane, sl)   # row * 16 + col
+            row = b.v(f'lshr i32 {rc}, 4')
+            col = b.v(f'and i32 {rc}, 15')
+            acc = b.v(f'extractelement {at} {C}, i32 {sl}')
+            for q in range(16 // (4 if kind == 'i' else 2)):
+                step = 4 if kind == 'i' else 2
+                ao = b.v(f'mul i32 {row}, {16 * esz}')
+                ao = b.v(f'add i32 {ao}, {q * step * esz}')
+                bo = b.v(f'mul i32 {col}, {16 * esz}')
+                bo = b.v(f'add i32 {bo}, {256 * esz + q * step * esz}')
+                pa = b.v(f'getelementptr inbounds i8, ptr addrspace(3) {base}, i32 {ao}')
+                pb = b.v(f'getelementptr inbounds i8, ptr addrspace(3) {base}, i32 {bo}')
+                if kind == 'i':
+                    xa = b.v(f'load i32, ptr addrspace(3) {pa}, align 4')
+                    xb = b.v(f'load i32, ptr addrspace(3) {pb}, align 4')
+                    su = intr(b, 'i32', 'llvm.amdgcn.udot4', [('i32', xa), ('i32', xb), ('i32', acc), ('i1', 'false')])
+                    ss = intr(b, 'i32', 'llvm.amdgcn.sdot4', [('i32', xa), ('i32', xb), ('i32', acc), ('i1', 'false')])
+                    acc = b.v(f'select i1 {signed}, i32 {ss}, i32 {su}')
+                else:
+                    xa = b.v(f'load <2 x half>, ptr addrspace(3) {pa}, align 4')
+                    xb = b.v(f'load <2 x half>, ptr addrspace(3) {pb}, align 4')
+                    acc = intr(b, 'float', 'llvm.amdgcn.fdot2', [('<2 x half>', xa), ('<2 x half>', xb), ('float', acc), ('i1', 'false')])
+            out = b.v(f'insertelement {at} {out}, {"i32" if kind == "i" else "float"} {acc}, i32 {sl}')
+        return out
+    return f
+
+
+AGX_TABLE = [
+    (r'm4r\.agx3\.load\.with\.emask\.', emask_load),
+    (r'm4r\.agx3\.store\.with\.emask\.', emask_store),
+    (r'm4r\.agx2\.device\.load\.cachectl\.', plain_load),
+    (r'm4r\.agx3\.igemm\.', mxu_gemm('i')),
+    (r'm4r\.agx3\.fgemm16x16x16\.', mxu_gemm('f')),
+]
+
+
+def implement_agx(decl_line):
+    m = re.match(r'declare\s+(.*?)\s*@(m4r\.agx[\w.]+)\((.*)\)', decl_line.strip())
+    s = Sig(decl_line.replace('@m4r.agx', '@air.__agx'))
+    s.name = m.group(2)
+    for pat, fn in AGX_TABLE:
+        if re.match(pat, s.name):
+            b = Body()
+            r = fn(b, s)
+            args = ', '.join(f'{t} %a{i}' for i, t in enumerate(s.params))
+            text = [f'define internal {s.ret} @{s.name}({args}) #900 {{'] + b.lines
+            text.append('  ret void' if s.ret == 'void' else f'  ret {s.ret} {r}')
+            text.append('}')
+            return '\n'.join(text), b.decls
+    raise NotImplementedError(s.name)
+
+
+def mask_helpers():
+    """Masked element load/store helpers (branch around the access)."""
+    out = []
+    for e, al in (('i8', 1), ('i16', 2), ('half', 2), ('float', 4)):
+        out.append(f'''define internal {e} @__m4r_maskload_{e}(i1 %on, ptr addrspace(1) %p) #900 {{
+  br i1 %on, label %l, label %z
+l:
+  %v = load {e}, ptr addrspace(1) %p, align {al}
+  ret {e} %v
+z:
+  ret {e} {'0' if e[0] == 'i' else '0.0'}
+}}
+define internal void @__m4r_maskstore_{e}(i1 %on, ptr addrspace(1) %p, {e} %v) #900 {{
+  br i1 %on, label %s, label %z
+s:
+  store {e} %v, ptr addrspace(1) %p, align {al}
+  ret void
+z:
+  ret void
+}}''')
+    return '\n'.join(out)
