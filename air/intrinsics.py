@@ -277,9 +277,9 @@ def to_i32_parts(b, t, v):
         x = v if n == 1 else b.v(f'extractelement {t} {v}, i32 {i}')
         if e == 'float':
             x = b.v(f'bitcast float {x} to i32')
-        elif e == 'half':
-            x = b.v(f'bitcast half {x} to i16')
-            x = b.v(f'zext i16 {x} to i32')
+        elif e == 'half':   # upper 16 bits undefined: nothing reads them, and zeroing them costs a v_and per word
+            x = b.v(f'insertelement <2 x half> poison, half {x}, i32 0')
+            x = b.v(f'bitcast <2 x half> {x} to i32')
         elif e == 'i16':
             x = b.v(f'zext i16 {x} to i32')
         elif e == 'i8':
@@ -293,8 +293,8 @@ def to_i32_parts(b, t, v):
             if e == 'float':
                 w = b.v(f'bitcast i32 {w} to float')
             elif e == 'half':
-                w = b.v(f'trunc i32 {w} to i16')
-                w = b.v(f'bitcast i16 {w} to half')
+                w = b.v(f'bitcast i32 {w} to <2 x half>')
+                w = b.v(f'extractelement <2 x half> {w}, i32 0')
             elif e in ('i16', 'i8'):
                 w = b.v(f'trunc i32 {w} to {e}')
             res.append(w)
@@ -336,21 +336,28 @@ def reduce_op(kind, width):
         else:
             ident = ('0xHFC00' if e == 'half' else '0xFFF0000000000000') if is_f else ('0' if not signed else str(-(1 << (int(e[1:]) - 1))))
         lane = lane_id(b)
-        cur = intr(b, t, f'llvm.amdgcn.set.inactive.{ivsuffix(t)}', [(t, '%a0'), (t, splat(t, ident))]) if width == 32 else '%a0'
-        step = 1
-        while step < width:
-            src = b.v(f'xor i32 {lane}, {step}')
-            parts, rebuild = to_i32_parts(b, t, cur)
-            other = rebuild([bpermute(b, src, w) for w in parts])
-            if kind == 'sum':
-                cur = b.v(f'{"fadd " + FAST if is_f else "add"} {t} {cur}, {other}')
-            else:
-                fn = ('minnum' if kind == 'min' else 'maxnum') if is_f else \
-                     (('smin' if kind == 'min' else 'smax') if signed else ('umin' if kind == 'min' else 'umax'))
-                cur = intr(b, t, f'llvm.{fn}.{ivsuffix(t)}', [(t, cur), (t, other)])
-            step *= 2
-        if width == 32:
-            cur = intr(b, t, f'llvm.amdgcn.strict.wwm.{ivsuffix(t)}', [(t, cur)])
+
+        def butterfly(cur):
+            step = 1
+            while step < width:
+                src = b.v(f'xor i32 {lane}, {step}')
+                parts, rebuild = to_i32_parts(b, t, cur)
+                other = rebuild([bpermute(b, src, w) for w in parts])
+                if kind == 'sum':
+                    cur = b.v(f'{"fadd " + FAST if is_f else "add"} {t} {cur}, {other}')
+                else:
+                    fn = ('minnum' if kind == 'min' else 'maxnum') if is_f else \
+                         (('smin' if kind == 'min' else 'smax') if signed else ('umin' if kind == 'min' else 'umax'))
+                    cur = intr(b, t, f'llvm.{fn}.{ivsuffix(t)}', [(t, cur), (t, other)])
+                step *= 2
+            return cur
+
+        if width != 32:
+            return butterfly('%a0')
+        # inactive lanes contribute the identity (a fast path for full waves, tried 2026-11-18, doubled the code and spilled)
+        cur = intr(b, t, f'llvm.amdgcn.set.inactive.{ivsuffix(t)}', [(t, '%a0'), (t, splat(t, ident))])
+        cur = butterfly(cur)
+        cur = intr(b, t, f'llvm.amdgcn.strict.wwm.{ivsuffix(t)}', [(t, cur)])
         return cur
     return f
 
