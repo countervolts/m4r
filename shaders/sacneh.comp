@@ -1,46 +1,61 @@
-// m4r: MetalFX's "sacneh" history prefilter (an MPSGraph in MetalFX: per channel plane, a separable 19-tap
-// filter with zero padding, applied along x and then y). Taps come from the user's emit_sacneh_constants.dat.
-// args: 0 src (f16 planes), 1 dst, 2 taps (19 x f16); consts 8 width, 9 height, 10 row pitch (elements),
-// 11 plane stride (elements), 12 axis (0 = x, 1 = y), 13 planes
+// m4r: MetalFX's "sacneh" history prefilter (an MPSGraph in MetalFX: per channel plane, a separable 19-tap filter with zero
+// padding, along x and then along y). Taps come from the user's emit_sacneh_constants.dat.
+// Both passes in one dispatch: a 32 x 8 group (32 x 32 outputs, 4 rows per thread) x-filters the 50 rows it needs into shared memory, rounded to f16 as the
+// separate passes stored their intermediate, then y-filters them. Same taps, order and roundings as two passes.
+// args: 0 src (f16 planes), 1 dst, 2 x taps, 3 y taps (19 x f16); consts 8 width, 9 height, 10 row pitch (elements),
+// 11 plane stride (elements), 12 planes
 // SPDX-License-Identifier: GPL-3.0-only
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_control_flow_attributes : require
-layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;   // 32-wide rows: whole 64-byte segments per wave
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer Half { float16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
 layout(push_constant) uniform Push { Args a; } pc;
-shared float16_t tile[(8 + 18) * 32];
-shared float tapv[19];                 // the coefficients, read once per group (per-thread buffer reads dominated the time)   // the group's outputs plus the 9-pixel apron on both sides of the filter axis
+
+const uint TW = 32u, TH = 32u, R = 9u, SW = TW + 2u * R, SH = TH + 2u * R;   // source window 50 x 50
+shared float16_t src_t[SH * SW];
+shared float16_t xf[SH * TW];          // x-filtered rows (f16, as the intermediate buffer held them)
+shared float tx[19], ty[19];
 
 void main() {
     Args a = pc.a;
-    uint w = a.c[0], h = a.c[1], pitch = a.c[2], plane = a.c[3], axis = a.c[4];
+    uint w = a.c[0], h = a.c[1], pitch = a.c[2], plane = a.c[3];
     uvec3 id = gl_GlobalInvocationID;
-    Half src = Half(a.slot[0]), dst = Half(a.slot[1]), taps = Half(a.slot[2]);
-    // the group's source window (32 x 8 outputs): along the filter axis outputs + 18 values, across it the group's extent;
-    // zero outside the image (the taps skip those anyway)
-    const uint along_n = axis == 0u ? 32u + 18u : 8u + 18u, across_n = axis == 0u ? 8u : 32u;
-    ivec2 g0 = ivec2(gl_WorkGroupID.x * 32u, gl_WorkGroupID.y * 8u);
-    for (uint i = gl_LocalInvocationIndex; i < along_n * across_n; i += 256u) {
-        int along, across;
-        if (axis == 0u) { along = int(i % along_n) - 9; across = int(i / along_n); }
-        else { across = int(i % across_n); along = int(i / across_n) - 9; }   // rows of the image stay contiguous in memory
-        int x = g0.x + (axis == 0u ? along : across), y = g0.y + (axis == 0u ? across : along);
-        tile[(axis == 0u ? uint(across) * along_n + uint(along + 9) : uint(along + 9) * across_n + uint(across))] =
-            (x >= 0 && y >= 0 && x < int(w) && y < int(h) && id.z < a.c[5]) ? src.v[id.z * plane + uint(y) * pitch + uint(x)]
-                                                                               : float16_t(0.0);
+    bool zok = id.z < a.c[4];
+    Half src = Half(a.slot[0]), dst = Half(a.slot[1]), tapx = Half(a.slot[2]), tapy = Half(a.slot[3]);
+    ivec2 g0 = ivec2(gl_WorkGroupID.x * TW, gl_WorkGroupID.y * TH) - ivec2(R);
+    uint li = gl_LocalInvocationIndex;
+    for (uint i = li; i < SH * SW; i += 256u) {
+        int x = g0.x + int(i % SW), y = g0.y + int(i / SW);
+        src_t[i] = (zok && x >= 0 && y >= 0 && x < int(w) && y < int(h)) ? src.v[id.z * plane + uint(y) * pitch + uint(x)]
+                                                                         : float16_t(0.0);
     }
-    if (gl_LocalInvocationIndex < 19u) tapv[gl_LocalInvocationIndex] = float(taps.v[gl_LocalInvocationIndex]);
+    if (li < 19u) { tx[li] = float(tapx.v[li]); ty[li] = float(tapy.v[li]); }
     barrier();
-    if (id.x >= w || id.y >= h || id.z >= a.c[5]) return;
+    // x filter for every row of the window; out-of-image taps read zeros: acc starts at +0 and a sum never becomes -0, so
+    // adding 0 * tap changes no bit
+    for (uint i = li; i < SH * TW; i += 256u) {
+        uint r = i / TW, cx = i % TW;
+        float acc = 0.0;
+        [[unroll]] for (uint t = 0u; t < 19u; ++t)
+            acc += tx[t] * float(src_t[r * SW + cx + t]);
+        xf[i] = float16_t(acc);
+    }
+    barrier();
     uvec2 l = gl_LocalInvocationID.xy;
-    // taps outside the image read the tile's zeros: acc starts at +0 and a sum never becomes -0, so adding 0 * tap changes no
-    // bit, and the loop needs no bounds test (same order and the same multiply-adds as the direct form)
-    float acc = 0.0;
-    uint k0 = axis == 0u ? l.y * along_n + l.x : l.y * across_n + l.x, step = axis == 0u ? 1u : across_n;
-    [[unroll]] for (int t = 0; t < 19; ++t)
-        acc += tapv[t] * float(tile[k0 + uint(t) * step]);
-    dst.v[id.z * plane + id.y * pitch + id.x] = float16_t(acc);
+    if (!zok || id.x >= w) return;
+    // y filter, 4 rows per thread; taps on rows outside the image are skipped as in the two-pass form (0 there)
+    [[unroll]] for (uint k = 0u; k < 4u; ++k) {
+        uint ly = l.y + 8u * k, oy = gl_WorkGroupID.y * TH + ly;
+        if (oy >= h) break;
+        float acc = 0.0;
+        [[unroll]] for (uint t = 0u; t < 19u; ++t) {
+            int y = int(oy) + int(t) - 9;
+            float v = (y >= 0 && y < int(h)) ? float(xf[(ly + t) * TW + l.x]) : 0.0;
+            acc += ty[t] * v;
+        }
+        dst.v[id.z * plane + oy * pitch + id.x] = float16_t(acc);
+    }
 }

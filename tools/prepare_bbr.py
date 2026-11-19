@@ -353,10 +353,10 @@ def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
     pre.append('glsl sacneh sacneh.spv 32 8 1')
     taps = m.sacneh()
     blob('sac_x', taps[0]); blob('sac_y', taps[1])
-    for axis, (src, dst, tp) in enumerate((('hist_t1', 'hist_tmp', 'sac_x'), ('hist_tmp', 'hist_t0', 'sac_y'))):
-        pre.append(f'pass sacneh threads {ow} {oh} 2')
-        pre += [f'  buf 0 {src}', f'  buf 1 {dst}', f'  buf 2 {tp}'] + [
-            f'  bytes {8 + j} ' + struct.pack('<I', v).hex() for j, v in enumerate((ow, oh, hp, oh * hp, axis, 2))]
+    # x and y filters in one dispatch (shaders/sacneh.comp), hist_t1 -> hist_t0
+    pre.append(f'pass sacneh threads {ow} {(oh + 3) // 4} 2')   # 32 x 32 outputs per 32 x 8 group
+    pre += ['  buf 0 hist_t1', '  buf 1 hist_t0', '  buf 2 sac_x', '  buf 3 sac_y'] + [
+        f'  bytes {8 + j} ' + struct.pack('<I', v).hex() for j, v in enumerate((ow, oh, hp, oh * hp, 2))]
     plan.extend(pre)
 
 
