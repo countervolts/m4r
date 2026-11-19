@@ -714,7 +714,7 @@ def implement(decl_line):
 # (masked-off loads return 0). MetalFX passes either 15 or 0 as the first mask and 15 as the second.
 
 MXU_MODE = {'mode': 'lds', 'int': os.environ.get('M4R_MXU_INT', 'wmma'),   # integer GEMM: 'wmma' or 'dot' (udot4/sdot4)
-            'fp16': os.environ.get('M4R_MXU_FP16', 'closed')}   # fp16 GEMM: 'closed' (closed-form layout) or 'table'
+            'fp16': os.environ.get('M4R_MXU_FP16', 'wmma')}   # fp16 GEMM: 'wmma', 'closed' (dot2 chain) or 'table'
 CTX = {'tg': [1, 1, 1]}   # threadgroup (= tile) size of the kernel being translated   # 'lds' (table-driven) or 'probe'
 
 
@@ -953,6 +953,108 @@ def _fgemm_dot2(b, lane):
     return out
 
 
+WMMA_F16 = 'llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16'
+
+
+def _fgemm_wmma(b, lane):
+    """D = C + A.B for 16x16x16 fp16 with f32 accumulators on RDNA3 WMMA (v_wmma_f32_16x16x16_f16).
+
+    On gfx1101 this instruction gives bit-identical results to the chain of v_dot2_f32_f16 over k in increasing order that
+    starts from C (_fgemm_dot2), also with a nonzero C (checked on 768k results, docs/mxu.md). C therefore goes into the WMMA
+    as its accumulator; adding it afterwards would round differently. The wave's LDS slot is used three times: A and B^T in
+    Apple's layout -> rows of k per lane; C in Apple's layout -> WMMA's (lane: column l & 15, rows 2i + (l >> 4)); D back."""
+    assert _mxu_closed_forms_ok(), 'air/mxu_layout.py no longer matches the closed forms'
+    A, B, C = '%a0', '%a2', '%a4'
+    base = _lds_wave_base(b, MXU_WAVE_BYTES)
+
+    def lane_bits(mask, shift):
+        t = b.v(f'and i32 {lane}, {mask}')
+        if shift > 0:
+            return b.v(f'shl i32 {t}, {shift}')
+        return b.v(f'lshr i32 {t}, {-shift}') if shift < 0 else t
+
+    def at(off_expr):
+        return b.v(f'getelementptr inbounds i8, ptr addrspace(3) {base}, i32 {off_expr}')
+
+    def sync():
+        b.emit('fence syncscope("wavefront") release')
+        b.emit('fence syncscope("wavefront") acquire')
+
+    a0 = b.v(f'or i32 {lane_bits(1, 2)}, {lane_bits(2, 3)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(4, 3)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(8, 0)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(16, 2)}')          # row * 16 + k0 (elements) of A's and C's first element
+    c0 = b.v(f'or i32 {lane_bits(1, 2)}, {lane_bits(8, 0)}')
+    kk = b.v(f'or i32 {lane_bits(2, -1)}, {lane_bits(4, -1)}')
+    kk = b.v(f'or i32 {kk}, {lane_bits(16, -2)}')
+    b0 = b.v(f'shl i32 {c0}, 4')
+    b0 = b.v(f'add i32 {b0}, {kk}')                         # col * 16 + k (elements) of B^T's first element
+
+    # 1. A tile [row][k] halves at byte 0, B^T tile [col][k] at byte 512 (Apple's layout: 4 consecutive k of rows r, r + 8)
+    for half in range(2):
+        x = b.v(f'shufflevector <8 x half> {A}, <8 x half> poison, <4 x i32> <i32 {4 * half}, i32 {4 * half + 1}, i32 {4 * half + 2}, i32 {4 * half + 3}>')
+        o = b.v(f'add i32 {a0}, {128 * half}')
+        o = b.v(f'shl i32 {o}, 1')
+        b.emit(f'store <4 x half> {x}, ptr addrspace(3) {at(o)}, align 8')
+    for sl in range(8):
+        x = b.v(f'extractelement <8 x half> {B}, i32 {sl}')
+        o = b.v(f'add i32 {b0}, {(sl & 3) * 16 + (8 if sl >= 4 else 0)}')
+        o = b.v(f'shl i32 {o}, 1')
+        o = b.v(f'add i32 {o}, 512')
+        b.emit(f'store half {x}, ptr addrspace(3) {at(o)}, align 2')
+    sync()
+    # WMMA operands: lane l (and l + 16) holds row / column (l & 15) of A / B, all 16 k
+    l16 = b.v(f'and i32 {lane}, 15')
+    ro = b.v(f'shl i32 {l16}, 5')
+    xa = b.v(f'load <16 x half>, ptr addrspace(3) {at(ro)}, align 32')
+    xb = b.v(f'load <16 x half>, ptr addrspace(3) {at(b.v(f"add i32 {ro}, 512"))}, align 32')
+    sync()
+
+    # 2. C (f32 [row][col], 1024 bytes, over the operand tiles): this lane's elements are rows r, r + 8, columns c0 .. c0 + 3
+    row0 = b.v(f'lshr i32 {a0}, 4')
+    col0 = b.v(f'and i32 {a0}, 15')
+    for h in range(2):
+        x = b.v(f'shufflevector <8 x float> {C}, <8 x float> poison, <4 x i32> <i32 {4 * h}, i32 {4 * h + 1}, i32 {4 * h + 2}, i32 {4 * h + 3}>')
+        o = b.v(f'add i32 {row0}, {8 * h}')
+        o = b.v(f'shl i32 {o}, 4')
+        o = b.v(f'add i32 {o}, {col0}')
+        o = b.v(f'shl i32 {o}, 2')
+        b.emit(f'store <4 x float> {x}, ptr addrspace(3) {at(o)}, align 16')
+    sync()
+    hi = b.v(f'lshr i32 {lane}, 4')
+    offs = []
+    cw = 'poison'
+    for i in range(8):
+        o = b.v(f'add i32 {hi}, {2 * i}')
+        o = b.v(f'shl i32 {o}, 4')
+        o = b.v(f'add i32 {o}, {l16}')
+        o = b.v(f'shl i32 {o}, 2')
+        offs.append(o)
+        x = b.v(f'load float, ptr addrspace(3) {at(o)}, align 4')
+        cw = b.v(f'insertelement <8 x float> {cw}, float {x}, i32 {i}')
+    b.decls.add(f'declare <8 x float> @{WMMA_F16}(<16 x half>, <16 x half>, <8 x float>)')
+    d = b.v(f'call <8 x float> @{WMMA_F16}(<16 x half> {xa}, <16 x half> {xb}, <8 x float> {cw})')
+    sync()
+
+    # 3. D back to Apple's layout
+    for i in range(8):
+        x = b.v(f'extractelement <8 x float> {d}, i32 {i}')
+        b.emit(f'store float {x}, ptr addrspace(3) {at(offs[i])}, align 4')
+    sync()
+    out = 'poison'
+    for h in range(2):
+        o = b.v(f'add i32 {row0}, {8 * h}')
+        o = b.v(f'shl i32 {o}, 4')
+        o = b.v(f'add i32 {o}, {col0}')
+        o = b.v(f'shl i32 {o}, 2')
+        x = b.v(f'load <4 x float>, ptr addrspace(3) {at(o)}, align 16')
+        for j in range(4):
+            e = b.v(f'extractelement <4 x float> {x}, i32 {j}')
+            out = b.v(f'insertelement <8 x float> {out}, float {e}, i32 {4 * h + j}')
+    sync()   # the slot is reused by the next GEMM
+    return out
+
+
 def mxu_gemm(kind):
     """kind 'i' (8 x i8 per lane packed in i64, i32 accumulators) or 'f' (8 x half, f32 accumulators)."""
     def f(b, s):
@@ -994,6 +1096,8 @@ def mxu_gemm(kind):
             return b.v(f'select i1 {allz}, {at} {ids}, {at} {C}')
         if kind == 'i' and MXU_MODE['int'] == 'wmma':
             return _igemm_wmma(b, lane)
+        if kind == 'f' and MXU_MODE['fp16'] == 'wmma':
+            return _fgemm_wmma(b, lane)
         if kind == 'f' and MXU_MODE['fp16'] == 'closed':
             return _fgemm_dot2(b, lane)
         # table-driven: scatter A and B into LDS in logical [row][k] / [col][k] order, then dot products

@@ -35,12 +35,14 @@ consecutive columns/k of rows `r` and `r + 8`, and for B^T, 4 consecutive column
   loads) and added to the accumulator. Integer sums do not depend on the order, so this is **bit-identical** to the dot-product
   lowering it replaced (`M4R_MXU_INT=dot` builds that one); checked on the numpy convolution (`tests/verify_conv.py`) and on
   every output frame of the full pipeline. The integer convolutions went from 3.3 ms to 0.45 ms per frame.
-- **fp16 GEMM (f16 inputs, f32 accumulators): a chain of `v_dot2_f32_f16`** over k in increasing order, as before, but with
-  the closed-form layout: each lane loads its 2 rows of A and 4 columns of B once instead of 32 operand vectors and 8 table
-  lookups. Same arithmetic, so bit-identical to the table version (`M4R_MXU_FP16=table`); `SBBRNet` 1.16 → 0.57 ms, the first
-  layer 0.32 → 0.14 ms. **WMMA is not used here on purpose:** `v_wmma_f32_16x16x16_f16` adds the products in an order and with
-  roundings the ISA does not specify, so its f32 sums would differ from the dot2 chain in the last bits, which is a change of
-  the numerics, not only of speed.
+- **fp16 GEMM (f16 inputs, f32 accumulators): RDNA3 WMMA** (`v_wmma_f32_16x16x16_f16`, `_fgemm_wmma`). On gfx1101 this
+  instruction gives **bit-identical** results to the chain of `v_dot2_f32_f16` over k in increasing order starting from C
+  (`_fgemm_dot2`, `M4R_MXU_FP16=closed`): a probe compared 768,000 results with zero and nonzero C, all equal. So C goes into
+  the WMMA as its accumulator (adding it afterwards would round differently), and the wave's LDS slot transposes A/B^T, C and
+  D between Apple's layout and WMMA's. Checked on every output frame of the synthetic fixture and of captured game frames.
+  SBBRNet at 2560x1440 output: 2.99 -> 0.43 ms.
+  Note: neither instruction is correctly rounded (`v_dot2_f32_f16` errs by up to about 2.4 ulp of the largest term against exact
+  arithmetic); "exact" here means equal to the earlier lowering, which is deterministic, not equal to true math.
 
 Whole frame (640x360 → 1280x720, RX 7700 XT): 5.3 ms before, 1.7 ms now (`M4R_PASS_TIME=1 build/run_bbr ...` prints the time of
 every pass).
