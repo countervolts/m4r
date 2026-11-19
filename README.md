@@ -23,7 +23,7 @@ GPU time per frame on an RX 7700 XT (RDNA3, gfx1101):
 | Upscaler, Balanced (1505x847 in) | 2.08 ms |
 | Upscaler, Performance (1280x720 in) | **1.98 ms** |
 | Upscaler, Ultra Performance (856x480 in) | 1.96 ms |
-| Upscaler with line locking (`install.py --line-locking`) | 2.06 ms |
+| Upscaler with line locking | 2.06 ms |
 | Frame generation, per generated frame | **1.55 ms** |
 
 At 1280x720 output (640x360 in) the upscaler takes 0.64 ms.
@@ -32,9 +32,6 @@ Every optimisation is bit-identical: the output matches the first, unoptimised t
 went from 6.7 to 1.98 ms and frame generation from 2.9 to 1.55 ms. They are measured offline with the captured game frames
 in `build/run_bbr` / `build/run_fg`; [docs/mxu.md](docs/mxu.md) and [docs/air-translation.md](docs/air-translation.md)
 describe the main techniques.
-
-RDNA2 has no matrix instructions, so its network runs on software matrix products. On the RX 7700 XT that code path takes
-4.2 ms for the 1440p upscaler. It has not been timed on RDNA2 or RDNA4 hardware yet.
 
 ## Quick start
 
