@@ -6,21 +6,41 @@
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;   // 32-wide rows: whole 64-byte segments per wave
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer Half { float16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
 layout(push_constant) uniform Push { Args a; } pc;
+shared float16_t tile[(8 + 18) * 32];
+shared float tapv[19];                 // the coefficients, read once per group (per-thread buffer reads dominated the time)   // the group's outputs plus the 9-pixel apron on both sides of the filter axis
+
 void main() {
     Args a = pc.a;
     uint w = a.c[0], h = a.c[1], pitch = a.c[2], plane = a.c[3], axis = a.c[4];
     uvec3 id = gl_GlobalInvocationID;
-    if (id.x >= w || id.y >= h || id.z >= a.c[5]) return;
     Half src = Half(a.slot[0]), dst = Half(a.slot[1]), taps = Half(a.slot[2]);
-    float acc = 0.0;
-    for (int t = 0; t < 19; ++t) {
-        int x = int(id.x) + (axis == 0u ? t - 9 : 0), y = int(id.y) + (axis == 1u ? t - 9 : 0);
-        if (x < 0 || y < 0 || x >= int(w) || y >= int(h)) continue;
-        acc += float(taps.v[t]) * float(src.v[id.z * plane + uint(y) * pitch + uint(x)]);
+    // the group's source window (32 x 8 outputs): along the filter axis outputs + 18 values, across it the group's extent;
+    // zero outside the image (the taps skip those anyway)
+    const uint along_n = axis == 0u ? 32u + 18u : 8u + 18u, across_n = axis == 0u ? 8u : 32u;
+    ivec2 g0 = ivec2(gl_WorkGroupID.x * 32u, gl_WorkGroupID.y * 8u);
+    for (uint i = gl_LocalInvocationIndex; i < along_n * across_n; i += 256u) {
+        int along, across;
+        if (axis == 0u) { along = int(i % along_n) - 9; across = int(i / along_n); }
+        else { across = int(i % across_n); along = int(i / across_n) - 9; }   // rows of the image stay contiguous in memory
+        int x = g0.x + (axis == 0u ? along : across), y = g0.y + (axis == 0u ? across : along);
+        tile[(axis == 0u ? uint(across) * along_n + uint(along + 9) : uint(along + 9) * across_n + uint(across))] =
+            (x >= 0 && y >= 0 && x < int(w) && y < int(h) && id.z < a.c[5]) ? src.v[id.z * plane + uint(y) * pitch + uint(x)]
+                                                                               : float16_t(0.0);
     }
+    if (gl_LocalInvocationIndex < 19u) tapv[gl_LocalInvocationIndex] = float(taps.v[gl_LocalInvocationIndex]);
+    barrier();
+    if (id.x >= w || id.y >= h || id.z >= a.c[5]) return;
+    uvec2 l = gl_LocalInvocationID.xy;
+    // taps outside the image read the tile's zeros: acc starts at +0 and a sum never becomes -0, so adding 0 * tap changes no
+    // bit, and the loop needs no bounds test (same order and the same multiply-adds as the direct form)
+    float acc = 0.0;
+    uint k0 = axis == 0u ? l.y * along_n + l.x : l.y * across_n + l.x, step = axis == 0u ? 1u : across_n;
+    [[unroll]] for (int t = 0; t < 19; ++t)
+        acc += tapv[t] * float(tile[k0 + uint(t) * step]);
     dst.v[id.z * plane + id.y * pitch + id.x] = float16_t(acc);
 }

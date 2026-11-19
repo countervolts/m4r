@@ -350,7 +350,7 @@ def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
     if not fused:
         post += ['tex 9 rnn_tex', 'buf 5 temporal_out']
     d('BBRNetAnisoGaussian', 'threads', ((ow + 15) & ~15, (oh + 15) & ~15, 1), post, tg=(16, 16, 1))
-    pre.append('glsl sacneh sacneh.spv 8 8 1')
+    pre.append('glsl sacneh sacneh.spv 32 8 1')
     taps = m.sacneh()
     blob('sac_x', taps[0]); blob('sac_y', taps[1])
     for axis, (src, dst, tp) in enumerate((('hist_t1', 'hist_tmp', 'sac_x'), ('hist_tmp', 'hist_t0', 'sac_y'))):
