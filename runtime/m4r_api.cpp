@@ -18,6 +18,7 @@ struct m4r_context {
     std::unique_ptr<Plan> bbr[2], fg;   // bbr[1]: plan for reversed depth, bbr[0]: forward depth (plans are specialised for it)
     uint32_t bbrSize[4] = {}, fgSize[4] = {};
     bool bbrInit = false;
+    std::map<uint64_t, bool> bbrNoPlan;   // content sizes without a plan of their own (looked up once)
     uint64_t bbrFrame[2] = {}, fgFrame = 0;
     float prevDt = 1.0f / 60.0f;
     std::map<VkImage, Texture> wrapped;
@@ -29,6 +30,10 @@ struct m4r_context {
     Buffer dumpDepth, dumpMotion;
     int dumpPending = -1, dumpCount = 0;
     uint32_t dumpW = 0, dumpH = 0;
+    // M4R_DUMP_UP=<dir>: the upscaler's inputs as the game gave them (raw texels) and each frame's parameters, for replay
+    struct UpDump { Buffer buf[3]; uint32_t w[3], h[3], bpp[3]; VkFormat fmt[3]; uint64_t call; std::string meta; bool written = false; };
+    std::vector<UpDump> upDumps;
+    uint64_t upCalls = 0;
 
     const Texture* wrap(const m4r_image& im) {
         if (!im.image) return nullptr;
@@ -53,6 +58,42 @@ static void logLine(const char* fmt, ...) {
     va_end(ap);
     std::fclose(f);
 }
+
+
+static uint32_t texelBytes(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R32G32_SFLOAT: return 8;
+    case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16_SNORM: case VK_FORMAT_R16G16_UNORM:
+    case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_D32_SFLOAT: case VK_FORMAT_D32_SFLOAT_S8_UINT: case VK_FORMAT_D24_UNORM_S8_UINT:
+    case VK_FORMAT_X8_D24_UNORM_PACK32: case VK_FORMAT_R32_UINT: return 4;
+    case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UNORM: case VK_FORMAT_D16_UNORM: return 2;
+    default: return 0;
+    }
+}
+
+static void writeUpDumps(m4r_context* c, bool all) {
+    const char* dir = std::getenv("M4R_DUMP_UP");
+    if (!dir) return;
+    static const char* names[3] = {"color", "depth", "motion"};
+    for (size_t i = 0; i < c->upDumps.size(); ++i) {
+        auto& u = c->upDumps[i];
+        if (u.written || (!all && c->upCalls < u.call + 6)) continue;   // a few frames later the GPU is done with the copies
+        char nm[512];
+        for (int k = 0; k < 3; ++k) {
+            if (!u.buf[k].buffer) continue;
+            std::snprintf(nm, sizeof nm, "%s/up-%02zu-%s.raw", dir, i, names[k]);
+            if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(u.buf[k].map, 1, size_t(u.w[k]) * u.h[k] * u.bpp[k], f); std::fclose(f); }
+            c->vk.destroyBuffer(u.buf[k]);
+        }
+        std::snprintf(nm, sizeof nm, "%s/up-%02zu.txt", dir, i);
+        if (FILE* f = std::fopen(nm, "w")) { std::fputs(u.meta.c_str(), f); std::fclose(f); }
+        u.written = true;
+    }
+}
+
 
 static void flushDump(m4r_context* c) {
     if (c->dumpPending < 0) return;
@@ -100,6 +141,48 @@ struct LayoutGuard {
                                  nullptr, uint32_t(back.size()), back.data());
     }
 };
+
+static void dumpUpscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_desc* d, uint32_t cw, uint32_t ch) {
+    const char* dir = std::getenv("M4R_DUMP_UP");
+    if (!dir) return;
+    writeUpDumps(c, false);
+    const char* st = std::getenv("M4R_DUMP_UP_START");
+    const char* nn = std::getenv("M4R_DUMP_UP_COUNT");
+    const uint64_t start = st ? std::strtoull(st, nullptr, 10) : 300, count = nn ? std::strtoull(nn, nullptr, 10) : 6;
+    if (c->upCalls < start || c->upCalls >= start + count) return;
+    m4r_context::UpDump u;
+    u.call = c->upCalls;
+    const m4r_image* ims[3] = {&d->color, &d->depth, &d->motion};
+    LayoutGuard g{cb};
+    for (auto* im : ims) g.add(*im);
+    g.begin();
+    char line[1024];
+    std::string meta;
+    for (int k = 0; k < 3; ++k) {
+        const m4r_image& im = *ims[k];
+        u.fmt[k] = im.format; u.w[k] = im.width; u.h[k] = im.height; u.bpp[k] = texelBytes(im.format);
+        std::snprintf(line, sizeof line, "image %d format %d size %u %u bpp %u\n", k, int(im.format), im.width, im.height, u.bpp[k]);
+        meta += line;
+        if (!u.bpp[k]) continue;
+        c->vk.createBuffer(u.buf[k], size_t(im.width) * im.height * u.bpp[k], true);
+        const bool depthFmt = im.format == VK_FORMAT_D32_SFLOAT || im.format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                              im.format == VK_FORMAT_D24_UNORM_S8_UINT || im.format == VK_FORMAT_X8_D24_UNORM_PACK32 ||
+                              im.format == VK_FORMAT_D16_UNORM;
+        VkBufferImageCopy r{};
+        r.imageSubresource = {VkImageAspectFlags(depthFmt ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
+        r.imageExtent = {im.width, im.height, 1};
+        vkCmdCopyImageToBuffer(cb, im.image, VK_IMAGE_LAYOUT_GENERAL, u.buf[k].buffer, 1, &r);
+    }
+    c->vk.barrier(cb);
+    g.end();
+    std::snprintf(line, sizeof line, "output %u %u\ncontent %u %u\nplan %u %u %u %u\njitter %.9g %.9g\nmvscale %.9g %.9g\n"
+                  "preexposure %.9g\nreset %d\ndepth_reversed %d\nexposure %d\n", d->output.width, d->output.height, cw, ch,
+                  c->bbrSize[0], c->bbrSize[1], c->bbrSize[2], c->bbrSize[3], d->jitter_x, d->jitter_y, d->motion_scale_x,
+                  d->motion_scale_y, d->pre_exposure, int(d->reset), int(d->depth_reversed), d->exposure.image ? 1 : 0);
+    meta += line;
+    u.meta = meta;
+    c->upDumps.push_back(std::move(u));
+}
 
 // full-image layout change with a full memory dependency (used around transfers on caller images)
 static void transition(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to) {
@@ -159,6 +242,7 @@ M4R_API int m4r_create(m4r_context** out, PFN_vkGetInstanceProcAddr gipa, VkInst
 M4R_API void m4r_destroy(m4r_context* c) {
     if (!c) return;
     flushDump(c);
+    writeUpDumps(c, true);
     if (c->dumpDepth.buffer) { c->vk.destroyBuffer(c->dumpDepth); c->vk.destroyBuffer(c->dumpMotion); }
     c->bbr[0].reset(); c->bbr[1].reset(); c->fg.reset();
     for (auto& [img, t] : c->wrapped) c->vk.destroyTexture(t);
@@ -197,6 +281,26 @@ M4R_API int m4r_upscale_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t 
 
 M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_desc* d) {
     if (!c->bbrInit) { c->error = "m4r_upscale_init not called"; return 1; }
+    // The size a game renders can differ from the one the feature was created with (Ghost of Tsushima creates DLSS at the
+    // optimal 1505x847 and renders 1512x848). Prefer the plan made for the content size; otherwise the current plan serves
+    // content up to its input size (MetalFX's maximum input size), and larger content is refused: the plan's buffers are
+    // sized for its input, and running it would write past them.
+    const uint32_t cw = d->content_width ? d->content_width : c->bbrSize[2], ch = d->content_height ? d->content_height : c->bbrSize[3];
+    if (cw != c->bbrSize[2] || ch != c->bbrSize[3]) {
+        const uint64_t key = (uint64_t(cw) << 32) | ch;
+        if (!c->bbrNoPlan.count(key)) {
+            const uint32_t ow = c->bbrSize[0], oh = c->bbrSize[1];
+            const std::string keep = c->error;
+            if (m4r_upscale_init(c, ow, oh, cw, ch) != 0) { c->bbrNoPlan[key] = true; c->error = keep; }
+        }
+        if (cw > c->bbrSize[2] || ch > c->bbrSize[3]) {
+            char b[256];
+            std::snprintf(b, sizeof b, "the game renders %ux%u, larger than the plan's %ux%u input; prepare a plan for %ux%u -> %ux%u "
+                          "(install.py --input %ux%u)", cw, ch, c->bbrSize[2], c->bbrSize[3], cw, ch, c->bbrSize[0], c->bbrSize[1], cw, ch);
+            c->error = b;
+            return 1;
+        }
+    }
     const int rev = d->depth_reversed ? 1 : 0;
     if (!c->bbr[rev]) { c->error = std::string("no plan for ") + (rev ? "reversed" : "forward") + " depth (prepare it with --reversed-depth " + (rev ? "1" : "0") + ")"; return 1; }
     Plan& p = *c->bbr[rev];
@@ -210,14 +314,16 @@ M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_de
         VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(cb, c->exposureOne.image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &r);
     }
+    dumpUpscale(c, cb, d, cw, ch);
+    ++c->upCalls;
     p.bindTexture("color", color); p.bindTexture("depth", depth); p.bindTexture("motion", motion);
     p.bindTexture("exposure", exposure); p.bindTexture("output", out);
     const uint32_t* s = c->bbrSize;
-    BRNetShaderParams bp = bbrParams(int(s[0]), int(s[1]), int(s[2]), int(s[3]), int(d->content_width), int(d->content_height),
+    BRNetShaderParams bp = bbrParams(int(s[0]), int(s[1]), int(s[2]), int(s[3]), int(cw), int(ch),
                                      d->jitter_x, d->jitter_y, d->motion_scale_x, d->motion_scale_y);
     const float pre = d->pre_exposure > 0 ? d->pre_exposure : 1.0f;
     const uint8_t reset = (d->reset || frame == 0) ? 1 : 0;
-    const float cpf[2] = {float(d->content_width) / s[0], float(d->content_height) / s[1]};
+    const float cpf[2] = {float(cw) / s[0], float(ch) / s[1]};
     p.bindBuffer("params", c->rt.transient(&bp, sizeof bp));
     p.bindBuffer("preexp", c->rt.transient(&pre, 4));
     p.bindBuffer("reset", c->rt.transient(&reset, 1));

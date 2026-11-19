@@ -8,12 +8,13 @@
 
 A plan exists per display and render resolution pair. The render size of each quality mode is worked out the way OptiScaler
 does it ((unsigned)(display / ratio) with 3.0, 2.0, 1.7, 1.5, 1.3 and 1.0 for ultra performance, performance, balanced,
-quality, ultra quality and DLAA); give --input for sizes a game picks on its own (dynamic resolution, custom scaling).
+quality, ultra quality and DLAA), and each of those rounded up to a multiple of 8, which some games render instead; m4r
+picks the plan matching the size each frame is rendered at. Give --input for sizes a game picks on its own (dynamic resolution, custom scaling).
 Plans contain Apple's translated kernels and weights made from your copy: keep them to yourself.
 
 usage: install.py --resources <MetalFX Resources dir> --binary <MetalFX binary> --game <dir with OptiScaler's dxgi.dll>
                   [--display 1920x1080 ...] [--modes quality,balanced,performance,ultra,dlaa,ultra-quality]
-                  [--input WxH ...] [--depth reversed|forward|both] [--no-fg] [--m4r-dll path] [--jobs N] [--force]
+                  [--input WxH ...] [--no-align8] [--depth reversed|forward|both] [--no-fg] [--m4r-dll path] [--jobs N] [--force]
 SPDX-License-Identifier: GPL-3.0-only
 """
 import argparse, concurrent.futures, os, shutil, subprocess, sys, tempfile
@@ -44,6 +45,7 @@ def main():
     ap.add_argument('--display', action='append', type=size, help='display resolution, e.g. 2560x1440 (default 1920x1080, 2560x1440, 3840x2160)')
     ap.add_argument('--modes', default='quality,balanced,performance,ultra', help='quality modes: ' + ', '.join(RATIOS))
     ap.add_argument('--input', action='append', type=size, help='extra render resolution (used with every --display)')
+    ap.add_argument('--no-align8', dest='align8', action='store_false', help='no plans for mode sizes rounded up to a multiple of 8')
     ap.add_argument('--depth', choices=('reversed', 'forward', 'both'), default='both', help='depth conventions of the upscaler plans')
     ap.add_argument('--no-fg', action='store_true', help='no frame generation plans')
     ap.add_argument('--m4r-dll', default=os.path.join(ROOT, 'build-win', 'm4r.dll'))
@@ -65,7 +67,12 @@ def main():
         for mode in [m for m in a.modes.split(',') if m]:
             if mode not in RATIOS:
                 sys.exit(f'unknown mode {mode}; known: {", ".join(RATIOS)}')
-            pairs.append((disp, render_size(disp, RATIOS[mode])))
+            r = render_size(disp, RATIOS[mode])
+            pairs.append((disp, r))
+            # some games render the mode's size rounded up to a multiple of 8 (Ghost of Tsushima: 1505x847 -> 1512x848)
+            r8 = (min(disp[0], (r[0] + 7) & ~7), min(disp[1], (r[1] + 7) & ~7))
+            if a.align8 and r8 != r:
+                pairs.append((disp, r8))
         for inp in a.input or []:
             pairs.append((disp, inp))
     pairs = sorted(set(pairs))
@@ -99,7 +106,9 @@ def main():
         out = os.path.join(plans_dir, name)
         if os.path.exists(os.path.join(out, 'plan.txt')) and not a.force:
             return name, 'kept'
-        r = subprocess.run(cmd + ['--out', out], capture_output=True, text=True)
+        if a.force and os.path.isdir(os.path.join(out, 'k')):
+            shutil.rmtree(os.path.join(out, 'k'))   # kernels of an older translator
+        r = subprocess.run(cmd + ['--out', out] + (['--force'] if a.force else []), capture_output=True, text=True)
         if r.returncode:
             return name, 'FAILED\n' + (r.stderr or r.stdout)[-2000:]
         if needs_sacneh:

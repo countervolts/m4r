@@ -102,6 +102,14 @@ int main(int argc, char** argv) {
             p.contentSize[0] = p.maxInputSize[0] = uint16_t(iw); p.contentSize[1] = p.maxInputSize[1] = uint16_t(ih);
             p.outputSize[0] = uint16_t(ow); p.outputSize[1] = uint16_t(oh);
             p.jitter[0] = jsign * float(halton(t + 1, 2)); p.jitter[1] = jsign * float(halton(t + 1, 3));
+            {   // optional params-NN.txt (fixtures captured from a game with M4R_DUMP_UP): the frame's own jitter, as m4r passes it
+                std::snprintf(nm, sizeof nm, "/params-%02d.txt", t);
+                std::ifstream pf(fx + nm);
+                std::string key;
+                float jx, jy;
+                while (pf >> key)
+                    if (key == "jitter" && (pf >> jx >> jy)) { p.jitter[0] = -jx; p.jitter[1] = -jy; }
+            }
             p.motionScale[0] = p.motionScale[1] = 1.0f;
             p.outputResMotionMultiplier[0] = float(iw) / ow; p.outputResMotionMultiplier[1] = float(ih) / oh;
             p.normalizeMotionScale[0] = 1.0f / iw; p.normalizeMotionScale[1] = 1.0f / ih;
@@ -214,6 +222,32 @@ int main(int argc, char** argv) {
             std::snprintf(nm, sizeof nm, "/out-%02d.rgba16f", t);
             std::ofstream(dir + nm, std::ios::binary).write(reinterpret_cast<char*>(out.data()), out.size());
             std::printf("frame %d: %.3f ms GPU\n", t, double(ts[1] - ts[0]) * props.limits.timestampPeriod * 1e-6);
+            // debug: M4R_DUMP_TEX=name,name... writes the plan's textures / buffers after every frame (tex-<name>-NN.raw)
+            if (const char* names = std::getenv("M4R_DUMP_TEX")) {
+                std::string all = names;
+                for (size_t a = 0; a < all.size();) {
+                    size_t b = all.find(',', a); if (b == std::string::npos) b = all.size();
+                    std::string n = all.substr(a, b - a); a = b + 1;
+                    std::vector<uint8_t> bytes;
+                    if (Texture* x = plan.texture(n)) {
+                        size_t bpp = 0;
+                        switch (x->format) {
+                        case VK_FORMAT_R8_UNORM: bpp = 1; break;
+                        case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R16_SFLOAT: bpp = 2; break;
+                        case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R8G8B8A8_UNORM: bpp = 4; break;
+                        case VK_FORMAT_R16G16B16A16_SFLOAT: bpp = 8; break;
+                        default: break;
+                        }
+                        if (!bpp) { std::fprintf(stderr, "dump %s: format %d\n", n.c_str(), int(x->format)); continue; }
+                        bytes.resize(size_t(x->width) * x->height * bpp);
+                        vk.download(*x, bytes.data(), bytes.size());
+                    } else if (Buffer* y = plan.buffer(n)) {
+                        bytes.assign(static_cast<uint8_t*>(y->map), static_cast<uint8_t*>(y->map) + y->size);
+                    } else { std::fprintf(stderr, "dump: no %s\n", n.c_str()); continue; }
+                    std::snprintf(nm, sizeof nm, "/tex-%s-%02d.raw", n.c_str(), t);
+                    std::ofstream(dir + nm, std::ios::binary).write(reinterpret_cast<char*>(bytes.data()), bytes.size());
+                }
+            }
         }
         vkDestroyQueryPool(vk.device, qp, nullptr);
         for (Texture* x : {&color, &depth, &motion, &exposure, &output}) vk.destroyTexture(*x);

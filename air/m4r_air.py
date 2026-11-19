@@ -196,7 +196,33 @@ def fc_literal(fc_type, value):
     raise ValueError('function constant type ' + fc_type)
 
 
-def translate(text, kernel, constants, tg, wave=32):
+def half_division_in_f32(text):
+    """Half-precision divisions are computed in f32 and the quotient rounded to half.
+
+    LLVM lowers a fast-math half division to v_rcp_f16(b) * a, and v_rcp_f16 treats a subnormal b as zero: 0 / 1.4e-5 gives
+    0 * inf = NaN where Apple's GPU, which keeps fp16 subnormals, gives 0 (BBRNetAnisoGaussian guards a weight sum with
+    `> 1e-5`, which lets half subnormals through; the NaNs then spread through the history as dark blocks). In f32 every half
+    subnormal is a normal number, so the quotient is right; this only widens, it approximates nothing."""
+    n = [0]
+
+    def rep(m):
+        ind, name, flags, t, rest = m.groups()
+        a, b = intrinsics.split_params(rest)[:2]   # (drops trailing metadata such as !fpmath)
+        ft = t.replace('half', 'float')
+        # no arcp / afn: LLVM narrows fptrunc(fdiv(fpext a, fpext b)) back to a half division, and with those flags lowers
+        # that to v_rcp_f16 again; without them the half division is the exact sequence (f32 reciprocal, v_div_fixup_f16)
+        fl = ' '.join(f for f in flags.split() for f in (['nnan', 'ninf', 'nsz', 'contract', 'reassoc'] if f == 'fast' else [f])
+                      if f not in ('arcp', 'afn'))
+        flags = fl + ' ' if fl else ''
+        n[0] += 1
+        base = f'%m4r.div{n[0]}'
+        return (f'{ind}{base}.a = fpext {t} {a} to {ft}\n{ind}{base}.b = fpext {t} {b} to {ft}\n'
+                f'{ind}{base}.q = fdiv {flags}{ft} {base}.a, {base}.b\n{ind}{name} = fptrunc {ft} {base}.q to {t}')
+    return re.sub(r'^(\s+)(%[-\w.]+) = fdiv ((?:(?:fast|nnan|ninf|nsz|arcp|contract|afn|reassoc) )*)(half|<\d+ x half>) (.*)$',
+                  rep, text, flags=re.M)
+
+
+def translate(text, kernel, constants, tg, wave=32, widen=False):
     """Return (amdgpu IR text, manifest dict)."""
     args = kernel_info(text, kernel)
     fcs = function_constants(text)
@@ -291,6 +317,17 @@ def translate(text, kernel, constants, tg, wave=32):
         body = re.sub(r'\bno-builtins\b', '', body)
         return f'attributes #{m.group(1)} = {{{body}}}'
     text = re.sub(r'^attributes #(\d+) = \{(.*)\}$', fix_attrs, text, flags=re.M)
+
+    # 7a. half divisions in f32 (see half_division_in_f32)
+    text = half_division_in_f32(text)
+
+    # 7b. optional widening of half arithmetic to f32 (air/widen.py): on inlined, scalarised IR, before the intrinsics get bodies
+    if widen:
+        import widen as widen_mod
+        text = run(['opt', '-O3', f'-mtriple={TRIPLE}', '-mcpu=gfx1101', f'-mattr=+wavefrontsize{wave},-real-true16', '-S', '-',
+                    '-o', '-'], input=text.encode()).decode()
+        text = widen_mod.widen(text)
+        manifest['widened'] = True
 
     # 8. AIR intrinsic bodies
     extra_decls = set()
@@ -566,8 +603,18 @@ def write_manifest(man, base):
     open(base + '.args', 'w').write('\n'.join(lines) + '\n')
 
 
+def translator_hash():
+    """Hash of the translator's own sources: kernels translated by another version of it are never reused."""
+    h = hashlib.sha256()
+    d = os.path.dirname(os.path.abspath(__file__))
+    for name in sorted(os.listdir(d)):
+        if name.endswith('.py'):
+            h.update(name.encode()); h.update(open(os.path.join(d, name), 'rb').read())
+    return h.hexdigest()[:16]
+
+
 def specialization_key(kernel, constants, tg, source_hash):
-    s = json.dumps([kernel, sorted(constants.items()), tg, source_hash], sort_keys=True)
+    s = json.dumps([kernel, sorted(constants.items()), tg, source_hash, translator_hash()], sort_keys=True)
     return hashlib.sha256(s.encode()).hexdigest()[:16]
 
 
@@ -578,6 +625,7 @@ def main():
     ap.add_argument('-o', '--out', required=True, help='output code object (.hsaco); manifest is written next to it')
     ap.add_argument('--tg', default='32,1,1', help='threadgroup size x,y,z')
     ap.add_argument('-D', action='append', default=[], help='function constant name=value')
+    ap.add_argument('--widen', action='store_true', help='compute half arithmetic in f32 (air/widen.py)')
     ap.add_argument('--keep', action='store_true', help='also write the intermediate IR and assembly')
     ap.add_argument('--mxu-probe', action='store_true', help='build the MXU layout probe (tests/probe_mxu.py)')
     a = ap.parse_args()
@@ -597,7 +645,7 @@ def main():
         k, v = d.split('=', 1)
         consts[k] = v
     tg = [int(x) for x in a.tg.split(',')]
-    ir, man = translate(text, a.kernel, consts, tg)
+    ir, man = translate(text, a.kernel, consts, tg, widen=a.widen)
     compile_ir(ir, a.out, keep=os.path.splitext(a.out)[0] if a.keep else None)
     write_manifest(man, os.path.splitext(a.out)[0])
     print(a.out)
