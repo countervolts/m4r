@@ -725,10 +725,23 @@ MXU_MODE = {'mode': 'lds', 'int': os.environ.get('M4R_MXU_INT', 'wmma'),   # int
 CTX = {'tg': [1, 1, 1]}   # threadgroup (= tile) size of the kernel being translated   # 'lds' (table-driven) or 'probe'
 
 
+ESIZE = {'i8': 1, 'i16': 2, 'half': 2, 'float': 4, 'i32': 4}
+
+
 def emask_load(b, s):
+    """All elements on (MetalFX passes 15 or 0): one vector load; otherwise element by element. Same values either way: a
+    full mask makes every address of the vector one Apple's kernel reads."""
     t = s.ret
     n, e = vec(t)
     m = b.v('and i16 %a1, %a2')
+    allm = (1 << n) - 1
+    mm = b.v(f'and i16 {m}, {allm}')
+    full = b.v(f'icmp eq i16 {mm}, {allm}')
+    b.emit(f'br i1 {full}, label %ld_full, label %ld_part')
+    b.emit('ld_full:')
+    vf = b.v(f'load {t}, ptr addrspace(1) %a0, align {ESIZE[e]}')
+    b.emit('br label %ld_end')
+    b.emit('ld_part:')
     out = 'zeroinitializer'
     for i in range(n):
         bit = b.v(f'and i16 {m}, {1 << i}')
@@ -736,20 +749,32 @@ def emask_load(b, s):
         p = b.v(f'getelementptr inbounds {e}, ptr addrspace(1) %a0, i64 {i}')
         out_i = b.v(f'call {e} @__m4r_maskload_{e}(i1 {on}, ptr addrspace(1) {p})')
         out = b.v(f'insertelement {t} {out}, {e} {out_i}, i32 {i}')
+    b.emit('br label %ld_end')
+    b.emit('ld_end:')
     b.decls.add(f'declare {e} @__m4r_maskload_{e}(i1, ptr addrspace(1))')
-    return out
+    return b.v(f'phi {t} [ {vf}, %ld_full ], [ {out}, %ld_part ]')
 
 
 def emask_store(b, s):
     t = s.params[1]
     n, e = vec(t)
     m = b.v('and i16 %a2, %a3')
+    allm = (1 << n) - 1
+    mm = b.v(f'and i16 {m}, {allm}')
+    full = b.v(f'icmp eq i16 {mm}, {allm}')
+    b.emit(f'br i1 {full}, label %st_full, label %st_part')
+    b.emit('st_full:')
+    b.emit(f'store {t} %a1, ptr addrspace(1) %a0, align {ESIZE[e]}')
+    b.emit('br label %st_end')
+    b.emit('st_part:')
     for i in range(n):
         bit = b.v(f'and i16 {m}, {1 << i}')
         on = b.v(f'icmp ne i16 {bit}, 0')
         p = b.v(f'getelementptr inbounds {e}, ptr addrspace(1) %a0, i64 {i}')
         x = b.v(f'extractelement {t} %a1, i32 {i}')
         b.emit(f'call void @__m4r_maskstore_{e}(i1 {on}, ptr addrspace(1) {p}, {e} {x})')
+    b.emit('br label %st_end')
+    b.emit('st_end:')
     b.decls.add(f'declare void @__m4r_maskstore_{e}(i1, ptr addrspace(1), {e})')
     return None
 
@@ -1148,7 +1173,164 @@ def mxu_gemm(kind):
     return f
 
 
+# --- GEMM chains in WMMA layout (air/gemm_chain.py) -------------------------------------------------------------------
+# A GEMM whose accumulator comes from another GEMM keeps it in WMMA's layout (lane: column l & 15, rows 2i + (l >> 4)); only
+# accumulators read by other code are converted to Apple's layout. Same WMMA instructions with C as the accumulator, so the
+# results equal _fgemm_wmma / _igemm_wmma.
+
+def _apple_coords(b, lane):
+    def lane_bits(mask, shift):
+        t = b.v(f'and i32 {lane}, {mask}')
+        if shift > 0:
+            return b.v(f'shl i32 {t}, {shift}')
+        return b.v(f'lshr i32 {t}, {-shift}') if shift < 0 else t
+    a0 = b.v(f'or i32 {lane_bits(1, 2)}, {lane_bits(2, 3)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(4, 3)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(8, 0)}')
+    a0 = b.v(f'or i32 {a0}, {lane_bits(16, 2)}')          # row * 16 + k0 of A's and C's first element
+    c0 = b.v(f'or i32 {lane_bits(1, 2)}, {lane_bits(8, 0)}')
+    kk = b.v(f'or i32 {lane_bits(2, -1)}, {lane_bits(4, -1)}')
+    kk = b.v(f'or i32 {kk}, {lane_bits(16, -2)}')
+    b0 = b.v(f'shl i32 {c0}, 4')
+    b0 = b.v(f'add i32 {b0}, {kk}')                         # col * 16 + k of B^T's first element
+    return a0, b0
+
+
+def _wsync(b):
+    b.emit('fence syncscope("wavefront") release')
+    b.emit('fence syncscope("wavefront") acquire')
+
+
+def _at(b, base, off):
+    return b.v(f'getelementptr inbounds i8, ptr addrspace(3) {base}, i32 {off}')
+
+
+def _acc_offsets(b, lane):
+    """byte offsets of this lane's 8 accumulator elements in a row-major 16x16 x 4-byte tile: (Apple: 2 x 16-byte rows),
+    (WMMA: 8 scalars)"""
+    a0, _ = _apple_coords(b, lane)
+    row0 = b.v(f'lshr i32 {a0}, 4')
+    col0 = b.v(f'and i32 {a0}, 15')
+    apple = []
+    for h in range(2):
+        o = b.v(f'add i32 {row0}, {8 * h}')
+        o = b.v(f'shl i32 {o}, 4')
+        o = b.v(f'add i32 {o}, {col0}')
+        apple.append(b.v(f'shl i32 {o}, 2'))
+    l16 = b.v(f'and i32 {lane}, 15')
+    hi = b.v(f'lshr i32 {lane}, 4')
+    wm = []
+    for i in range(8):
+        o = b.v(f'add i32 {hi}, {2 * i}')
+        o = b.v(f'shl i32 {o}, 4')
+        o = b.v(f'add i32 {o}, {l16}')
+        wm.append(b.v(f'shl i32 {o}, 2'))
+    return apple, wm
+
+
+def acc_convert(to_wmma):
+    def f(b, s):
+        t = s.ret
+        e = vec(t)[1]
+        lane = lane_id(b)
+        base = _lds_wave_base(b, MXU_WAVE_BYTES)
+        apple, wm = _acc_offsets(b, lane)
+        if to_wmma:
+            for h in range(2):
+                x = b.v(f'shufflevector {t} %a0, {t} poison, <4 x i32> <i32 {4 * h}, i32 {4 * h + 1}, i32 {4 * h + 2}, i32 {4 * h + 3}>')
+                b.emit(f'store <4 x {e}> {x}, ptr addrspace(3) {_at(b, base, apple[h])}, align 16')
+            _wsync(b)
+            out = 'poison'
+            for i in range(8):
+                x = b.v(f'load {e}, ptr addrspace(3) {_at(b, base, wm[i])}, align 4')
+                out = b.v(f'insertelement {t} {out}, {e} {x}, i32 {i}')
+        else:
+            for i in range(8):
+                x = b.v(f'extractelement {t} %a0, i32 {i}')
+                b.emit(f'store {e} {x}, ptr addrspace(3) {_at(b, base, wm[i])}, align 4')
+            _wsync(b)
+            out = 'poison'
+            for h in range(2):
+                x = b.v(f'load <4 x {e}>, ptr addrspace(3) {_at(b, base, apple[h])}, align 16')
+                for j in range(4):
+                    y = b.v(f'extractelement <4 x {e}> {x}, i32 {j}')
+                    out = b.v(f'insertelement {t} {out}, {e} {y}, i32 {4 * h + j}')
+        _wsync(b)   # the slot is reused next
+        return out
+    return f
+
+
+def wgemm_f(b, s):
+    """m4r.agx3.wgemm.f(<8 x half> A, <8 x half> B, <8 x float> C in WMMA layout) -> D in WMMA layout"""
+    A, B, C = '%a0', '%a1', '%a2'
+    lane = lane_id(b)
+    base = _lds_wave_base(b, MXU_WAVE_BYTES)
+    a0, b0 = _apple_coords(b, lane)
+    for half in range(2):
+        x = b.v(f'shufflevector <8 x half> {A}, <8 x half> poison, <4 x i32> <i32 {4 * half}, i32 {4 * half + 1}, i32 {4 * half + 2}, i32 {4 * half + 3}>')
+        o = b.v(f'add i32 {a0}, {128 * half}')
+        o = b.v(f'shl i32 {o}, 1')
+        b.emit(f'store <4 x half> {x}, ptr addrspace(3) {_at(b, base, o)}, align 8')
+    for sl in range(8):
+        x = b.v(f'extractelement <8 x half> {B}, i32 {sl}')
+        o = b.v(f'add i32 {b0}, {(sl & 3) * 16 + (8 if sl >= 4 else 0)}')
+        o = b.v(f'shl i32 {o}, 1')
+        o = b.v(f'add i32 {o}, 512')
+        b.emit(f'store half {x}, ptr addrspace(3) {_at(b, base, o)}, align 2')
+    _wsync(b)
+    l16 = b.v(f'and i32 {lane}, 15')
+    ro = b.v(f'shl i32 {l16}, 5')
+    xa = b.v(f'load <16 x half>, ptr addrspace(3) {_at(b, base, ro)}, align 32')
+    xb = b.v(f'load <16 x half>, ptr addrspace(3) {_at(b, base, b.v(f"add i32 {ro}, 512"))}, align 32')
+    _wsync(b)
+    b.decls.add(f'declare <8 x float> @{WMMA_F16}(<16 x half>, <16 x half>, <8 x float>)')
+    return b.v(f'call <8 x float> @{WMMA_F16}(<16 x half> {xa}, <16 x half> {xb}, <8 x float> {C})')
+
+
+def wgemm_i(b, s):
+    """m4r.agx3.wgemm.i(i64 A, i16 typeA, i64 B, i16 typeB, <8 x i32> C in WMMA layout) -> D in WMMA layout (type 75 = s8)"""
+    A, B, C = '%a0', '%a2', '%a4'
+    lane = lane_id(b)
+    base = _lds_wave_base(b, MXU_WAVE_BYTES)
+    a0, b0 = _apple_coords(b, lane)
+    a2 = b.v(f'bitcast i64 {A} to <2 x i32>')
+    for half in range(2):
+        x = b.v(f'extractelement <2 x i32> {a2}, i32 {half}')
+        b.emit(f'store i32 {x}, ptr addrspace(3) {_at(b, base, b.v(f"add i32 {a0}, {128 * half}"))}, align 4')
+    bv = b.v(f'bitcast i64 {B} to <8 x i8>')
+    for sl in range(8):
+        x = b.v(f'extractelement <8 x i8> {bv}, i32 {sl}')
+        b.emit(f'store i8 {x}, ptr addrspace(3) {_at(b, base, b.v(f"add i32 {b0}, {256 + (sl & 3) * 16 + (8 if sl >= 4 else 0)}"))}, align 1')
+    _wsync(b)
+    l16 = b.v(f'and i32 {lane}, 15')
+    row_off = b.v(f'shl i32 {l16}, 4')
+    xa = b.v(f'load <4 x i32>, ptr addrspace(3) {_at(b, base, row_off)}, align 16')
+    xb = b.v(f'load <4 x i32>, ptr addrspace(3) {_at(b, base, b.v(f"add i32 {row_off}, 256"))}, align 16')
+    _wsync(b)
+    sa = b.v('icmp eq i16 %a1, 75')
+    sb = b.v('icmp eq i16 %a3, 75')
+    b.decls.add(f'declare <8 x i32> @{WMMA_I8}(i1 immarg, <4 x i32>, i1 immarg, <4 x i32>, <8 x i32>, i1 immarg)')
+    b.emit(f'br i1 {sa}, label %wm_a1, label %wm_a0')
+    results = []
+    for ia in (0, 1):
+        b.emit(f'wm_a{ia}:')
+        b.emit(f'br i1 {sb}, label %wm_{ia}1, label %wm_{ia}0')
+    for ia in (0, 1):
+        for ib in (0, 1):
+            b.emit(f'wm_{ia}{ib}:')
+            r = b.v(f'call <8 x i32> @{WMMA_I8}(i1 {"true" if ia else "false"}, <4 x i32> {xa}, i1 {"true" if ib else "false"}, '
+                    f'<4 x i32> {xb}, <8 x i32> {C}, i1 false)')
+            b.emit('br label %wm_end')
+            results.append((r, f'wm_{ia}{ib}'))
+    b.emit('wm_end:')
+    return b.v('phi <8 x i32> ' + ', '.join(f'[ {r}, %{lbl} ]' for r, lbl in results))
+
+
 AGX_TABLE = [
+    (r'm4r\.agx3\.wgemm\.f', wgemm_f),
+    (r'm4r\.agx3\.wgemm\.i', wgemm_i),
+    (r'm4r\.agx3\.a2w\.', acc_convert(True)),
+    (r'm4r\.agx3\.w2a\.', acc_convert(False)),
     (r'm4r\.agx3\.load\.with\.emask\.', emask_load),
     (r'm4r\.agx3\.store\.with\.emask\.', emask_store),
     (r'm4r\.agx2\.device\.load\.cachectl\.', plain_load),

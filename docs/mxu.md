@@ -70,3 +70,14 @@ values, stale registers and out-of-bounds access. `tests/check_determinism.sh <p
 vkhip's donor shader indexed its shared array with the thread id, so ACO allocated only threadgroup-size × 4 bytes
 of LDS; kernels with more LDS than that (the GEMM tiles here) overflowed into other waves. The donor now indexes
 with a value the compiler cannot bound.
+
+## GEMM chains in WMMA layout
+
+`air/gemm_chain.py` (on by default, `M4R_GEMM_CHAIN=0` turns it off) keeps an accumulator in WMMA's layout while it only flows
+from GEMM to GEMM: the module is optimised first with the MXU intrinsics still opaque (so the accumulator arrays are registers
+and loops are phis), then each GEMM becomes `wgemm` (WMMA with C as the accumulator, as before) and conversions between the
+layouts (`a2w`, `w2a`, through the wave's LDS slot) remain only where other code reads or produces an accumulator: a value
+entering a loop is converted once in the block before it, a value read after a loop once in the block that reads it. Same
+instructions, so the results are bit-identical (every output frame of the synthetic and the captured game fixtures). At
+1280x720 -> 2560x1440: first layer 0.50 -> 0.31 ms, SBBRNet 0.43 -> 0.28, each 32-channel 3x3 convolution 0.31 -> 0.17; the
+upscaler 3.79 -> 2.96 ms. Masked MXU loads and stores with a full mask are single vector accesses (MetalFX passes 15 or 0).

@@ -321,11 +321,17 @@ def translate(text, kernel, constants, tg, wave=32, widen=False):
     # 7a. half divisions in f32 (see half_division_in_f32)
     text = half_division_in_f32(text)
 
-    # 7b. optional widening of half arithmetic to f32 (air/widen.py): on inlined, scalarised IR, before the intrinsics get bodies
-    if widen:
-        import widen as widen_mod
+    # 7b. on inlined, scalarised IR, before the intrinsics get bodies: GEMM accumulators in WMMA layout (air/gemm_chain.py) and
+    # the optional widening of half arithmetic (air/widen.py)
+    chain = os.environ.get('M4R_GEMM_CHAIN', '1') != '0' and re.search(r'@llvm\.agx3\.(fgemm|igemm)', text) is not None
+    if widen or chain:
         text = run(['opt', '-O3', f'-mtriple={TRIPLE}', '-mcpu=gfx1101', f'-mattr=+wavefrontsize{wave},-real-true16', '-S', '-',
                     '-o', '-'], input=text.encode()).decode()
+    if chain:
+        import gemm_chain
+        text = gemm_chain.rewrite(text)
+    if widen:
+        import widen as widen_mod
         text = widen_mod.widen(text)
         manifest['widened'] = True
 
