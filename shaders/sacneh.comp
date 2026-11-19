@@ -34,28 +34,34 @@ void main() {
     }
     if (li < 19u) { tx[li] = float(tapx.v[li]); ty[li] = float(tapy.v[li]); }
     barrier();
-    // x filter for every row of the window; out-of-image taps read zeros: acc starts at +0 and a sum never becomes -0, so
-    // adding 0 * tap changes no bit
-    for (uint i = li; i < SH * TW; i += 256u) {
-        uint r = i / TW, cx = i % TW;
-        float acc = 0.0;
-        [[unroll]] for (uint t = 0u; t < 19u; ++t)
-            acc += tx[t] * float(src_t[r * SW + cx + t]);
-        xf[i] = float16_t(acc);
+    // x filter for every row of the window, 8 consecutive outputs per thread from 26 values in registers; out-of-image taps read
+    // zeros: acc starts at +0 and a sum never becomes -0, so adding 0 * tap changes no bit
+    if (li < SH * (TW / 8u)) {
+        uint r = li / (TW / 8u), c0 = (li % (TW / 8u)) * 8u;
+        float v[26];
+        [[unroll]] for (uint i = 0u; i < 26u; ++i) v[i] = float(src_t[r * SW + c0 + i]);
+        [[unroll]] for (uint o = 0u; o < 8u; ++o) {
+            float acc = 0.0;
+            [[unroll]] for (uint t = 0u; t < 19u; ++t) acc += tx[t] * v[o + t];
+            xf[r * TW + c0 + o] = float16_t(acc);
+        }
     }
     barrier();
     uvec2 l = gl_LocalInvocationID.xy;
     if (!zok || id.x >= w) return;
-    // y filter, 4 rows per thread; taps on rows outside the image are skipped as in the two-pass form (0 there)
+    // y filter: 4 consecutive rows per thread from 22 values; taps on rows outside the image are skipped as in the two-pass
+    // form (0 there)
+    uint oy0 = gl_WorkGroupID.y * TH + l.y * 4u;
+    float u[22];
+    [[unroll]] for (uint i = 0u; i < 22u; ++i) {
+        int y = int(oy0) + int(i) - 9;
+        u[i] = (y >= 0 && y < int(h)) ? float(xf[(l.y * 4u + i) * TW + l.x]) : 0.0;
+    }
     [[unroll]] for (uint k = 0u; k < 4u; ++k) {
-        uint ly = l.y + 8u * k, oy = gl_WorkGroupID.y * TH + ly;
+        uint oy = oy0 + k;
         if (oy >= h) break;
         float acc = 0.0;
-        [[unroll]] for (uint t = 0u; t < 19u; ++t) {
-            int y = int(oy) + int(t) - 9;
-            float v = (y >= 0 && y < int(h)) ? float(xf[(ly + t) * TW + l.x]) : 0.0;
-            acc += ty[t] * v;
-        }
+        [[unroll]] for (uint t = 0u; t < 19u; ++t) acc += ty[t] * u[k + t];
         dst.v[id.z * plane + oy * pitch + id.x] = float16_t(acc);
     }
 }
