@@ -13,15 +13,26 @@ is re-trained, approximated or replaced.
 
 > **proof of concept.** Not affiliated with Apple or AMD.
 
-## What you need
+## Performance
 
-- Linux, an AMD RDNA2, RDNA3 or RDNA4 GPU (gfx1030-gfx1036, gfx1100-gfx1103, gfx1150-gfx1153, gfx1200-gfx1201), Mesa RADV
-  with `VK_EXT_descriptor_buffer`. Developed and tested on an RX 7700 XT (gfx1101); RDNA2 and RDNA4 are built and validated on
-  that card (see [docs/mxu.md](docs/mxu.md#other-gpu-generations)) but not run on their own hardware yet.
-- LLVM with the AMDGPU target and lld (developed with LLVM 23.1), CMake, Ninja, glslang, Python 3.
-- **Your own MetalFX files** from macOS 27.2.1 (build 26B131): the framework's `Resources/` folder
-  (`default.metallib`, `emit_*.dat`) and the MetalFX binary extracted from the dyld shared cache. m4r ships none
-  of Apple's files and nothing derived from them; everything Apple-specific is read from your copy at build time.
+GPU time per frame on an RX 7700 XT (RDNA3, gfx1101):
+
+| | 2560x1440 output |
+|---|---|
+| Upscaler, Performance (1280x720 in) | **1.98 ms** |
+| Upscaler, Ultra Performance (856x480 in) | 1.96 ms |
+| Upscaler with line locking (`install.py --line-locking`) | 2.06 ms |
+| Frame generation, per generated frame | **1.55 ms** |
+
+At 1280x720 output (640x360 in) the upscaler takes 0.64 ms.
+
+Every optimisation is bit-identical: the output matches the first, unoptimised translation exactly. Since then the upscaler
+went from 6.7 to 1.98 ms and frame generation from 2.9 to 1.55 ms. They are measured offline with the captured game frames
+in `build/run_bbr` / `build/run_fg`; [docs/mxu.md](docs/mxu.md) and [docs/air-translation.md](docs/air-translation.md)
+describe the main techniques.
+
+RDNA2 has no matrix instructions, so its network runs on software matrix products. On the RX 7700 XT that code path takes
+4.2 ms for the 1440p upscaler. It has not been timed on RDNA2 or RDNA4 hardware yet.
 
 ## Quick start
 
