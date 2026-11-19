@@ -355,6 +355,39 @@ def rewrite_function(lines, used, params=()):
         if not dead:
             break
         out = [ln for ln in out if not (re.match(r'^\s*(%[-\w.]+) = ', ln) and re.match(r'^\s*(%[-\w.]+) = ', ln).group(1) in dead)]
+    # GEMMs of one block that multiply the same A stage it into WMMA layout once (wa.f / wa.i) and take it staged
+    if os.environ.get('M4R_SHARE_A', '1') != '0':
+        call_re = re.compile(r'^(\s*)(%[-\w.]+) = call (<8 x (?:float|i32)>) @llvm\.agx3\.wgemm\.(f|i|ib)\(((?:<8 x half>|i64) [^,]+), (.*)\)$')
+        groups, blk = {}, '__entry'
+        for idx, ln in enumerate(out):
+            mm = LABEL.match(ln.strip()) if ln and not ln.startswith(' ') else None
+            if mm:
+                blk = '%' + mm.group(1)
+                continue
+            mc = call_re.match(ln)
+            if mc:
+                groups.setdefault((blk, mc.group(4)[0], mc.group(5)), []).append(idx)
+        inserts, nst = {}, 0
+        for (blk_, kind, a), idxs in groups.items():
+            if len(idxs) < 2:
+                continue
+            nst += 1
+            name = f'%m4rA.{nst}'
+            st = '<16 x half>' if kind == 'f' else '<4 x i32>'
+            inserts.setdefault(idxs[0], []).append(f'  {name} = call {st} @llvm.agx3.wa.{kind}({a})')
+            used.add(('wa', kind))
+            for x in idxs:
+                mc = call_re.match(out[x])
+                ind, d, t, var, rest = mc.group(1), mc.group(2), mc.group(3), mc.group(4), mc.group(6)
+                newvar = {'f': 'fa', 'i': 'ia', 'ib': 'iab'}[var]
+                out[x] = f'{ind}{d} = call {t} @llvm.agx3.wgemm.{newvar}({st} {name}, {rest})'
+                used.add(('wgemm' + newvar, kind))
+        if inserts:
+            new = []
+            for idx, ln in enumerate(out):
+                new += inserts.get(idx, [])
+                new.append(ln)
+            out = new
     return out
 
 
@@ -376,6 +409,18 @@ def rewrite(text):
     decls = []
     for what, kind in sorted(used):
         t = TYPES[kind]
+        if what == 'wa':
+            decls.append('declare <16 x half> @llvm.agx3.wa.f(<8 x half>)' if kind == 'f' else 'declare <4 x i32> @llvm.agx3.wa.i(i64)')
+            continue
+        if what == 'wgemmfa':
+            decls.append(f'declare {t} @llvm.agx3.wgemm.fa(<16 x half>, <8 x half>, {t})')
+            continue
+        if what == 'wgemmia':
+            decls.append(f'declare {t} @llvm.agx3.wgemm.ia(<4 x i32>, i16, i64, i16, {t})')
+            continue
+        if what == 'wgemmiab':
+            decls.append(f'declare {t} @llvm.agx3.wgemm.iab(<4 x i32>, i16, ptr addrspace(1), i16, {t}, i32)')
+            continue
         if what == 'wgemmb':
             decls.append(f'declare {t} @llvm.agx3.wgemm.ib(i64, i16, ptr addrspace(1), i16, {t}, i32)')
         elif what == 'wgemm':

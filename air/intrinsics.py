@@ -1384,7 +1384,126 @@ def wgemm_ib(b, s):
     return b.v('phi <8 x i32> ' + ', '.join(f'[ {r}, %{lbl} ]' for r, lbl in results))
 
 
+# --- A operands staged once for several GEMMs (air/gemm_chain.py shares them) ------------------------------------------
+
+def wa_f(b, s):
+    """m4r.agx3.wa.f(<8 x half> A in Apple's layout) -> <16 x half>: row (l & 15) of A, the WMMA A operand"""
+    lane = lane_id(b)
+    base = _lds_wave_base(b, MXU_WAVE_BYTES)
+    a0, _ = _apple_coords(b, lane)
+    for half in range(2):
+        x = b.v(f'shufflevector <8 x half> %a0, <8 x half> poison, <4 x i32> <i32 {4 * half}, i32 {4 * half + 1}, i32 {4 * half + 2}, i32 {4 * half + 3}>')
+        o = b.v(f'add i32 {a0}, {128 * half}')
+        o = b.v(f'shl i32 {o}, 1')
+        b.emit(f'store <4 x half> {x}, ptr addrspace(3) {_at(b, base, o)}, align 8')
+    _wsync(b)
+    l16 = b.v(f'and i32 {lane}, 15')
+    xa = b.v(f'load <16 x half>, ptr addrspace(3) {_at(b, base, b.v(f"shl i32 {l16}, 5"))}, align 32')
+    _wsync(b)
+    return xa
+
+
+def wa_i(b, s):
+    """m4r.agx3.wa.i(i64 A in Apple's layout) -> <4 x i32>: row (l & 15) of A (16 bytes), the WMMA A operand"""
+    lane = lane_id(b)
+    base = _lds_wave_base(b, MXU_WAVE_BYTES)
+    a0, _ = _apple_coords(b, lane)
+    a2 = b.v('bitcast i64 %a0 to <2 x i32>')
+    for half in range(2):
+        x = b.v(f'extractelement <2 x i32> {a2}, i32 {half}')
+        b.emit(f'store i32 {x}, ptr addrspace(3) {_at(b, base, b.v(f"add i32 {a0}, {128 * half}"))}, align 4')
+    _wsync(b)
+    l16 = b.v(f'and i32 {lane}, 15')
+    xa = b.v(f'load <4 x i32>, ptr addrspace(3) {_at(b, base, b.v(f"shl i32 {l16}, 4"))}, align 16')
+    _wsync(b)
+    return xa
+
+
+def wgemm_fa(b, s):
+    """m4r.agx3.wgemm.fa(<16 x half> staged A, <8 x half> B, <8 x float> C in WMMA layout) -> D in WMMA layout"""
+    B, C = '%a1', '%a2'
+    lane = lane_id(b)
+    base = _lds_wave_base(b, MXU_WAVE_BYTES)
+    _, b0 = _apple_coords(b, lane)
+    for sl in range(8):
+        x = b.v(f'extractelement <8 x half> {B}, i32 {sl}')
+        o = b.v(f'add i32 {b0}, {(sl & 3) * 16 + (8 if sl >= 4 else 0)}')
+        o = b.v(f'shl i32 {o}, 1')
+        o = b.v(f'add i32 {o}, 512')
+        b.emit(f'store half {x}, ptr addrspace(3) {_at(b, base, o)}, align 2')
+    _wsync(b)
+    l16 = b.v(f'and i32 {lane}, 15')
+    xb = b.v(f'load <16 x half>, ptr addrspace(3) {_at(b, base, b.v(f"add i32 {b.v(f"shl i32 {l16}, 5")}, 512"))}, align 32')
+    _wsync(b)
+    b.decls.add(f'declare <8 x float> @{WMMA_F16}(<16 x half>, <16 x half>, <8 x float>)')
+    return b.v(f'call <8 x float> @{WMMA_F16}(<16 x half> %a0, <16 x half> {xb}, <8 x float> {C})')
+
+
+def _wmma_i8(b, xa, ta, xb, tb, C):
+    sa = b.v(f'icmp eq i16 {ta}, 75')
+    sb = b.v(f'icmp eq i16 {tb}, 75')
+    b.decls.add(f'declare <8 x i32> @{WMMA_I8}(i1 immarg, <4 x i32>, i1 immarg, <4 x i32>, <8 x i32>, i1 immarg)')
+    b.emit(f'br i1 {sa}, label %wm_a1, label %wm_a0')
+    results = []
+    for ia in (0, 1):
+        b.emit(f'wm_a{ia}:')
+        b.emit(f'br i1 {sb}, label %wm_{ia}1, label %wm_{ia}0')
+    for ia in (0, 1):
+        for ib in (0, 1):
+            b.emit(f'wm_{ia}{ib}:')
+            r = b.v(f'call <8 x i32> @{WMMA_I8}(i1 {"true" if ia else "false"}, <4 x i32> {xa}, i1 {"true" if ib else "false"}, '
+                    f'<4 x i32> {xb}, <8 x i32> {C}, i1 false)')
+            b.emit('br label %wm_end')
+            results.append((r, f'wm_{ia}{ib}'))
+    b.emit('wm_end:')
+    return b.v('phi <8 x i32> ' + ', '.join(f'[ {r}, %{lbl} ]' for r, lbl in results))
+
+
+def wgemm_ia(b, s):
+    """m4r.agx3.wgemm.ia(<4 x i32> staged A, i16 typeA, i64 B, i16 typeB, <8 x i32> C in WMMA layout) -> D in WMMA layout"""
+    lane = lane_id(b)
+    base = _lds_wave_base(b, MXU_WAVE_BYTES)
+    _, b0 = _apple_coords(b, lane)
+    bv = b.v('bitcast i64 %a2 to <8 x i8>')
+    for sl in range(8):
+        x = b.v(f'extractelement <8 x i8> {bv}, i32 {sl}')
+        b.emit(f'store i8 {x}, ptr addrspace(3) {_at(b, base, b.v(f"add i32 {b0}, {256 + (sl & 3) * 16 + (8 if sl >= 4 else 0)}"))}, align 1')
+    _wsync(b)
+    l16 = b.v(f'and i32 {lane}, 15')
+    xb = b.v(f'load <4 x i32>, ptr addrspace(3) {_at(b, base, b.v(f"add i32 {b.v(f"shl i32 {l16}, 4")}, 256"))}, align 16')
+    _wsync(b)
+    return _wmma_i8(b, '%a0', '%a1', xb, '%a3', '%a4')
+
+
+def wgemm_iab(b, s):
+    """m4r.agx3.wgemm.iab(<4 x i32> staged A, i16 typeA, ptr addrspace(1) P, i16 typeB, <8 x i32> C, i32 H): B read straight
+    from the transposed weight tile (see wgemm_ib)"""
+    lane = lane_id(b)
+
+    def bit(i, sh):
+        t = b.v(f'lshr i32 {lane}, {i}')
+        t = b.v(f'and i32 {t}, 1')
+        return b.v(f'shl i32 {t}, {sh}')
+    c0 = b.v(f'or i32 {bit(0, 2)}, {bit(3, 3)}')
+    kk = b.v(f'or i32 {bit(1, 0)}, {bit(2, 1)}')
+    kk = b.v(f'or i32 {kk}, {bit(4, 2)}')
+    off = b.v(f'add i32 {c0}, {b.v(f"shl i32 {kk}, 4")}')
+    l16 = b.v(f'and i32 {lane}, 15')
+    delta = b.v(f'sub i32 {b.v(f"shl i32 {l16}, 3")}, {off}')
+    p0 = b.v(f'getelementptr i8, ptr addrspace(1) %a2, i64 {b.v(f"sext i32 {delta} to i64")}')
+    p1 = b.v(f'getelementptr i8, ptr addrspace(1) {p0}, i64 {b.v("sext i32 %a5 to i64")}')
+    lo = b.v(f'load <2 x i32>, ptr addrspace(1) {p0}, align 8')
+    hi = b.v(f'load <2 x i32>, ptr addrspace(1) {p1}, align 8')
+    xb = b.v(f'shufflevector <2 x i32> {lo}, <2 x i32> {hi}, <4 x i32> <i32 0, i32 1, i32 2, i32 3>')
+    return _wmma_i8(b, '%a0', '%a1', xb, '%a3', '%a4')
+
+
 AGX_TABLE = [
+    (r'm4r\.agx3\.wa\.f', wa_f),
+    (r'm4r\.agx3\.wa\.i', wa_i),
+    (r'm4r\.agx3\.wgemm\.fa', wgemm_fa),
+    (r'm4r\.agx3\.wgemm\.iab', wgemm_iab),
+    (r'm4r\.agx3\.wgemm\.ia', wgemm_ia),
     (r'm4r\.agx3\.wgemm\.f', wgemm_f),
     (r'm4r\.agx3\.wgemm\.ib', wgemm_ib),
     (r'm4r\.agx3\.wgemm\.i', wgemm_i),
