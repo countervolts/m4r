@@ -29,3 +29,5 @@ __pycache__/
 /external/
 /build-*/
 .xwin-cache/
+# local notes (not part of the repo)
+/private/
