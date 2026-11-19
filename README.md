@@ -19,6 +19,8 @@ GPU time per frame on an RX 7700 XT (RDNA3, gfx1101):
 
 | | 2560x1440 output |
 |---|---|
+| Upscaler, Quality (1706x960 in) | 2.18 ms |
+| Upscaler, Balanced (1505x847 in) | 2.08 ms |
 | Upscaler, Performance (1280x720 in) | **1.98 ms** |
 | Upscaler, Ultra Performance (856x480 in) | 1.96 ms |
 | Upscaler with line locking (`install.py --line-locking`) | 2.06 ms |
