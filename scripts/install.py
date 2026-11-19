@@ -48,6 +48,7 @@ def main():
     ap.add_argument('--no-align8', dest='align8', action='store_false', help='no plans for mode sizes rounded up to a multiple of 8')
     ap.add_argument('--depth', choices=('reversed', 'forward', 'both'), default='both', help='depth conventions of the upscaler plans')
     ap.add_argument('--no-fg', action='store_true', help='no frame generation plans')
+    ap.add_argument('--line-locking', action='store_true', help="upscaler plans with MetalFX's line locking (about 0.06 ms)")
     ap.add_argument('--m4r-dll', default=os.path.join(ROOT, 'build-win', 'm4r.dll'))
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument('--force', action='store_true', help='regenerate plans that exist')
@@ -97,7 +98,8 @@ def main():
             if (rev and a.depth == 'forward') or (not rev and a.depth == 'reversed'):
                 continue
             jobs.append((f'bbr-{tag}{suffix}', [sys.executable, '-I', os.path.join(ROOT, 'tools', 'prepare_bbr.py'), *common,
-                                                '--binary', a.binary, '--reversed-depth', str(rev)], True))
+                                                '--binary', a.binary, '--reversed-depth', str(rev)]
+                         + (['--line-locking'] if a.line_locking else []), True))
         if not a.no_fg:
             jobs.append((f'fg-{tag}', [sys.executable, '-I', os.path.join(ROOT, 'tools', 'prepare_fg.py'), *common], False))
 

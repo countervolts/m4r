@@ -59,7 +59,7 @@ def _attr_renum(line, off):
     return re.sub(r'#(\d+)\b', lambda m: f'#{int(m.group(1)) + off}', line)
 
 
-def fuse(ctext, ckernel, producers):
+def fuse(ctext, ckernel, producers, force_inline=False):
     """ctext: AIR text of the consumer; producers: list of dicts with
     text, kernel, out_loc (location of the texture the producer writes), read_loc (consumer's texture location that reads it),
     grid (producer dispatch grid [x, y]), base (first new Metal location), bind_map {('texture'|'buffer', producer location):
@@ -317,7 +317,27 @@ def fuse(ctext, ckernel, producers):
     # the consumer with its new arguments and allocas
     lab = next(k for k, ln in enumerate(cbody) if re.match(r'^[-\w.$"]+:', ln))
     cbody[lab + 1:lab + 1] = entry_allocas + entry_code
-    head = re.sub(r'\((.*)\)([^)]*)\{$', lambda m: '(' + ', '.join(cparams + extra_params) + ')' + m.group(2) + '{', lines[cs])
+    # force_inline: a large fused body may stay a called function (then pointer arguments arrive in VGPRs, which the scalar
+    # fences above reject, and the call costs); alwaysinline fixes that, but it also changes when the body is inlined and with
+    # it the consumer's code generation (not bit-identical to the separate passes), so it is used only when needed
+    tail = ctail
+    if force_inline:
+        cg = re.search(r'#(\d+)', ctail).group(1)
+        ctext_attr = next(ln for ln in lines if ln.startswith(f'attributes #{cg} = '))
+        appended.append(f'attributes #999 = ' + ctext_attr.split(' = ', 1)[1].replace('{', '{ alwaysinline', 1))
+        tail = re.sub(r'#' + cg + r'\b', '#999', ctail)
+        # and the producers' helpers (WarpHistory's SacNehSampleBuffer stays a call otherwise)
+        groups = {}
+        for i, ln in enumerate(appended):
+            m = re.match(r'^(define internal .*@[-\w.$"]+\.m4rp\d+\(.*\).*)#(\d+)( \{)$', ln)
+            if m:
+                g = int(m.group(2))
+                if g not in groups:
+                    src = next(x for x in appended if x.startswith(f'attributes #{g} = '))
+                    groups[g] = g + 500
+                    appended.append(f'attributes #{g + 500} = ' + src.split(' = ', 1)[1].replace('{', '{ alwaysinline', 1))
+                appended[i] = f'{m.group(1)}#{groups[g]}{m.group(3)}'
+    head = re.sub(r'\((.*)\)([^)]*)\{$', lambda m: '(' + ', '.join(cparams + extra_params) + ')' + tail + '{', lines[cs])
     lines[cs:ce + 1] = [head] + cbody + ['}']
     text = '\n'.join(lines)
     al = re.search(r'^!' + str(arglist_id) + r' = !\{(.*)\}$', text, re.M)

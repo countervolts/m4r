@@ -124,6 +124,8 @@ int main(int argc, char** argv) {
             *static_cast<uint8_t*>(plan.buffer("reset")->map) = t == 0;
             float cpf[2] = {float(iw) / ow, float(ih) / oh};
             std::memcpy(plan.buffer("cpf")->map, cpf, 8);
+            if (Buffer* np = plan.buffer("npix")) *static_cast<uint32_t*>(np->map) = iw * ih;
+            plan.setFlag("autoexp", std::getenv("M4R_AUTOEXPOSURE") != nullptr);   // MetalFX auto exposure instead of 1.0
             plan.setParity(t);
             rt.resetTransient();
             if (std::getenv("M4R_PASS_TIME")) {

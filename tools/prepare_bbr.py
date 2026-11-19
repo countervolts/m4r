@@ -157,10 +157,20 @@ def build(args):
             if not os.path.exists(base + '.hsaco') or args.force:
                 text = source(fn)
                 if fuse:
-                    text = fuse_mod.fuse(text, fn, [dict(p, text=source(p['kernel']),
-                                                         bind_map={(a, b): c for a, b, c in p['bind_map']}) for p in fuse])
-                ir, man = m4r_air.translate(text, fn, consts, tg)
-                m4r_air.compile_ir(ir, base + '.hsaco')
+                    specs = [dict(p, text=source(p['kernel']), bind_map={(a, b): c for a, b, c in p['bind_map']}) for p in fuse]
+                    ir, man = m4r_air.translate(fuse_mod.fuse(text, fn, specs), fn, consts, tg)
+                    try:
+                        m4r_air.compile_ir(ir, base + '.hsaco')
+                        called = b's_swappc' in subprocess.run(['llvm-objdump', '-d', '--mcpu=gfx1101', base + '.hsaco'],
+                                                               capture_output=True, check=True).stdout
+                    except RuntimeError:
+                        called = True
+                    if called:   # the fused body was not inlined: force it (see air/fuse.py)
+                        ir, man = m4r_air.translate(fuse_mod.fuse(text, fn, specs, force_inline=True), fn, consts, tg)
+                        m4r_air.compile_ir(ir, base + '.hsaco')
+                else:
+                    ir, man = m4r_air.translate(text, fn, consts, tg)
+                    m4r_air.compile_ir(ir, base + '.hsaco')
                 m4r_air.write_manifest(man, base)
             kernels[name] = fn
             plan.append(f'kernel {name} k/{name}')
@@ -330,7 +340,8 @@ def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
     ow, oh, sw, sh, tw, th, fused = sizes
     iw, ih = args.input
     rev = 1 if args.reversed_depth else 0
-    fc = {'#13': 1, '#30': 1, '#31': 1, '#32': 1, '#33': 1, '#34': fused, '#14': 0, '#17': 0, '#16': 0, '#19': 0,
+    lines = bool(getattr(args, 'line_locking', False))   # MetalFX's line locking (off unless an app compat flag enables it)
+    fc = {'#13': 1, '#30': 1, '#31': 1, '#32': 1, '#33': 1, '#34': fused, '#14': 0, '#17': 1 if lines else 0, '#16': 0, '#19': 0,
           '#25': 0, '#26': 0, '#22': 0, '#9': 0.0328}
     pre = []
 
@@ -350,7 +361,7 @@ def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
     one = np.array([1.0], np.float16)
     buf_init('exp0', one); buf_init('exp1', one)
     for n, sz in (('splatbuf', iw * ih * 4), ('hinv', 16), ('lumabuf', 8192), ('params', 144), ('preexp', 16),
-                  ('reset', 16), ('cpf', 16)):
+                  ('reset', 16), ('cpf', 16), ('npix', 16)):
         plan.insert(0, f'buffer {n} {sz}')
     hp = 32 * ((2 * ow + 63) // 64)
     for n in ('hist_t0', 'hist_t1', 'hist_tmp'):
@@ -362,9 +373,17 @@ def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
         pre.append(f'pass {k} {mode} {grid[0]} {grid[1]} {grid[2]}')
         pre.extend('  ' + b for b in binds)
 
-    # encodePre: exposure from the game's exposure texture (1.0 when the game has none)
+    # encodePre: exposure. Without an exposure texture (DLSS AutoExposure) MetalFX's auto exposure: luma_log_sum (32 x 64 groups
+    # of 8 x 4, one log-luma partial sum per group into lumabuf) and luma_log_sum_to_exposure (one group of 1024: average,
+    # key value, EMA with EMA_factor, snap and history reset on a 10x change); with one, exposure_texture_to_buffer. The runtime
+    # picks the path per frame (flag autoexp); the auto passes come first so that what later passes inherit is unchanged.
+    d('luma_log_sum', 'threads', (256, 256, 1),
+      ['only autoexp', 'tex 0 color', 'buf 0 lumabuf', 'buf 1 params', 'buf 2 preexp'], tg=(8, 4, 1))
+    d('luma_log_sum_to_exposure', 'threads', (1024, 1, 1),
+      ['only autoexp', 'buf 0 lumabuf', 'buf 1 npix', 'buf 2 exp0|exp1', 'buf 3 exp1|exp0', 'buf 4 hinv', 'buf 5 reset'],
+      tg=(1024, 1, 1))
     d('exposure_texture_to_buffer', 'threads', (1, 1, 1),
-      ['tex 0 exposure', 'buf 0 exp0|exp1', 'buf 1 exp1|exp0', 'buf 2 hinv', 'buf 3 reset'], tg=(32, 1, 1))
+      ['only !autoexp', 'tex 0 exposure', 'buf 0 exp0|exp1', 'buf 1 exp1|exp0', 'buf 2 hinv', 'buf 3 reset'], tg=(32, 1, 1))
     d('bbrnet_build_tensors_low_resolution', 'threads', (iw + 2, ih + 2, 1),
       ['tex 0 color', 'tex 1 depth', 'tex 2 motion', 'tex 3 crr', 'tex 4 flowd',
        'bytes 0 ' + struct.pack('<f', 1.0 if rev else -1.0).hex(), 'buf 1 params', 'buf 2 preexp',
@@ -417,6 +436,9 @@ def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
     post = ['buf 0 params', 'tex 0 crr', 'tex 1 fah', 'tex 6 hw0|hw1', 'tex 3 output', 'tex 4 hist1|hist0', 'tex 8 hw1|hw0',
             'tex 5 diff', 'tex 7 flowd', 'tex 10 clampt', 'tex 11 temporal_tex', 'buf 1 cpf', 'buf 2 hinv',
             'buf 3 preexp', 'buf 4 exp0|exp1', 'buf 6 spatial_out', 'buf 10 hist_t1']
+    if lines:
+        tex('lock0', 'R8_UNORM', ow, oh); tex('lock1', 'R8_UNORM', ow, oh)
+        post += ['tex 13 lock1|lock0', 'tex 14 lock0|lock1']
     if not fused:
         post += ['tex 9 rnn_tex', 'buf 5 temporal_out']
     ag_grid = ((ow + 15) & ~15, (oh + 15) & ~15, 1)
@@ -491,4 +513,7 @@ if __name__ == '__main__':
     ap.add_argument('--force', action='store_true')
     ap.add_argument('--input', required=True, type=lambda s: [int(x) for x in s.split('x')], help='max input size')
     ap.add_argument('--reversed-depth', type=int, default=1)
+    ap.add_argument('--line-locking', action='store_true',
+                    help="MetalFX's line locking (thin-line stability; MetalFX leaves it off unless an app compatibility flag "
+                         'sets it): two lock-counter textures, about 0.06 ms at 2560x1440')
     build(ap.parse_args())

@@ -61,7 +61,16 @@ Apple's translated kernels and weights and must not be shared.
 **Upscaler.** At `EvaluateFeature`, OptiScaler gives the feature the game's D3D12 resources. They are turned into
 `VkImage`s with `ID3D12DXVKInteropDevice1::GetVulkanResourceInfo1` and the layout for their D3D12 state, m4r's 27 passes
 are recorded into the game's own command list through `BeginVkCommandBufferInterop`, and nothing is waited for. The NGX
-jitter is passed as it is; m4r negates it internally (MetalFX's convention).
+jitter is passed as it is; m4r negates it internally (MetalFX's convention). m4r expects the sample offset, i.e. the frame
+was rendered at pixel + 0.5 + jitter. `[MetalFX] FlipJitter` is for games that report the opposite sign; whether one does can
+be measured instead of judged by eye: in static pixels of two consecutive captured inputs (`M4R_DUMP_UP`) the content shifts by
+the jitter difference (a least-squares gradient fit gives the shift). Ghost of Tsushima measured -1x the passed difference with
+FlipJitter=true in every frame, so it needs the default (false); with the wrong sign the history is merged at mirrored
+sub-pixel positions (softer each frame, shimmering).
+
+Exposure: when the game gives no exposure texture (DLSS AutoExposure, as Ghost of Tsushima), m4r runs MetalFX's own auto
+exposure (`luma_log_sum`, `luma_log_sum_to_exposure`, as MetalFX does for a descriptor with auto exposure enabled) instead of a
+fixed 1.0; `M4R_NO_AUTOEXPOSURE=1` restores 1.0.
 
 **Frame generation.** OptiScaler's OptiFG (`FGInput=upscaler`) keeps a copy of the frame's depth and motion vectors.
 `MetalFXFG_Dx12` wraps the game's swapchain (the same pass-through wrapper the reprojection output uses). At present:

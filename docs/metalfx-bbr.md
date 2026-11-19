@@ -12,7 +12,10 @@ here; `tools/` extracts them from the user's own binary.
 
 1. `encodePre` (debug group `MetalFX_Temporal_BBR_PreProcessing`)
    - auto exposure: `luma_log_sum` (grid {32,64}x tg {8,4}, threadgroups) → `luma_log_sum_to_exposure`
-     ({1} x {1024}); otherwise `exposure_texture_to_buffer` with the game's exposure texture.
+     ({1} x {1024}); otherwise `exposure_texture_to_buffer` with the game's exposure texture. Both are in m4r's plans
+     (`only autoexp` / `only !autoexp`, chosen per frame). `_autoExposureEnabled` comes from the descriptor or
+     `MTLFX_FORCE_AUTO_EXPOSURE`; `_linelockingEnabled` is cleared in `initWithDevice:descriptor:` and set only by the app
+     compatibility flag `MFX_COMPAT_ENABLE_LINE_LOCKING` (m4r: `install.py --line-locking`, lock counters lock0|lock1).
      Exposure lives in two 2-byte buffers used ping-pong (index flips each frame), initialised to half 1.0.
    - `bbrnet_build_tensors_low_resolution`: textures 0 color, 1 depth, 2 motion, 3 → +0x1e8 (RGBA16F, input
      size), 4 → +0x1e0 (RG16F, input size); bytes(0) = ±1.0 (reversed depth); params (transient buffer 1);

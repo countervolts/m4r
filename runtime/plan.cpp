@@ -103,6 +103,13 @@ bool Plan::load(const std::string& dir) {
             VkDeviceSize off;
             ls >> name >> base >> off;
             views_[name] = {base, off};
+        } else if (w == "only") {      // only FLAG / only !FLAG: the pass runs only while the flag is set / clear
+            if (!cur) return fail("only outside a pass");
+            std::string fl;
+            ls >> fl;
+            cur->onlyNot = !fl.empty() && fl[0] == '!';
+            cur->only = cur->onlyNot ? fl.substr(1) : fl;
+            if (cur->only.empty()) return fail("only without a flag");
         } else if (w == "buf" || w == "tex" || w == "bytes" || w == "tgmem") {
             if (!cur) return fail("binding outside a pass");
             Bind b;
@@ -155,6 +162,7 @@ bool Plan::record(VkCommandBuffer cb, size_t first, size_t count) {
     std::vector<std::vector<std::pair<std::string, bool>>> uses(last - first);   // resource, written
     for (size_t pi = first; pi < last; ++pi) {
         Pass& p = passes_[pi];
+        if (!active(p)) continue;   // switched off: no uses, recorded below as nothing
         for (auto& bb : p.binds) {
             if (bb.kind != 'b' && bb.kind != 't') continue;
             std::string nm = pick(bb.name);
@@ -187,6 +195,7 @@ bool Plan::record(VkCommandBuffer cb, size_t first, size_t count) {
     for (size_t oi : order) {
         const size_t pi = first + oi;
         Pass& p = passes_[pi];
+        if (!active(p)) continue;
         enc.setKernel(p.kernel);
         enc.setBarrier(level[oi] != prevLevel);
         prevLevel = level[oi];

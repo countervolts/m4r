@@ -328,6 +328,10 @@ M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_de
     p.bindBuffer("preexp", c->rt.transient(&pre, 4));
     p.bindBuffer("reset", c->rt.transient(&reset, 1));
     p.bindBuffer("cpf", c->rt.transient(cpf, 8));
+    // no exposure texture (the game asked for DLSS AutoExposure): MetalFX's auto exposure over the content area
+    const uint32_t npix = cw * ch;
+    p.bindBuffer("npix", c->rt.transient(&npix, 4));
+    p.setFlag("autoexp", d->exposure.image == VK_NULL_HANDLE && !std::getenv("M4R_NO_AUTOEXPOSURE"));
     p.setParity(int(frame & 1));
     LayoutGuard g{cb};
     for (const m4r_image* im : {&d->color, &d->depth, &d->motion, &d->exposure, &d->output}) g.add(*im);

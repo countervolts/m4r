@@ -43,7 +43,8 @@ BUILTINS = {
 def run(cmd, **kw):
     r = subprocess.run(cmd, capture_output=True, **kw)
     if r.returncode:
-        raise RuntimeError(f'{cmd[0]} failed:\n' + r.stderr.decode(errors='replace')[-4000:])
+        err = r.stderr.decode(errors='replace')   # the message comes first, a crash's stack trace after it
+        raise RuntimeError(f'{cmd[0]} failed:\n' + (err if len(err) <= 4000 else err[:2000] + '\n...\n' + err[-2000:]))
     return r.stdout
 
 
