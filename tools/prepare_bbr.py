@@ -247,6 +247,7 @@ def build(args):
     shader = os.path.join(os.path.dirname(HERE), 'shaders', 'sacneh.comp')
     subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', shader, '-o', os.path.join(out, 'sacneh.spv')],
                    check=True, capture_output=True)
+    transpose_weight_tiles(out, plan)
     decl = [l for l in plan if l.split(' ', 1)[0] in ('buffer', 'texture', 'kernel', 'glsl')]
     rest = [l for l in plan if l.split(' ', 1)[0] not in ('buffer', 'texture', 'kernel', 'glsl')]
     open(os.path.join(out, 'plan.txt'), 'w').write('\n'.join(decl + rest) + '\n')
@@ -358,6 +359,33 @@ def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
     pre += ['  buf 0 hist_t1', '  buf 1 hist_t0', '  buf 2 sac_x', '  buf 3 sac_y'] + [
         f'  bytes {8 + j} ' + struct.pack('<I', v).hex() for j, v in enumerate((ow, oh, hp, oh * hp, 2))]
     plan.extend(pre)
+
+
+def transpose_weight_tiles(out, plan):
+    """Weight blobs that a kernel reads straight into WMMA layout (manifest transpose_b8, air/gemm_chain.py find_direct_b) are
+    stored with each 128-byte half-tile transposed ([8 k][16 col] -> [16 col][8 k]). A blob bound anywhere else is refused."""
+    passes, cur = [], None
+    for line in plan:
+        if line.startswith('pass '):
+            cur = [line.split()[1], {}]
+            passes.append(cur)
+        elif cur and line.startswith('  buf '):
+            _, loc, name = line.split()[:3]
+            cur[1][int(loc)] = name
+    want, other = set(), set()
+    for kname, binds in passes:
+        mf = os.path.join(out, 'k', kname + '.json')
+        locs = set(json.load(open(mf)).get('transpose_b8', [])) if os.path.exists(mf) else set()
+        for loc, name in binds.items():
+            (want if loc in locs else other).add(name)
+    for name in sorted(want):
+        if name in other or '|' in name:
+            raise SystemExit(f'weight blob {name} is read both as WMMA tiles and in another way')
+        path = os.path.join(out, 'blobs', name + '.bin')
+        a = np.fromfile(path, np.uint8)
+        if a.size % 128:
+            raise SystemExit(f'weight blob {name}: {a.size} bytes is not a whole number of 8 x 16 half-tiles')
+        a.reshape(-1, 8, 16).transpose(0, 2, 1).copy().tofile(path)
 
 
 def sbbr_input_scale(m):

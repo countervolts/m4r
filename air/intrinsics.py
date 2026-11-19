@@ -1328,8 +1328,65 @@ def wgemm_i(b, s):
     return b.v('phi <8 x i32> ' + ', '.join(f'[ {r}, %{lbl} ]' for r, lbl in results))
 
 
+def wgemm_ib(b, s):
+    """m4r.agx3.wgemm.ib(i64 A, i16 typeA, ptr addrspace(1) P, i16 typeB, <8 x i32> C in WMMA layout, i32 H): B is the weight tile
+    Apple's kernel reads as 4 bytes at P (rows k 0-7 of a [k][col] half-tile, lane offset c0 + 16 kk) and 4 bytes at P + H
+    (rows 8-15). The plan stores each 128-byte half transposed ([col][8 k]), so the lane's WMMA column (l & 15) is 8 bytes at
+    P - (c0 + 16 kk) + 8 (l & 15) and 8 bytes H further."""
+    A, P, C, H = '%a0', '%a2', '%a4', '%a5'
+    lane = lane_id(b)
+    base = _lds_wave_base(b, MXU_WAVE_BYTES)
+    a0, _ = _apple_coords(b, lane)
+    a2 = b.v(f'bitcast i64 {A} to <2 x i32>')
+    for half in range(2):
+        x = b.v(f'extractelement <2 x i32> {a2}, i32 {half}')
+        b.emit(f'store i32 {x}, ptr addrspace(3) {_at(b, base, b.v(f"add i32 {a0}, {128 * half}"))}, align 4')
+    # Apple's lane offset in the half-tile: c0 = 4 lane[0] + 8 lane[3], kk = lane[1] | lane[2] << 1 | lane[4] << 2
+    def bit(i, sh):
+        t = b.v(f'lshr i32 {lane}, {i}')
+        t = b.v(f'and i32 {t}, 1')
+        return b.v(f'shl i32 {t}, {sh}')
+    c0 = b.v(f'or i32 {bit(0, 2)}, {bit(3, 3)}')
+    kk = b.v(f'or i32 {bit(1, 0)}, {bit(2, 1)}')
+    kk = b.v(f'or i32 {kk}, {bit(4, 2)}')
+    k16 = b.v(f'shl i32 {kk}, 4')
+    off = b.v(f'add i32 {c0}, {k16}')
+    l16 = b.v(f'and i32 {lane}, 15')
+    col = b.v(f'shl i32 {l16}, 3')
+    delta = b.v(f'sub i32 {col}, {off}')
+    d64 = b.v(f'sext i32 {delta} to i64')
+    p0 = b.v(f'getelementptr i8, ptr addrspace(1) {P}, i64 {d64}')
+    h64 = b.v(f'sext i32 {H} to i64')
+    p1 = b.v(f'getelementptr i8, ptr addrspace(1) {p0}, i64 {h64}')
+    lo = b.v(f'load <2 x i32>, ptr addrspace(1) {p0}, align 8')
+    hi = b.v(f'load <2 x i32>, ptr addrspace(1) {p1}, align 8')
+    xb = b.v(f'shufflevector <2 x i32> {lo}, <2 x i32> {hi}, <4 x i32> <i32 0, i32 1, i32 2, i32 3>')
+    _wsync(b)
+    row_off = b.v(f'shl i32 {l16}, 4')
+    xa = b.v(f'load <4 x i32>, ptr addrspace(3) {_at(b, base, row_off)}, align 16')
+    _wsync(b)
+    sa = b.v('icmp eq i16 %a1, 75')
+    sb = b.v('icmp eq i16 %a3, 75')
+    b.decls.add(f'declare <8 x i32> @{WMMA_I8}(i1 immarg, <4 x i32>, i1 immarg, <4 x i32>, <8 x i32>, i1 immarg)')
+    b.emit(f'br i1 {sa}, label %wm_a1, label %wm_a0')
+    results = []
+    for ia in (0, 1):
+        b.emit(f'wm_a{ia}:')
+        b.emit(f'br i1 {sb}, label %wm_{ia}1, label %wm_{ia}0')
+    for ia in (0, 1):
+        for ib in (0, 1):
+            b.emit(f'wm_{ia}{ib}:')
+            r = b.v(f'call <8 x i32> @{WMMA_I8}(i1 {"true" if ia else "false"}, <4 x i32> {xa}, i1 {"true" if ib else "false"}, '
+                    f'<4 x i32> {xb}, <8 x i32> {C}, i1 false)')
+            b.emit('br label %wm_end')
+            results.append((r, f'wm_{ia}{ib}'))
+    b.emit('wm_end:')
+    return b.v('phi <8 x i32> ' + ', '.join(f'[ {r}, %{lbl} ]' for r, lbl in results))
+
+
 AGX_TABLE = [
     (r'm4r\.agx3\.wgemm\.f', wgemm_f),
+    (r'm4r\.agx3\.wgemm\.ib', wgemm_ib),
     (r'm4r\.agx3\.wgemm\.i', wgemm_i),
     (r'm4r\.agx3\.a2w\.', acc_convert(True)),
     (r'm4r\.agx3\.w2a\.', acc_convert(False)),

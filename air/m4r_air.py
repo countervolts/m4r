@@ -403,9 +403,13 @@ def translate(text, kernel, constants, tg, wave=32, widen=False):
     if widen or chain:
         text = run(['opt', '-O3', f'-mtriple={TRIPLE}', '-mcpu=gfx1101', f'-mattr=+wavefrontsize{wave},-real-true16', '-S', '-',
                     '-o', '-'], input=text.encode()).decode()
+    permuted = []
     if chain:
         import gemm_chain
+        # weight tiles read straight in WMMA layout only where Apple's kernel says its weights are block-major 16 x 16 tiles
+        gemm_chain.DIRECT_B = str(constants.get('blockMajorWeights', 0)) in ('1', 'True', 'true')
         text = gemm_chain.rewrite(text)
+        permuted = list(gemm_chain.PERMUTED)
     if widen:
         import widen as widen_mod
         text = widen_mod.widen(text)
@@ -502,6 +506,8 @@ def translate(text, kernel, constants, tg, wave=32, widen=False):
                 call_args.append(('ptr addrspace(1)', f'%krt{k}' if k else '%krt'))
     grid_off = slot * 8
     manifest['grid_offset'] = grid_off
+    if permuted:   # weight buffers the plan must store as transposed 16 x 16 byte tiles (air/gemm_chain.py find_direct_b)
+        manifest['transpose_b8'] = sorted(a['location'] for a in manifest['args'] if a.get('param') in permuted)
     kparams += ['i32 %gx', 'i32 %gy', 'i32 %gz']
     lds_off = grid_off + 12
     for j, i in enumerate(lds_args):

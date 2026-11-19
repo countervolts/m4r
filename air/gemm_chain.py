@@ -15,6 +15,7 @@ instruction with C as its accumulator (air/intrinsics.py wgemm_f / wgemm_i), so 
 
 Runs on optimised IR (inlined, scalarised) before the AIR / AGX intrinsics get bodies (m4r_air.translate, step 7b).
 """
+import os
 import re
 
 FGEMM = re.compile(r'^(\s*)(%[-\w.]+) = (?:tail )?call (?:fast |nnan |ninf |nsz |arcp |contract |afn |reassoc )*<8 x float> '
@@ -54,7 +55,123 @@ def wname(v):
     return '%m4rw.' + v[1:]
 
 
-def rewrite_function(lines, used):
+DIRECT_B = False   # set by m4r_air.translate: the kernel's weights are block-major tiles (function constant blockMajorWeights)
+PERMUTED = []   # parameters of the last rewritten kernel whose weight tiles are read in WMMA order (set by rewrite)
+
+
+def find_direct_b(lines, params):
+    """Integer GEMMs whose B operand is a weight tile read as two 4-byte loads at P and P + 128 from a kernel buffer argument
+    that nothing else reads: {gemm result: P}, and the argument indices. Apple stores those tiles [k][col] (16 x 16 bytes; a
+    lane's offset is c0 + 16 kk); rows 0-7 at P, rows 8-15 a constant distance further (128 or more bytes). The plan generator
+    transposes each 128-byte half ([8 k][16 col] -> [16 col][8 k]), so a lane loads its WMMA column as two 8-byte loads."""
+    defs = {}
+    for ln in lines:
+        m = re.match(r'^\s*(%[-\w.]+) = (.*)$', ln)
+        if m:
+            defs[m.group(1)] = m.group(2)
+
+    def root(v, seen=None):
+        """the kernel argument a pointer is derived from through geps and pointer phis, or None"""
+        seen = set() if seen is None else seen
+        while v in defs:
+            if v in seen:
+                return 'cycle'
+            seen.add(v)
+            d = defs[v]
+            m = re.match(r'getelementptr (?:inbounds )?(?:nuw )?(?:nusw )?i8, ptr addrspace\(1\) (%[-\w.]+), ', d)
+            if m:
+                v = m.group(1)
+                continue
+            if d.startswith('phi ptr addrspace(1) '):
+                rs = {root(x, seen) for x in re.findall(r'\[\s*(%[-\w.]+)\s*,', d)} - {'cycle'}
+                return rs.pop() if len(rs) == 1 and None not in rs else None
+            return None
+        return v if v in params else None
+    LOAD4 = re.compile(r'(?:load <4 x i8>, ptr addrspace\(1\) (%[-\w.]+), align \d+|tail call <4 x i8> @llvm\.agx3\.load\.with\.emask\.global\.v4i8\('
+                       r'ptr addrspace\(1\) (?:noundef )?(?:nonnull )?(%[-\w.]+), i16 (?:noundef )?(?:zeroext )?15, i16 (?:noundef )?(?:zeroext )?15,)')
+
+    def load_ptr(v):
+        m = LOAD4.match(defs.get(v, ''))
+        return (m.group(1) or m.group(2)) if m else None
+
+    cands = {}
+    loads = set()
+    for ln in lines:
+        m = IGEMM.match(ln)
+        if not m:
+            continue
+        args = split_top(m.group(3))
+        _, bv = arg_value(args[6])
+        mb = re.match(r'bitcast <8 x i8> (%[-\w.]+) to i64$', defs.get(bv, ''))
+        ms = mb and re.match(r'shufflevector <4 x i8> (%[-\w.]+), <4 x i8> (%[-\w.]+), <8 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7>$',
+                             defs.get(mb.group(1), ''))
+        if not ms:
+            continue
+        l1, l2 = ms.group(1), ms.group(2)
+        p, q = load_ptr(l1), load_ptr(l2)
+        if not (p and q):
+            continue
+
+        def rel(q, p):   # q = p + constant through constant i8 geps -> the constant, else None
+            off = 0
+            while q != p:
+                mm = re.match(r'getelementptr (?:inbounds )?(?:nuw )?(?:nusw )?i8, ptr addrspace\(1\) (%[-\w.]+), i64 (-?\d+)$', defs.get(q, ''))
+                if not mm:
+                    return None
+                q, off = mm.group(1), off + int(mm.group(2))
+            return off
+
+        def top(v):      # outermost gep: (base, variable index, constant)
+            mm = re.match(r'getelementptr (?:inbounds )?(?:nuw )?(?:nusw )?i8, ptr addrspace\(1\) (%[-\w.]+), i64 (\S+)$', defs.get(v, ''))
+            if not mm:
+                return None
+            idx = mm.group(2)
+            if re.fullmatch(r'-?\d+', idx):
+                return mm.group(1), None, int(idx)
+            ma = re.match(r'(?:add|or)(?: disjoint)?(?: nuw)?(?: nsw)? i64 (%[-\w.]+), (-?\d+)$', defs.get(idx, ''))
+            return (mm.group(1), ma.group(1), int(ma.group(2))) if ma else (mm.group(1), idx, 0)
+        half = rel(q, p)
+        if half is None:
+            tp, tq = top(p), top(q)
+            half = tq[2] - tp[2] if tp and tq and tp[0] == tq[0] and tp[1] == tq[1] else None
+        if half is None or half < 128 or half % 128:
+            continue
+        r = root(p)
+        if r is None or r == 'cycle':
+            continue
+        cands[m.group(2)] = (p, r, half)
+        loads |= {l1, l2}
+    # every use of a pointer derived from such an argument must be a gep or one of those loads
+    ok_roots = set(r for _, r, _ in cands.values())
+    derived = {r: {r} for r in ok_roots}
+    changed = True
+    while changed:
+        changed = False
+        for v, d in defs.items():
+            m = re.match(r'getelementptr [^,]*, ptr addrspace\(1\) (%[-\w.]+), ', d)
+            srcs = [m.group(1)] if m else (re.findall(r'\[\s*(%[-\w.]+)\s*,', d) if d.startswith('phi ptr addrspace(1) ') else [])
+            for r in ok_roots:
+                if any(x in derived[r] for x in srcs) and v not in derived[r]:
+                    derived[r].add(v); changed = True
+    for r in list(ok_roots):
+        for ln in lines:
+            m = re.match(r'^\s*(%[-\w.]+) = (.*)$', ln)
+            body = m.group(2) if m else ln
+            name = m.group(1) if m else None
+            for v in derived[r]:
+                if re.search(re.escape(v) + r'(?![-\w.])', body):
+                    if name in derived[r] and (body.startswith('getelementptr') or body.startswith('phi ptr addrspace(1)')):
+                        continue
+                    if name in loads:
+                        continue
+                    ok_roots.discard(r)
+                    break
+            if r not in ok_roots:
+                break
+    return {g: (p, h) for g, (p, r, h) in cands.items() if r in ok_roots}, sorted(params.index(r) for r in ok_roots)
+
+
+def rewrite_function(lines, used, params=()):
     gemms = {}     # result -> kind
     phis = {}      # result -> (kind, [(value, block)])
     for ln in lines:
@@ -69,6 +186,8 @@ def rewrite_function(lines, used):
             phis[m.group(2)] = (kind, inc)
     if not gemms:
         return lines
+    direct, perm = find_direct_b(lines, list(params)) if DIRECT_B and os.environ.get('M4R_DIRECT_B', '1') != '0' else ({}, [])
+    PERMUTED.extend(perm)
     # phis rebuilt in WMMA layout: incoming values that are GEMM results, zero or other rebuilt phis are used as they are; any
     # other incoming value is converted once at the end of its predecessor block (typically the value entering a loop).
     # A phi is rebuilt when at least one incoming value is a GEMM result or a rebuilt phi (greatest fixpoint).
@@ -121,11 +240,17 @@ def rewrite_function(lines, used):
                 (_, a), (_, b), (_, c) = arg_value(args[0]), arg_value(args[2]), arg_value(args[4])
                 cw = wval(c, kind, ind, pre)
                 call = f'call {t} @llvm.agx3.wgemm.f(<8 x half> {a}, <8 x half> {b}, {t} {cw})'
+                used.add(('wgemm', kind))
             else:
                 (_, a), (_, ta), (_, b), (_, tb), (_, c) = (arg_value(args[i]) for i in (4, 5, 6, 7, 8))
                 cw = wval(c, kind, ind, pre)
-                call = f'call {t} @llvm.agx3.wgemm.i(i64 {a}, i16 {ta}, i64 {b}, i16 {tb}, {t} {cw})'
-            used.add(('wgemm', kind)); used.add(('w2a', kind))
+                if d in direct:
+                    call = f'call {t} @llvm.agx3.wgemm.ib(i64 {a}, i16 {ta}, ptr addrspace(1) {direct[d][0]}, i16 {tb}, {t} {cw}, i32 {direct[d][1]})'
+                    used.add(('wgemmb', kind))
+                else:
+                    call = f'call {t} @llvm.agx3.wgemm.i(i64 {a}, i16 {ta}, i64 {b}, i16 {tb}, {t} {cw})'
+                    used.add(('wgemm', kind))
+            used.add(('w2a', kind))
             out += pre
             out.append(f'{ind}{wname(d)} = {call}')
             out.append(f'{ind}{d} = call {t} @llvm.agx3.w2a.{SUFFIX[kind]}({t} {wname(d)})')
@@ -236,19 +361,24 @@ def rewrite_function(lines, used):
 def rewrite(text):
     lines = text.split('\n')
     out, used, i = [], set(), 0
+    PERMUTED.clear()
     while i < len(lines):
         if lines[i].startswith('define '):
             j = i
             while lines[j] != '}':
                 j += 1
-            out += [lines[i]] + rewrite_function(lines[i + 1:j], used) + [lines[j]]
+            mp = re.match(r'define [^(]*\((.*)\)[^)]*\{$', lines[i])
+            params = [split_top(mp.group(1))[k].split()[-1] for k in range(len(split_top(mp.group(1))))] if mp and mp.group(1) else []
+            out += [lines[i]] + rewrite_function(lines[i + 1:j], used, params) + [lines[j]]
             i = j + 1
         else:
             out.append(lines[i]); i += 1
     decls = []
     for what, kind in sorted(used):
         t = TYPES[kind]
-        if what == 'wgemm':
+        if what == 'wgemmb':
+            decls.append(f'declare {t} @llvm.agx3.wgemm.ib(i64, i16, ptr addrspace(1), i16, {t}, i32)')
+        elif what == 'wgemm':
             decls.append(f'declare {t} @llvm.agx3.wgemm.f(<8 x half>, <8 x half>, {t})' if kind == 'f' else
                          f'declare {t} @llvm.agx3.wgemm.i(i64, i16, i64, i16, {t})')
         else:
