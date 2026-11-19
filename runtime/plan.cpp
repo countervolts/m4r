@@ -1,6 +1,9 @@
 // m4r: pass plan executor (see plan.h).
 // SPDX-License-Identifier: GPL-3.0-only
 #include "plan.h"
+#include <set>
+#include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 
@@ -144,9 +147,49 @@ bool Plan::record(VkCommandBuffer cb, size_t first, size_t count) {
     }
     uninitialised_.clear();
     Encoder enc(rt_, cb);
-    for (size_t pi = first; pi < passes_.size() && pi - first < count; ++pi) {
+    // Passes run in dependency levels: a pass's level is one more than the highest level of an earlier pass whose output it
+    // reads or writes, or whose input it overwrites; within a level passes are independent and run without barriers between
+    // them (one barrier per level). Every dependency is kept, so the results equal the plan's order. Kernels without a
+    // manifest (GLSL passes) count as writing everything they bind. M4R_ALL_BARRIERS=1: plan order, a barrier before each pass.
+    const size_t last = std::min(passes_.size(), first + count);
+    std::vector<std::vector<std::pair<std::string, bool>>> uses(last - first);   // resource, written
+    for (size_t pi = first; pi < last; ++pi) {
+        Pass& p = passes_[pi];
+        for (auto& bb : p.binds) {
+            if (bb.kind != 'b' && bb.kind != 't') continue;
+            std::string nm = pick(bb.name);
+            if (bb.kind == 'b') { auto v = views_.find(nm); if (v != views_.end()) nm = v->second.first; }
+            bool known = false, wr = true;
+            for (const auto& a : p.kernel->args)
+                if (a.location == int(bb.index) && ((bb.kind == 'b' && a.kind == Arg::Buffer) || (bb.kind == 't' && a.kind == Arg::Texture))) {
+                    known = true; wr = !a.readonly;
+                }
+            if (!known && !p.kernel->args.empty()) continue;   // bound but not an argument of this kernel
+            uses[pi - first].emplace_back((bb.kind == 'b' ? "b:" : "t:") + nm, wr);
+        }
+    }
+    const bool serial = std::getenv("M4R_ALL_BARRIERS") != nullptr;
+    std::vector<int> level(last - first, 0);
+    for (size_t i = 0; i < level.size(); ++i) {
+        if (serial) { level[i] = int(i); continue; }
+        for (size_t j = 0; j < i; ++j) {
+            bool dep = false;
+            for (auto& [a, aw] : uses[i])
+                for (auto& [b, bw] : uses[j])
+                    if (a == b && (aw || bw)) dep = true;
+            if (dep) level[i] = std::max(level[i], level[j] + 1);
+        }
+    }
+    std::vector<size_t> order(level.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return level[a] < level[b]; });
+    int prevLevel = -1;
+    for (size_t oi : order) {
+        const size_t pi = first + oi;
         Pass& p = passes_[pi];
         enc.setKernel(p.kernel);
+        enc.setBarrier(level[oi] != prevLevel);
+        prevLevel = level[oi];
         for (auto& bb : p.binds) {
             Bind b = bb;
             if (b.kind != 'y') b.name = pick(b.name);

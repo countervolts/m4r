@@ -679,7 +679,8 @@ def write_manifest(man, base):
              f"kernarg {man['kernarg_size']}", f"grid {man['grid_offset']}"]
     for a in man['args']:
         loc = a.get('location') if a.get('location') is not None else -1
-        lines.append(f"arg {a['kind']} {loc} {a['offset']} {a.get('name') or '-'}")
+        acc = 'r' if a.get('access') in ('read', 'sample') else 'w'   # the runtime skips barriers between passes that only read
+        lines.append(f"arg {a['kind']} {loc} {a['offset']} {a.get('name') or '-'} {acc}")
     for smp in man['samplers']:
         lines.append(f"sampler {smp['global']} {smp['state'][0]} {smp['state'][1]}")
     open(base + '.args', 'w').write('\n'.join(lines) + '\n')

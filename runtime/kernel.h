@@ -15,6 +15,7 @@ struct Arg {
     int location = -1;       // Metal [[buffer(n)]] / [[texture(n)]] index
     uint32_t offset = 0;     // byte offset in the kernel-argument block
     std::string name;
+    bool readonly = false;   // the kernel only reads it (manifest access read / sample)
 };
 
 struct Kernel {
@@ -78,6 +79,7 @@ public:
     }
     void setTexture(const Texture* t, uint32_t index) { textures_[index] = t ? t->record : 0; }
     void setThreadgroupMemory(uint32_t bytes, uint32_t index) { lds_[index] = bytes; }
+    void setBarrier(bool b) { barrier_ = b; }   // memory barrier before the next dispatch (default: always)
     bool dispatchThreads(uint32_t x, uint32_t y = 1, uint32_t z = 1);       // Metal dispatchThreads (grid in threads)
     bool dispatchThreadgroups(uint32_t x, uint32_t y = 1, uint32_t z = 1);  // Metal dispatchThreadgroups
     std::string error;
@@ -90,6 +92,7 @@ private:
     std::map<uint32_t, VkDeviceAddress> buffers_, textures_;
     std::map<uint32_t, uint32_t> lds_;
     std::map<uint32_t, std::vector<uint8_t>> raw_;
+    bool barrier_ = true;
 };
 
 } // namespace m4r

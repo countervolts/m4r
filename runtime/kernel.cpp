@@ -97,7 +97,9 @@ Kernel* Runtime::load(const std::string& base, uint32_t extraLds) {
         else if (w == "arg") {
             std::string kind;
             Arg a;
-            ls >> kind >> a.location >> a.offset >> a.name;
+            std::string acc;
+            ls >> kind >> a.location >> a.offset >> a.name >> acc;
+            a.readonly = acc == "r";
             a.kind = kind == "buffer" ? Arg::Buffer : kind == "texture" ? Arg::Texture : kind == "sampler" ? Arg::Sampler : Arg::Threadgroup;
             k->args.push_back(a);
         } else if (w == "sampler") {
@@ -191,7 +193,8 @@ bool Encoder::dispatch(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t nx, uint3
         const uint32_t grid[3] = {gx, gy, gz};
         std::memcpy(block + 96, grid, 12);
         VkDeviceAddress args = rt_.transient(block, sizeof(block), 64);
-        rt_.vk().barrier(cb_);
+        if (barrier_) rt_.vk().barrier(cb_);
+        barrier_ = true;
         vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, k_->pipeline);
         vkCmdPushConstants(cb_, rt_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &args);
         vkCmdDispatch(cb_, nx, ny, nz);
@@ -218,7 +221,8 @@ bool Encoder::dispatch(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t nx, uint3
     const uint32_t grid[3] = {gx, gy, gz};
     std::memcpy(block.data() + k_->gridOffset, grid, 12);
     VkDeviceAddress args = rt_.transient(block.data(), block.size(), 64);
-    rt_.vk().barrier(cb_);
+    if (barrier_) rt_.vk().barrier(cb_);
+    barrier_ = true;
     vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, k_->pipeline);
     vkCmdPushConstants(cb_, rt_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &args);
     vkCmdDispatch(cb_, nx, ny, nz);
