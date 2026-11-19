@@ -3,6 +3,7 @@
 #include "vk.h"
 #include <cstdlib>
 #include <cstdio>
+#include <string>
 
 namespace m4r {
 
@@ -73,8 +74,13 @@ bool Context::create() {
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pci.queueFamilyIndex = queueFamily;
     vkCreateCommandPool(device, &pci, nullptr, &pool);
     if (!getDescriptor) { error = "vkGetDescriptorEXT"; return false; }
-    if (descProps.sampledImageDescriptorSize > 32 || descProps.storageImageDescriptorSize > 32 || descProps.samplerDescriptorSize > 16) {
-        error = "descriptor sizes larger than the record layout"; return false;
+    // RDNA2 and older: RADV's sampled-image descriptor is 64 bytes (the image descriptor, then FMASK's); the kernels read the
+    // first 32 (the image resource), so records keep those
+    if (descProps.sampledImageDescriptorSize > 64 || descProps.storageImageDescriptorSize > 64 || descProps.samplerDescriptorSize > 16 ||
+        descProps.sampledImageDescriptorSize < 32 || descProps.storageImageDescriptorSize < 32) {
+        error = "unsupported descriptor sizes (sampled image " + std::to_string(descProps.sampledImageDescriptorSize) + ", storage image " +
+                std::to_string(descProps.storageImageDescriptorSize) + ", sampler " + std::to_string(descProps.samplerDescriptorSize) + ")";
+        return false;
     }
     return createBuffer(records, 1 << 20, true);
 }
@@ -106,8 +112,13 @@ bool Context::adopt(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32
     gpu = gpuTarget(p2.properties.deviceName);
     getDescriptor = reinterpret_cast<PFN_vkGetDescriptorEXT>(vkGetDeviceProcAddr(device, "vkGetDescriptorEXT"));
     if (!getDescriptor) { error = "VK_EXT_descriptor_buffer is not enabled on the game's device"; return false; }
-    if (descProps.sampledImageDescriptorSize > 32 || descProps.storageImageDescriptorSize > 32 || descProps.samplerDescriptorSize > 16) {
-        error = "descriptor sizes larger than the record layout"; return false;
+    // RDNA2 and older: RADV's sampled-image descriptor is 64 bytes (the image descriptor, then FMASK's); the kernels read the
+    // first 32 (the image resource), so records keep those
+    if (descProps.sampledImageDescriptorSize > 64 || descProps.storageImageDescriptorSize > 64 || descProps.samplerDescriptorSize > 16 ||
+        descProps.sampledImageDescriptorSize < 32 || descProps.storageImageDescriptorSize < 32) {
+        error = "unsupported descriptor sizes (sampled image " + std::to_string(descProps.sampledImageDescriptorSize) + ", storage image " +
+                std::to_string(descProps.storageImageDescriptorSize) + ", sampler " + std::to_string(descProps.samplerDescriptorSize) + ")";
+        return false;
     }
     return createBuffer(records, 1 << 20, true);
 }
@@ -214,12 +225,16 @@ bool Context::writeRecord(Texture& t) {
     VkDescriptorImageInfo ii{VK_NULL_HANDLE, t.view, VK_IMAGE_LAYOUT_GENERAL};
     VkDescriptorGetInfoEXT gi{VK_STRUCTURE_TYPE_DESCRIPTOR_GET_INFO_EXT};
     gi.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; gi.data.pSampledImage = &ii;
-    getDescriptor(device, &gi, descProps.sampledImageDescriptorSize, dst);
+    // a record holds the 32-byte image resource of each descriptor (RDNA2's 64-byte sampled descriptor appends FMASK's)
+    uint8_t tmp[64];
+    getDescriptor(device, &gi, descProps.sampledImageDescriptorSize, tmp);
+    std::memcpy(dst, tmp, 32);
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(physical, t.format, &fp);
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
         gi.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; gi.data.pStorageImage = &ii;
-        getDescriptor(device, &gi, descProps.storageImageDescriptorSize, dst + 32);
+        getDescriptor(device, &gi, descProps.storageImageDescriptorSize, tmp);
+        std::memcpy(dst + 32, tmp, 32);
     }
     return true;
 }
