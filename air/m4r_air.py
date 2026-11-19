@@ -296,7 +296,19 @@ def pair_simd_sums(text):
     return text
 
 
-def translate(text, kernel, constants, tg, wave=32, widen=False):
+LANE_OPS = re.compile(r'@air\.(simd_|quad_)|@llvm\.agx|implicit_imageblock|imageblock|"air\.(thread_index_in_simdgroup|'
+                      r'simdgroup_index_in_threadgroup|threads_per_simdgroup|dispatch_simdgroups_per_threadgroup|'
+                      r'simdgroups_per_threadgroup|thread_index_in_quadgroup|quadgroup_index_in_threadgroup)"')
+
+
+def lane_free(text, tg):
+    """No subgroup operation or subgroup-index input and at least 64 threads per group: the kernel computes the same in wave64
+    (d4r measured 13-42% on such kernels; on MetalFX's kernels it was slower overall: WarpHistory +0.05 ms, one
+    BilinearUpsample +0.09 ms, AnisoGaussian -0.02 ms), so `wave='auto'` uses it only with M4R_WAVE64=1."""
+    return tg[0] * tg[1] * tg[2] >= 64 and LANE_OPS.search(text) is None
+
+
+def translate(text, kernel, constants, tg, wave='auto', widen=False):
     """Return (amdgpu IR text, manifest dict)."""
     args = kernel_info(text, kernel)
     fcs = function_constants(text)
@@ -322,6 +334,8 @@ def translate(text, kernel, constants, tg, wave=32, widen=False):
         text = re.sub(r'(declare void @air\.store\.implicit_imageblock\.\w+\()', r'\1ptr addrspace(1), ', text)
         if re.search(r'@air\.(write_imageblock_slice_to_texture_2d|imageblock_data)', text) and constants.get('using_compute_imageblock'):
             raise ValueError(f'{kernel}: the compute-imageblock path is not supported')
+    if wave == 'auto':
+        wave = 64 if os.environ.get('M4R_WAVE64', '0') == '1' and lane_free(text, tg) else 32   # opt-in: measured slower
     manifest = {'kernel': kernel, 'threadgroup': tg, 'wave': wave, 'constants': {}, 'args': [], 'samplers': []}
 
     # 1. function constants
@@ -654,10 +668,14 @@ def translate(text, kernel, constants, tg, wave=32, widen=False):
     # the inner kernel and its helpers get the same target
     text = re.sub(r'^define internal (.*?)#(\d+) \{$', r'define internal \1#\2 {', text, flags=re.M)
     manifest['wrapper_params'] = kparams
+    if wave == 64:
+        text = '; m4r.wave 64\n' + text
     return text, manifest
 
 
 def compile_ir(text, out_path, mcpu='gfx1101', wave=32, keep=None, opt_level='3'):
+    if re.match(r'; m4r\.wave 64\n', text):   # translate() chose wave64 for this kernel
+        wave = 64
     with tempfile.TemporaryDirectory() as d:
         ll = os.path.join(d, 'k.ll'); bc = os.path.join(d, 'k.bc'); obj = os.path.join(d, 'k.o')
         open(ll, 'w').write(text)

@@ -43,7 +43,7 @@ struct Module {
     std::vector<uint8_t> dataInit;    // initial contents of [dataLo, dataHi)
     std::map<std::string, Kernel> kernels;
     std::map<std::string, Global> globals;
-    struct Site { uint32_t word = 0, sdst = 0; uint64_t target = 0; };
+    struct Site { uint32_t word = 0, sdst = 0; uint64_t target = 0; uint32_t wait = 0; };   // wait: a hazard wait between getpc and add (0: none)
     std::vector<Site> sites;           // getpc triples that address data
     uint32_t textGetpc = 0;            // getpc triples that address code (left alone)
     std::string error;

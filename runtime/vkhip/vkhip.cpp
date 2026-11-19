@@ -134,24 +134,29 @@ bool Module::parse(const std::vector<uint8_t>& f) {
     for (size_t i = 0; i + 4 < n; ++i) {
         if ((w[i] & GETPC_MASK) != GETPC) continue;
         const uint32_t reg = (w[i] >> 16) & 0x7f;
-        if (!sop2Literal(w[i + 1], S_ADD_U32, reg) || !sop2Literal(w[i + 3], S_ADDC_U32, reg + 1)) {
+        // m4r: the compiler may put one hazard wait (s_waitcnt_depctr, s_nop) between the getpc and its add
+        const bool wait = i + 5 < n && ((w[i + 1] & 0xffff0000u) == 0xbf880000u || (w[i + 1] & 0xffff0000u) == S_NOP);
+        const size_t a = i + (wait ? 1 : 0);
+        if (!sop2Literal(w[a + 1], S_ADD_U32, reg) || !sop2Literal(w[a + 3], S_ADDC_U32, reg + 1)) {
             error = "unhandled s_getpc_b64 at text+" + std::to_string(4 * i);
             return false;
         }
-        const int64_t offset = int64_t((uint64_t(w[i + 4]) << 32) | w[i + 2]);
+        const int64_t offset = int64_t((uint64_t(w[a + 4]) << 32) | w[a + 2]);
         const uint64_t target = textVa + 4 * (i + 1) + uint64_t(offset);
+        const uint32_t waitWord = wait ? w[i + 1] : 0;
         if (target >= dataLo && target < dataHi) {
-            sites.push_back(Site{uint32_t(i), reg, target});
+            sites.push_back(Site{uint32_t(i), reg, target, waitWord});
         } else if (rodata >= 0 && target >= s[rodata].addr && target < s[rodata].addr + s[rodata].size) {
-            sites.push_back(Site{uint32_t(i), reg, target});   // constant tables: mapped below, only for modules that read them
+            sites.push_back(Site{uint32_t(i), reg, target, waitWord});   // constant tables: mapped below, only for modules that read them
             readsRodata = true;
         } else if (target >= textVa && target < textVa + this->text.size()) {
             ++textGetpc;
+            i += wait ? 1 : 0;
         } else {
             error = "s_getpc_b64 at text+" + std::to_string(4 * i) + " addresses neither code nor data";
             return false;
         }
-        i += 4;
+        i += 4 + (wait ? 1 : 0);
     }
     if (readsRodata) {
         // m4r: the data image spans .rodata and the writable data, in whichever order the linker placed them
@@ -176,7 +181,7 @@ bool Module::parse(const std::vector<uint8_t>& f) {
         if ((k.props & 0x7f) != (1u << 3) || (k.preload & 0x7f) || user < 2 || (user > 2 && user + ids != 16)) {
             error = name + ": not a kernarg-only kernel"; return false;
         }
-        if (!(k.props & (1u << 10))) { error = name + ": not wave32"; return false; }
+        // wave32 or wave64 (props bit 10); the donor pipeline is created with the same subgroup size
     }
     return true;
 }
@@ -186,11 +191,13 @@ std::vector<uint32_t> Module::patchedText(uint64_t dataAddress) const {
     std::memcpy(w.data(), text.data(), text.size());
     for (const auto& site : sites) {
         const uint64_t a = dataAddress + (site.target - dataLo);
-        w[site.word + 0] = S_MOV_B32_LIT | (site.sdst << 16);
-        w[site.word + 1] = uint32_t(a);
-        w[site.word + 2] = S_MOV_B32_LIT | ((site.sdst + 1) << 16);
-        w[site.word + 3] = uint32_t(a >> 32);
-        w[site.word + 4] = S_NOP;
+        uint32_t at = site.word;
+        if (site.wait) w[at++] = site.wait;   // the hazard wait first (waiting earlier is always allowed), then the moves
+        w[at + 0] = S_MOV_B32_LIT | (site.sdst << 16);
+        w[at + 1] = uint32_t(a);
+        w[at + 2] = S_MOV_B32_LIT | ((site.sdst + 1) << 16);
+        w[at + 3] = uint32_t(a >> 32);
+        w[at + 4] = S_NOP;
     }
     return w;
 }
@@ -250,7 +257,9 @@ VkPipeline createPipeline(const Device& vk, VkPipelineLayout layout, const Modul
     for (uint32_t i = 0; i < 5; ++i) entries[i] = {i, 4 * i, 4};
     VkSpecializationInfo si{5, entries, sizeof(spec), spec};
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo wave{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
-    wave.requiredSubgroupSize = 32;
+    const bool wave64 = !(kernel.props & (1u << 10));
+    wave.requiredSubgroupSize = wave64 ? 64 : 32;
+    const uint32_t vgran = wave64 ? 4 : 8;   // RSRC1 VGPR field unit (gfx10+: 8 for wave32, 4 for wave64)
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &wave, 0, VK_SHADER_STAGE_COMPUTE_BIT, shader, "main", &si};
     ci.layout = layout;
@@ -298,8 +307,8 @@ VkPipeline createPipeline(const Device& vk, VkPipelineLayout layout, const Modul
                     const uint32_t rsrc1 = rd<uint32_t>(object, CFG + RSRC1), fmode = rd<uint32_t>(object, CFG + FLOAT_MODE);
                     const uint32_t declared = std::max(1u, (kernel.lds + 3) / 4) * 4;
                     const bool ldsOk = (lds >= declared && lds < declared + 1024) || (kernel.lds == 0 && lds == 0);
-                    const bool sane = sgprs && sgprs <= 128 && vgprs && vgprs <= 256 && ((rsrc1 & 0x3f) + 1) * 8 >= vgprs &&
-                                      ((rsrc1 & 0x3f) + 1) * 8 < vgprs + 8 && ldsOk &&
+                    const bool sane = sgprs && sgprs <= 128 && vgprs && vgprs <= 256 && ((rsrc1 & 0x3f) + 1) * vgran >= vgprs &&
+                                      ((rsrc1 & 0x3f) + 1) * vgran < vgprs + vgran && ldsOk &&
                                       ((donorRsrc2 & RSRC2_LDS_MASK) != 0) == (lds != 0) && scratch == 0 && fmode < 256 &&
                                       object[CFG + WGP_MODE] <= 1 && ((rsrc1 >> 12) & 0xff) == fmode;
                     if (!sane) {
@@ -321,12 +330,12 @@ VkPipeline createPipeline(const Device& vk, VkPipelineLayout layout, const Modul
                 code.insert(code.end(), 64, S_CODE_END);
                 const uint32_t codeBytes = uint32_t(code.size() * 4);
                 wr<uint32_t>(patched, CFG + NUM_SGPRS, 106);
-                wr<uint32_t>(patched, CFG + NUM_VGPRS, ((kernel.rsrc1 & 0x3f) + 1) * 8);
+                wr<uint32_t>(patched, CFG + NUM_VGPRS, ((kernel.rsrc1 & 0x3f) + 1) * vgran);
                 wr<uint32_t>(patched, CFG + SHARED_VGPRS, 0);
                 wr<uint32_t>(patched, CFG + SPILLED_SGPRS, 0);
                 wr<uint32_t>(patched, CFG + SPILLED_VGPRS, 0);
                 wr<uint32_t>(patched, CFG + FLOAT_MODE, (kernel.rsrc1 >> 12) & 0xff);
-                wr<uint32_t>(patched, CFG + SCRATCH, (kernel.scratch * 32 + 255) / 256 * 256);
+                wr<uint32_t>(patched, CFG + SCRATCH, (kernel.scratch * (wave64 ? 64 : 32) + 255) / 256 * 256);
                 patched[CFG + WGP_MODE] = uint8_t((kernel.rsrc1 >> 29) & 1);
                 wr<uint32_t>(patched, CFG + RSRC1, kernel.rsrc1);
                 wr<uint32_t>(patched, CFG + RSRC2, (kernel.rsrc2 & ~RSRC2_LDS_MASK) | (donorRsrc2 & RSRC2_LDS_MASK));
