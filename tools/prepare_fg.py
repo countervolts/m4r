@@ -107,7 +107,7 @@ def build(a):
       ['buf 0 fgparams', 'buf 1 hist_change', 'tex 1 mask', 'tex 2 ddepth1|ddepth0', 'tex 3 color', 'tex 4 prevcolor',
        'tex 5 gmv', 'tex 6 omv', 'tex 7 nil', 'tex 8 nil', 'tex 9 nil', 'tex 10 color', 'tex 11 ddepth0|ddepth1',
        'tex 14 mover', 'tex 255 output', 'tgmem 0 8192'])
-    open(os.path.join(out, 'plan.txt'), 'w').write('\n'.join(decl + passes) + '\n')
+    open(os.path.join(out, 'plan.txt'), 'w').write('\n'.join([f'gpu {m4r_air.GPU}'] + decl + passes) + '\n')
     json.dump({'output': [ow, oh], 'input': [iw, ih], 'levels': levels}, open(os.path.join(out, 'sizes.json'), 'w'))
     print(f'{len(kernels)} kernels, {sum(1 for p in passes if p.startswith("pass"))} passes, {levels} levels -> {out}')
 
@@ -117,6 +117,9 @@ if __name__ == '__main__':
     ap.add_argument('--resources', required=True)
     ap.add_argument('--output', required=True, type=lambda s: [int(x) for x in s.split('x')])
     ap.add_argument('--input', required=True, type=lambda s: [int(x) for x in s.split('x')])
+    ap.add_argument('--gpu', default=m4r_air.GPU, help='target GPU (' + ', '.join(m4r_air.GPUS) + ')')
     ap.add_argument('--out', required=True)
     ap.add_argument('--force', action='store_true')
-    build(ap.parse_args())
+    args = ap.parse_args()
+    m4r_air.set_gpu(args.gpu)
+    build(args)

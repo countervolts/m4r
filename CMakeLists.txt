@@ -45,6 +45,8 @@ target_link_libraries(test_plan m4r_runtime)
 add_executable(test_scratch tests/test_scratch.cpp)
 target_link_libraries(test_scratch m4r_runtime)
 
+add_executable(vkhip_parse tests/vkhip_parse.cpp)
+target_link_libraries(vkhip_parse m4r_runtime)
 add_executable(run_bbr tests/run_bbr.cpp)
 target_link_libraries(run_bbr m4r_runtime)
 

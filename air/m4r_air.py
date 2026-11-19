@@ -32,6 +32,42 @@ AMDGPU_DL = ('e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:32:32-p7
              'v256:256-v512:512-v1024:1024-v2048:2048-n32:64-S32-A5-G1-ni:7:8:9')
 TRIPLE = 'amdgcn-amd-amdhsa'
 
+# The GPU the kernels are built for (set_gpu, or M4R_GPU): RDNA2 gfx1030-gfx1036, RDNA3 gfx1100-gfx1103, RDNA 3.5
+# gfx1150-gfx1153, RDNA4 gfx1200-gfx1201. Code objects are per target; the matrix lowering depends on the generation:
+# gfx11 has WMMA (Apple's 16x16x16 MXU products on v_wmma, accumulators kept in WMMA layout across GEMM chains), gfx12 has
+# WMMA with another register layout, gfx10.3 none (dot-product instructions; bit-identical to the WMMA build on gfx1101).
+GPUS = ('gfx1030', 'gfx1031', 'gfx1032', 'gfx1033', 'gfx1034', 'gfx1035', 'gfx1036', 'gfx1100', 'gfx1101', 'gfx1102',
+        'gfx1103', 'gfx1150', 'gfx1151', 'gfx1152', 'gfx1153', 'gfx1200', 'gfx1201')
+GPU = os.environ.get('M4R_GPU', 'gfx1101')
+
+
+def family(gpu=None):
+    g = gpu or GPU
+    if g not in GPUS:
+        raise ValueError(f'unsupported GPU {g} (RDNA2 gfx1030-gfx1036, RDNA3 gfx1100-gfx1103 / gfx1150-gfx1153, RDNA4 gfx1200-gfx1201)')
+    return g[:5]   # gfx10, gfx11 or gfx12
+
+
+def set_gpu(g):
+    """Target GPU for translate() / compile_ir(); picks the matrix lowering unless M4R_MXU_INT / M4R_MXU_FP16 say otherwise."""
+    global GPU
+    family(g)
+    GPU = g
+    intrinsics.CTX['family'] = family(g)
+    wmma = 'wmma'   # every generation runs the WMMA lowering; wmma_impl() says how the instruction itself is executed
+    intrinsics.MXU_MODE['int'] = os.environ.get('M4R_MXU_INT') or (wmma or 'dot')
+    intrinsics.MXU_MODE['fp16'] = os.environ.get('M4R_MXU_FP16') or (wmma or 'closed')
+
+
+def wmma_impl():
+    """how the gfx11 WMMA instructions the GEMM lowering emits are executed (intrinsics.wmma_impl_defs); M4R_WMMA_IMPL overrides"""
+    return os.environ.get('M4R_WMMA_IMPL') or {'gfx10': 'soft', 'gfx11': 'native', 'gfx12': 'gfx12'}[family()]
+
+
+def target_features(wave):
+    # -real-true16: LLVM's gfx11/gfx12 true-16-bit register mode miscompiles findOpticalMotionVectorsV3 (docs/air-translation.md)
+    return f'+wavefrontsize{wave}' + (',-real-true16' if family() in ('gfx11', 'gfx12') else '')
+
 BUILTINS = {
     'air.thread_position_in_grid', 'air.thread_position_in_threadgroup', 'air.threadgroup_position_in_grid',
     'air.thread_index_in_threadgroup', 'air.threads_per_threadgroup', 'air.threadgroups_per_grid',
@@ -559,9 +595,10 @@ def translate(text, kernel, constants, tg, wave='auto', widen=False):
 
     # 7b. on inlined, scalarised IR, before the intrinsics get bodies: GEMM accumulators in WMMA layout (air/gemm_chain.py) and
     # the optional widening of half arithmetic (air/widen.py)
+    # accumulators kept in WMMA layout (gfx11's on every generation, see wmma_impl; M4R_GEMM_CHAIN=0 turns it off)
     chain = os.environ.get('M4R_GEMM_CHAIN', '1') != '0' and re.search(r'@llvm\.agx3\.(fgemm|igemm)', text) is not None
     if widen or chain:
-        text = run(['opt', '-O3', f'-mtriple={TRIPLE}', '-mcpu=gfx1101', f'-mattr=+wavefrontsize{wave},-real-true16', '-S', '-',
+        text = run(['opt', '-O3', f'-mtriple={TRIPLE}', f'-mcpu={GPU}', f'-mattr={target_features(wave)}', '-S', '-',
                     '-o', '-'], input=text.encode()).decode()
     permuted = []
     if chain:
@@ -610,6 +647,20 @@ def translate(text, kernel, constants, tg, wave='auto', widen=False):
             existing.add(nm)
     text += '\n\n' + '\n\n'.join(defs) + '\n'
     text += 'attributes #900 = { alwaysinline nounwind }\n'
+
+    # 8b. WMMA on other generations: the two gfx11 instructions become functions with the same signature (see wmma_impl)
+    impl = wmma_impl()
+    if impl != 'native' and re.search(r'@llvm\.amdgcn\.wmma\.', text):
+        text = text.replace('@' + intrinsics.WMMA_F16 + '(', '@__m4r_wmma_f16(').replace('@' + intrinsics.WMMA_I8 + '(', '@__m4r_wmma_iu8(')
+        text = re.sub(r'^declare [^\n]*@__m4r_wmma_(f16|iu8)\([^\n]*\n', '', text, flags=re.M)
+        wdefs, wdecls = intrinsics.wmma_impl_defs(impl)
+        existing_w = set(re.findall(r'^declare [^\n]*@(llvm\.[\w.]+)\(', text, re.M))
+        for d in sorted(wdecls):
+            nm = re.search(r'@(llvm\.[\w.]+)\(', d).group(1)
+            if nm not in existing_w:
+                text += '\n' + d
+                existing_w.add(nm)
+        text += '\n\n' + wdefs + '\n'
 
     # 9. kernel wrapper
     m = re.search(r'^define (?:[\w ]*?)(void|<\d+ x \w+>) @' + re.escape(kernel) + r'\((.*)\)(.*)\{$', text, re.M)
@@ -810,7 +861,7 @@ def translate(text, kernel, constants, tg, wave='auto', widen=False):
              '"amdgpu-no-dispatch-ptr" "amdgpu-no-queue-ptr" "amdgpu-no-implicitarg-ptr" "amdgpu-no-dispatch-id" '
              '"amdgpu-no-hostcall-ptr" "amdgpu-no-heap-ptr" "amdgpu-no-multigrid-sync-arg" "amdgpu-no-lds-kernel-id" '
              '"amdgpu-no-default-queue" "amdgpu-no-completion-action" "amdgpu-no-flat-scratch-init" '
-             '"target-cpu"="gfx1101" "target-features"="+wavefrontsize%d" }\n') % (phys[0] * phys[1] * phys[2], phys[0] * phys[1] * phys[2], wave)
+             '"target-cpu"="%s" "target-features"="+wavefrontsize%d" }\n') % (phys[0] * phys[1] * phys[2], phys[0] * phys[1] * phys[2], GPU, wave)
     # the inner kernel and its helpers get the same target
     text = re.sub(r'^define internal (.*?)#(\d+) \{$', r'define internal \1#\2 {', text, flags=re.M)
     manifest['wrapper_params'] = kparams
@@ -819,7 +870,8 @@ def translate(text, kernel, constants, tg, wave='auto', widen=False):
     return text, manifest
 
 
-def compile_ir(text, out_path, mcpu='gfx1101', wave=32, keep=None, opt_level='3'):
+def compile_ir(text, out_path, mcpu=None, wave=32, keep=None, opt_level='3'):
+    mcpu = mcpu or GPU
     if re.match(r'; m4r\.wave 64\n', text):   # translate() chose wave64 for this kernel
         wave = 64
     with tempfile.TemporaryDirectory() as d:
@@ -828,17 +880,17 @@ def compile_ir(text, out_path, mcpu='gfx1101', wave=32, keep=None, opt_level='3'
         if keep:
             open(keep + '.amdgpu.ll', 'w').write(text)
         run(['llvm-as', ll, '-o', bc])
-        run(['opt', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr=+wavefrontsize{wave},-real-true16', bc, '-o', bc])
+        run(['opt', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr={target_features(wave)}', bc, '-o', bc])
         dis = run(['llvm-dis', bc, '-o', '-']).decode()
         if 'llvm.global_ctors' in dis and re.search(r'@llvm\.global_ctors = appending global \[[1-9]', dis):
             raise RuntimeError('static initialiser of function constants was not folded')
         if keep:
             open(keep + '.opt.ll', 'w').write(dis)
-        run(['llc', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr=+wavefrontsize{wave},-real-true16',
+        run(['llc', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr={target_features(wave)}',
              '-filetype=obj', bc, '-o', obj])
         if keep:
             open(keep + '.s', 'wb').write(run(['llc', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}',
-                                                f'-mattr=+wavefrontsize{wave},-real-true16', bc, '-o', '-']))
+                                                f'-mattr={target_features(wave)}', bc, '-o', '-']))
         run(['ld.lld', '-shared', obj, '-o', out_path])
 
 
@@ -867,7 +919,7 @@ def translator_hash():
 
 
 def specialization_key(kernel, constants, tg, source_hash):
-    s = json.dumps([kernel, sorted(constants.items()), tg, source_hash, translator_hash()], sort_keys=True)
+    s = json.dumps([kernel, sorted(constants.items()), tg, source_hash, translator_hash(), GPU, wmma_impl()], sort_keys=True)
     return hashlib.sha256(s.encode()).hexdigest()[:16]
 
 
@@ -877,11 +929,13 @@ def main():
     ap.add_argument('kernel')
     ap.add_argument('-o', '--out', required=True, help='output code object (.hsaco); manifest is written next to it')
     ap.add_argument('--tg', default='32,1,1', help='threadgroup size x,y,z')
+    ap.add_argument('--gpu', default=GPU, help='target GPU (' + ', '.join(GPUS) + ')')
     ap.add_argument('-D', action='append', default=[], help='function constant name=value')
     ap.add_argument('--widen', action='store_true', help='compute half arithmetic in f32 (air/widen.py)')
     ap.add_argument('--keep', action='store_true', help='also write the intermediate IR and assembly')
     ap.add_argument('--mxu-probe', action='store_true', help='build the MXU layout probe (tests/probe_mxu.py)')
     a = ap.parse_args()
+    set_gpu(a.gpu)
     if a.mxu_probe:
         intrinsics.MXU_MODE['mode'] = 'probe'
     data = open(a.source, 'rb').read()
@@ -903,6 +957,8 @@ def main():
     write_manifest(man, os.path.splitext(a.out)[0])
     print(a.out)
 
+
+set_gpu(GPU)   # M4R_GPU's matrix lowering
 
 if __name__ == '__main__':
     main()

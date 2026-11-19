@@ -1049,6 +1049,212 @@ def _fgemm_dot2(b, lane):
 WMMA_F16 = 'llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16'
 
 
+# --- the gfx11 WMMA instructions on other generations ------------------------------------------------------------------
+# Every GEMM above is written against RDNA3's v_wmma_f32_16x16x16_f16 / v_wmma_i32_16x16x16_iu8 and their register layout
+# (operand lane l: row / column l & 15, all 16 k; accumulator VGPR i: row 2i + (l >> 4), column l & 15). On other
+# generations m4r_air replaces just those two calls by @__m4r_wmma_f16 / @__m4r_wmma_iu8 with the same operands and results:
+#   soft     RDNA2 (no WMMA): each accumulator element is the v_dot2 (fp16) / v_dot4 (int8) chain over k in increasing order
+#            starting from C, the A row broadcast with DPP row_share (half 1 first rotated by one lane so that row_share n
+#            reads row n there and row n + 1 in half 1). On gfx1101 the fp16 chain is bit-identical to WMMA (docs/mxu.md).
+#   gfx12    RDNA4's WMMA (operand: 8 of the 16 k, half h holds k 8h .. 8h + 7; accumulator VGPR i: row i + 8h) with the
+#            operands cut to the lane's half and the accumulators exchanged between the halves around it.
+#   gfx12emu validation on RDNA3: the gfx12 path above, with the gfx12 instruction itself emulated by gfx11 WMMA in gfx12's
+#            layout (as d4r's layout shim). Bit-identical to the native build only if every layout conversion is right.
+WMMA_IMPLS = ('native', 'soft', 'gfx12', 'gfx12emu')
+
+
+def _other_half(b, v):
+    """the value of the lane with the same index in the other half of the wave (v_permlanex16, identity selects)"""
+    return intr(b, 'i32', 'llvm.amdgcn.permlanex16.i32', [('i32', 'poison'), ('i32', v), ('i32', str(0x76543210)),
+                                                           ('i32', str(0xfedcba98 - (1 << 32))), ('i1', 'false'), ('i1', 'false')])
+
+
+def _words(b, v, n, t):
+    """<n x t> (t: half or i32 words) -> list of n * 16 / 32 i32 words"""
+    if t == 'half':
+        w = b.v(f'bitcast <{n} x half> {v} to <{n // 2} x i32>')
+        k = n // 2
+    else:
+        w, k = v, n
+    return [b.v(f'extractelement <{k} x i32> {w}, i32 {j}') for j in range(k)]
+
+
+def _vec(b, words, t, n):
+    cur = 'poison'
+    for j, x in enumerate(words):
+        cur = b.v(f'insertelement <{len(words)} x i32> {cur}, i32 {x}, i32 {j}')
+    return b.v(f'bitcast <{len(words)} x i32> {cur} to <{n} x {t}>') if t == 'half' else cur
+
+
+def _acc_11_to_12(b, half, acc, t):
+    """accumulators in gfx11 layout (VGPR i = row 2i + h) -> gfx12 layout (VGPR i = row i + 8h); acc: list of 8 values"""
+    w = [b.v(f'bitcast {t} {x} to i32') if t != 'i32' else x for x in acc]
+    x = [_other_half(b, v) for v in w]
+    out = []
+    for i in range(8):
+        lo = w[i // 2] if i % 2 == 0 else x[(i - 1) // 2]          # h = 0: row i is gfx11 half i & 1, VGPR i >> 1
+        hi = w[4 + (i - 1) // 2] if i % 2 == 1 else x[4 + i // 2]  # h = 1: row 8 + i
+        v = b.v(f'select i1 {half}, i32 {hi}, i32 {lo}')
+        out.append(b.v(f'bitcast i32 {v} to {t}') if t != 'i32' else v)
+    return out
+
+
+def _acc_12_to_11(b, half, acc, t):
+    """gfx12 layout (VGPR i = row i + 8h) -> gfx11 layout (VGPR i = row 2i + h)"""
+    w = [b.v(f'bitcast {t} {x} to i32') if t != 'i32' else x for x in acc]
+    x = [_other_half(b, v) for v in w]
+    out = []
+    for i in range(8):
+        lo = w[2 * i] if i < 4 else x[2 * i - 8]        # h = 0: row 2i is gfx12 half (2i) >> 3, VGPR 2i & 7
+        hi = x[2 * i + 1] if i < 4 else w[2 * i - 7]    # h = 1: row 2i + 1
+        v = b.v(f'select i1 {half}, i32 {hi}, i32 {lo}')
+        out.append(b.v(f'bitcast i32 {v} to {t}') if t != 'i32' else v)
+    return out
+
+
+def _elems(b, v, t):
+    return [b.v(f'extractelement <8 x {t}> {v}, i32 {i}') for i in range(8)]
+
+
+def _pack8(b, xs, t):
+    cur = 'poison'
+    for i, x in enumerate(xs):
+        cur = b.v(f'insertelement <8 x {t}> {cur}, {t} {x}, i32 {i}')
+    return cur
+
+
+WMMA12_F16 = 'llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v8f16'
+WMMA12_I8 = 'llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v2i32'
+
+
+def _wmma12(b, kind, a, bb, c, sa='false', sb='false', emu=False):
+    """the gfx12 instruction on gfx12-layout operands (a, bb: 4 / 2 words of the lane's k half; c: 8 values); emu: built from
+    the gfx11 instruction (operands and accumulators converted to gfx11's layout and back)"""
+    t = 'float' if kind == 'f' else 'i32'
+    if not emu:
+        if kind == 'f':
+            b.decls.add(f'declare <8 x float> @{WMMA12_F16}(<8 x half>, <8 x half>, <8 x float>)')
+            d = b.v(f'call <8 x float> @{WMMA12_F16}(<8 x half> {_vec(b, a, "half", 8)}, <8 x half> {_vec(b, bb, "half", 8)}, '
+                    f'<8 x float> {_pack8(b, c, t)})')
+        else:
+            b.decls.add(f'declare <8 x i32> @{WMMA12_I8}(i1 immarg, <2 x i32>, i1 immarg, <2 x i32>, <8 x i32>, i1 immarg)')
+            d = b.v(f'call <8 x i32> @{WMMA12_I8}(i1 {sa}, <2 x i32> {_vec(b, a, "i32", 2)}, i1 {sb}, <2 x i32> {_vec(b, bb, "i32", 2)}, '
+                    f'<8 x i32> {_pack8(b, c, t)}, i1 false)')
+        return _elems(b, d, t)
+    lane = lane_id(b)
+    half = b.v(f'icmp uge i32 {lane}, 16')
+    full = []
+    for v in (a, bb):   # gfx11 operand: k 0..15 in order = (half 0's words, half 1's words)
+        o = [_other_half(b, x) for x in v]
+        full.append([b.v(f'select i1 {half}, i32 {o[j]}, i32 {v[j]}') for j in range(len(v))] +
+                    [b.v(f'select i1 {half}, i32 {v[j]}, i32 {o[j]}') for j in range(len(v))])
+    c11 = _acc_12_to_11(b, half, c, t)
+    d11 = _wmma11(b, kind, full[0], full[1], c11, sa, sb)
+    return _acc_11_to_12(b, half, d11, t)
+
+
+def _wmma11(b, kind, a, bb, c, sa='false', sb='false'):
+    t = 'float' if kind == 'f' else 'i32'
+    if kind == 'f':
+        b.decls.add(f'declare <8 x float> @{WMMA_F16}(<16 x half>, <16 x half>, <8 x float>)')
+        d = b.v(f'call <8 x float> @{WMMA_F16}(<16 x half> {_vec(b, a, "half", 16)}, <16 x half> {_vec(b, bb, "half", 16)}, '
+                f'<8 x float> {_pack8(b, c, t)})')
+    else:
+        b.decls.add(f'declare <8 x i32> @{WMMA_I8}(i1 immarg, <4 x i32>, i1 immarg, <4 x i32>, <8 x i32>, i1 immarg)')
+        d = b.v(f'call <8 x i32> @{WMMA_I8}(i1 {sa}, <4 x i32> {_vec(b, a, "i32", 4)}, i1 {sb}, <4 x i32> {_vec(b, bb, "i32", 4)}, '
+                f'<8 x i32> {_pack8(b, c, t)}, i1 false)')
+    return _elems(b, d, t)
+
+
+def _wmma_soft(b, kind, a, bb, c, signed=None):
+    """gfx11 semantics from dot products: acc(row 2i + h, col r) = C, then the dot over the k words in order.
+    One inline-asm statement per output row: LLVM would otherwise merge the broadcasts of products that share their A
+    operand and keep 64 of them alive across those products (spills; RDNA2 cannot run kernels with scratch in vkhip). fp16:
+    v_dot2c_f32_f16 (gfx11: v_dot2acc_f32_f16) takes the DPP broadcast itself; int8: a DPP move into a private temporary,
+    then the VOP3P dot. Each statement starts with s_nop 1: LLVM does not see the DPP read inside it, and a DPP source
+    written by the previous VALU instruction needs two wait states."""
+    fam = CTX.get('family', 'gfx11')
+    if fam not in ('gfx10', 'gfx11'):
+        raise ValueError(f'software WMMA is written for gfx10/gfx11, not {fam}')
+    lane = lane_id(b)
+    half = b.v(f'icmp uge i32 {lane}, 16')
+    # half 1 rotated by one lane (row_ror:15): row_share n then reads lane n + 1 there, which holds row n + 1
+    ar = []
+    for w in a:
+        rot = intr(b, 'i32', 'llvm.amdgcn.update.dpp.i32', [('i32', 'poison'), ('i32', w), ('i32', str(0x12f)), ('i32', '15'),
+                                                             ('i32', '15'), ('i1', 'false')])
+        ar.append(b.v(f'select i1 {half}, i32 {rot}, i32 {w}'))
+    n = len(ar)
+    dpp = 'row_mask:0xf bank_mask:0xf'
+    out = []
+    for i in range(8):
+        sh = f'row_share:{2 * i}'
+        if kind == 'f':
+            op = 'v_dot2c_f32_f16_dpp' if fam == 'gfx10' else 'v_dot2acc_f32_f16_dpp'
+            body = '\\0As_nop 1' + ''.join(f'\\0A{op} $0, ${1 + j}, ${1 + n + j} {sh} {dpp}' for j in range(n))
+            cons = '=v,' + ','.join(['v'] * (2 * n)) + ',0'
+            acc = b.v(f'call float asm "{body[3:]}", "{cons}"(' + ', '.join([f'i32 {x}' for x in ar] + [f'i32 {x}' for x in bb])
+                      + f', float {c[i]})')
+        else:
+            dot = ('v_dot4_i32_i8 $0, $1, ${0}, $0' if fam == 'gfx10' else 'v_dot4_i32_iu8 $0, $1, ${0}, $0 neg_lo:[1,1,0]') \
+                if signed else 'v_dot4_u32_u8 $0, $1, ${0}, $0'
+            body = '\\0As_nop 1' + ''.join(f'\\0Av_mov_b32_dpp $1, ${2 + j} {sh} {dpp}\\0A' + dot.replace('${0}', f'${2 + n + j}')
+                                            for j in range(n))
+            cons = '=v,=&v,' + ','.join(['v'] * (2 * n)) + ',0'
+            r = b.v(f'call {{ i32, i32 }} asm "{body[3:]}", "{cons}"(' + ', '.join([f'i32 {x}' for x in ar] + [f'i32 {x}' for x in bb])
+                    + f', i32 {c[i]})')
+            acc = b.v(f'extractvalue {{ i32, i32 }} {r}, 0')
+        out.append(acc)
+    return out
+
+
+def wmma_impl_defs(impl):
+    """IR definitions of @__m4r_wmma_f16 and @__m4r_wmma_iu8 (the gfx11 instructions' signatures) for `impl`"""
+    defs, decls = [], set()
+    for kind in ('f', 'i'):
+        b = Body()
+        t = 'float' if kind == 'f' else 'i32'
+        if kind == 'f':
+            hdr = 'define internal <8 x float> @__m4r_wmma_f16(<16 x half> %a, <16 x half> %b, <8 x float> %c) #900 {'
+            a, bb = _words(b, '%a', 16, 'half'), _words(b, '%b', 16, 'half')
+        else:
+            hdr = 'define internal <8 x i32> @__m4r_wmma_iu8(i1 %sa, <4 x i32> %a, i1 %sb, <4 x i32> %b, <8 x i32> %c, i1 %clamp) #900 {'
+            a, bb = _words(b, '%a', 4, 'i32'), _words(b, '%b', 4, 'i32')
+        c = _elems(b, '%c', t)
+        if impl == 'soft':
+            if kind == 'f':
+                d = _wmma_soft(b, kind, a, bb, c)
+            else:   # MetalFX multiplies u8 by u8 or s8 by s8 (mixed pairs are never selected at run time)
+                ds = _wmma_soft(b, kind, a, bb, c, signed=True)
+                du = _wmma_soft(b, kind, a, bb, c, signed=False)
+                d = [b.v(f'select i1 %sa, i32 {x}, i32 {y}') for x, y in zip(ds, du)]
+        else:
+            lane = lane_id(b)
+            half = b.v(f'icmp uge i32 {lane}, 16')
+            n = len(a) // 2
+            a12 = [b.v(f'select i1 {half}, i32 {a[n + j]}, i32 {a[j]}') for j in range(n)]
+            b12 = [b.v(f'select i1 {half}, i32 {bb[n + j]}, i32 {bb[j]}') for j in range(n)]
+            c12 = _acc_11_to_12(b, half, c, t)
+            emu = impl == 'gfx12emu'
+            if kind == 'f':
+                d12 = _wmma12(b, kind, a12, b12, c12, emu=emu)
+            else:   # the sign flags are immediates of the instruction: one call per pair, picked by the flags
+                outs = {}
+                for sa in ('false', 'true'):
+                    for sb in ('false', 'true'):
+                        outs[(sa, sb)] = _wmma12(b, kind, a12, b12, c12, sa, sb, emu=emu)
+                d12 = []
+                for i in range(8):
+                    x = b.v(f'select i1 %sb, i32 {outs[("true", "true")][i]}, i32 {outs[("true", "false")][i]}')
+                    y = b.v(f'select i1 %sb, i32 {outs[("false", "true")][i]}, i32 {outs[("false", "false")][i]}')
+                    d12.append(b.v(f'select i1 %sa, i32 {x}, i32 {y}'))
+            d = _acc_12_to_11(b, half, d12, t)
+        r = _pack8(b, d, t)
+        defs.append('\n'.join([hdr] + b.lines + [f'  ret <8 x {t}> {r}', '}']))
+        decls |= b.decls
+    return '\n\n'.join(defs), decls
+
+
 def _fgemm_wmma(b, lane):
     """D = C + A.B for 16x16x16 fp16 with f32 accumulators on RDNA3 WMMA (v_wmma_f32_16x16x16_f16).
 

@@ -29,6 +29,10 @@ struct Texture {
     bool owned = true;
 };
 
+// The LLVM GPU target (gfx1030 ... gfx1201) of a RADV device, from the chip name RADV puts in the device name
+// ("AMD Radeon RX 7700 XT (RADV NAVI32)"); M4R_GPU overrides it. Empty for anything else.
+std::string gpuTarget(const char* deviceName);
+
 struct Context {
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
@@ -40,6 +44,7 @@ struct Context {
     VkPhysicalDeviceDescriptorBufferPropertiesEXT descProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT};
     PFN_vkGetDescriptorEXT getDescriptor = nullptr;
     bool ownsDevice = false;
+    std::string gpu;             // LLVM target of the device (gfx1101, ...; gpuTarget); empty if not recognised
     std::string error;
 
     // Descriptor records live in one host-visible arena.

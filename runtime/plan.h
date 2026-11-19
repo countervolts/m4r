@@ -29,6 +29,7 @@ public:
     const std::map<std::string, Buffer>& buffers() const { return buffers_; }
     const std::map<std::string, Texture>& textures() const { return textures_; }
     const std::map<std::string, Kernel*>& kernels() const { return kernels_; }
+    const std::string& gpu() const { return gpu_; }   // the GPU the plan's kernels were built for (plan line `gpu`)
     std::string error;
 
 private:
@@ -44,6 +45,7 @@ private:
     std::vector<Pass> passes_;
     std::map<std::string, std::pair<std::string, VkDeviceSize>> views_;
     int parity_ = 0;
+    std::string gpu_;
     std::map<std::string, bool> flags_;
     bool active(const Pass& p) const {
         if (p.only.empty()) return true;

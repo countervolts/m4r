@@ -53,6 +53,14 @@ bool Plan::load(const std::string& dir) {
         std::string w;
         if (!(ls >> w) || w[0] == '#') continue;
         auto fail = [&](const std::string& why) { error = "plan.txt:" + std::to_string(ln) + ": " + why; return false; };
+        if (w == "gpu") {   // gpu gfx1101: the kernels below are code for that GPU only
+            ls >> gpu_;
+            const std::string& dev = rt_.vk().gpu;
+            if (!dev.empty() && gpu_ != dev)
+                return fail("this plan was built for " + gpu_ + " but the GPU is " + dev + "; reinstall the plans for it (install.py "
+                            "--gpu " + dev + ")");
+            continue;
+        }
         if (w == "buffer") {
             std::string name, src, path;
             size_t size;

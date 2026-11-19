@@ -37,6 +37,23 @@ def need(tool):
         sys.exit(f'{tool} not found (needed to translate the kernels: LLVM with the AMDGPU target, lld, glslang)')
 
 
+def detect_gpu():
+    """LLVM target of this machine's AMD GPU from amdgpu's KFD topology (gfx_target_version 110001 -> gfx1101); the first
+    GPU node if there are several (pass --gpu to choose)."""
+    import glob
+    found = []
+    for p in sorted(glob.glob('/sys/class/kfd/kfd/topology/nodes/*/properties')):
+        try:
+            for line in open(p):
+                k, _, v = line.partition(' ')
+                if k == 'gfx_target_version' and int(v) > 0:
+                    v = int(v)
+                    found.append(f'gfx{v // 10000}{(v // 100) % 100:x}{v % 100:x}')
+        except OSError:
+            pass
+    return found
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--resources', required=True, help="MetalFX.framework/Versions/A/Resources of your macOS install")
@@ -51,6 +68,8 @@ def main():
     ap.add_argument('--line-locking', action='store_true', help="upscaler plans with MetalFX's line locking (about 0.06 ms)")
     ap.add_argument('--m4r-dll', default=os.path.join(ROOT, 'build-win', 'm4r.dll'))
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument('--gpu', help='GPU the kernels are built for: gfx1030-gfx1036 (RDNA2), gfx1100-gfx1103, gfx1150-gfx1153 '
+                                  '(RDNA3), gfx1200-gfx1201 (RDNA4); default: detected from this machine')
     ap.add_argument('--force', action='store_true', help='regenerate plans that exist')
     a = ap.parse_args()
 
@@ -62,6 +81,13 @@ def main():
         sys.exit(f'{a.m4r_dll} not found (build it with: cmake --build build-win, or pass --m4r-dll)')
     for t in ('llvm-as', 'opt', 'llc', 'ld.lld', 'glslangValidator'):
         need(t)
+
+    if not a.gpu:
+        gpus = detect_gpu()
+        if not gpus:
+            sys.exit('could not detect the GPU (no amdgpu KFD topology); pass --gpu, e.g. --gpu gfx1101')
+        a.gpu = gpus[0]
+        print(f'GPU: {a.gpu}' + (f' (first of {", ".join(gpus)}; pass --gpu to choose)' if len(set(gpus)) > 1 else ''))
 
     pairs = []
     for disp in a.display or [(1920, 1080), (2560, 1440), (3840, 2160)]:
@@ -93,7 +119,7 @@ def main():
     jobs = []   # (name, command)
     for disp, inp in pairs:
         tag = f'{disp[0]}x{disp[1]}-{inp[0]}x{inp[1]}'
-        common = ['--resources', a.resources, '--output', f'{disp[0]}x{disp[1]}', '--input', f'{inp[0]}x{inp[1]}']
+        common = ['--resources', a.resources, '--output', f'{disp[0]}x{disp[1]}', '--input', f'{inp[0]}x{inp[1]}', '--gpu', a.gpu]
         for rev, suffix in ((1, ''), (0, '-fwd')):
             if (rev and a.depth == 'forward') or (not rev and a.depth == 'reversed'):
                 continue

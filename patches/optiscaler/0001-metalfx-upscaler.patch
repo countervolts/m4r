@@ -130,7 +130,7 @@ index e2f1023..47bab6b 100644
  
      DLSSD, // "dlssd", used for the DLSS-D/Ray Reconstruction upscaler+denoiser backend
 +
-+    MetalFX, // "metalfx", Apple MetalFX ML temporal scaler via m4r (AMD RDNA3 under vkd3d-proton)
++    MetalFX, // "metalfx", Apple MetalFX ML temporal scaler via m4r (AMD RDNA2/3/4, vkd3d-proton)
 +
      Reset
  };
@@ -460,7 +460,7 @@ index 0000000..2e539b4
 +++ b/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h
 @@ -0,0 +1,31 @@
 +#pragma once
-+// MetalFX ML temporal upscaler (Apple's BBR network run by m4r on AMD RDNA3) for D3D12 games under vkd3d-proton.
++// MetalFX ML temporal upscaler (Apple's BBR network run by m4r on AMD RDNA2/3/4) for D3D12 games under vkd3d-proton.
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include <upscalers/IFeature_Dx12.h>
 +#include "M4R_D3D12.h"

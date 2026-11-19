@@ -15,7 +15,9 @@ is re-trained, approximated or replaced.
 
 ## What you need
 
-- Linux, an RDNA3 GPU (developed on an RX 7700 XT, gfx1101), Mesa RADV with `VK_EXT_descriptor_buffer`.
+- Linux, an AMD RDNA2, RDNA3 or RDNA4 GPU (gfx1030-gfx1036, gfx1100-gfx1103, gfx1150-gfx1153, gfx1200-gfx1201), Mesa RADV
+  with `VK_EXT_descriptor_buffer`. Developed and tested on an RX 7700 XT (gfx1101); RDNA2 and RDNA4 are built and validated on
+  that card (see [docs/mxu.md](docs/mxu.md#other-gpu-generations)) but not run on their own hardware yet.
 - LLVM with the AMDGPU target and lld (developed with LLVM 23.1), CMake, Ninja, glslang, Python 3.
 - **Your own MetalFX files** from macOS 27.2.1 (build 26B131): the framework's `Resources/` folder
   (`default.metallib`, `emit_*.dat`) and the MetalFX binary extracted from the dyld shared cache. m4r ships none
@@ -32,7 +34,7 @@ is re-trained, approximated or replaced.
 4. In `OptiScaler.ini`: `Dx12Upscaler=metalfx` for the upscaler, and for frame generation `[FrameGen] Enabled=true`,
    `FGInput=upscaler`, `FGOutput=metalfx` (or pick MetalFX in OptiScaler's menu).
 
-Only D3D12 games running under vkd3d-proton are supported, on RDNA3. Not tried in a real game yet; the tests use a D3D12
+Only D3D12 games running under vkd3d-proton are supported, on RDNA2/3/4 (plans are built for your GPU; `install.py` detects it). Not tried in a real game yet; the tests use a D3D12
 harness under Proton ([docs/optiscaler.md](docs/optiscaler.md)).
 
 ## Build

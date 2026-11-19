@@ -94,7 +94,7 @@ shown back to back. How well that paces is a guess; it is not a replacement for 
 | Menu entries | added; not seen on screen yet |
 
 Known limits: display-resolution motion vectors (the upscaler logs a warning, frame generation skips the frame),
-one plan per resolution pair, vkd3d-proton only, RDNA3 only (gfx1101 tested), frame generation interpolates the final image
+one plan per resolution pair and GPU, vkd3d-proton only, RDNA2/3/4 (only gfx1101 tested on hardware), frame generation interpolates the final image
 including the HUD (no hudless input), no dynamic resolution.
 
 The pipeline is deterministic: repeated runs give bit-identical frames (`tests/check_determinism.sh`).

@@ -21,11 +21,19 @@ struct Section { std::string name; uint32_t type = 0; uint64_t flags = 0, addr =
 constexpr uint32_t SHT_NOBITS = 8, SHT_SYMTAB = 2, SHT_DYNSYM = 11;
 constexpr uint64_t SHF_WRITE = 1, SHF_ALLOC = 2;
 
-// gfx11 encodings
-constexpr uint32_t GETPC_MASK = 0xff80ffffu, GETPC = 0xbe804700u;  // s_getpc_b64 s[n:n+1]
-constexpr uint32_t SOP2_OP_MASK = 0xff800000u, S_ADD_U32 = 0x80000000u, S_ADDC_U32 = 0x82000000u;
-constexpr uint32_t S_MOV_B32_LIT = 0xbe8000ffu;  // | sdst << 16
-constexpr uint32_t S_NOP = 0xbf800000u, S_BRANCH = 0xbfa00000u, S_CODE_END = 0xbf9f0000u;
+// Encodings of the instructions vkhip reads or writes, per generation (checked with llvm-mc). gfx12 keeps gfx11's;
+// gfx10.3 numbers its SOP1/SOPP opcodes differently.
+struct Isa { uint32_t getpc, movLit, branch, movB64; };   // movB64: s_mov_b64 s[0:1], s[0:1] (| sdst << 16 | ssrc0)
+constexpr Isa GFX10{0xbe801f00u, 0xbe8003ffu, 0xbf820000u, 0xbe800400u}, GFX11{0xbe804700u, 0xbe8000ffu, 0xbfa00000u, 0xbe800100u};
+constexpr uint32_t GETPC_MASK = 0xff80ffffu;   // s_getpc_b64 s[n:n+1]: n in bits 16..22
+constexpr uint32_t SOP2_OP_MASK = 0xff800000u, S_ADD_U32 = 0x80000000u, S_ADDC_U32 = 0x82000000u;   // same in gfx10-gfx12
+constexpr uint32_t S_NOP = 0xbf800000u, S_CODE_END = 0xbf9f0000u;
+const Isa& isa(int family) { return family == 10 ? GFX10 : GFX11; }
+// waits the compiler may put inside a getpc sequence: s_nop, gfx11 s_waitcnt_depctr / gfx12 s_wait_alu, gfx10 s_waitcnt_depctr
+bool hazardWait(uint32_t w, int family) {
+    const uint32_t hi = w & 0xffff0000u;
+    return hi == S_NOP || (family >= 11 ? hi == 0xbf880000u : hi == 0xbfa30000u);
+}
 
 // s_add_u32/s_addc_u32 sN, sN, literal (either operand order)
 bool sop2Literal(uint32_t w, uint32_t op, uint32_t reg) {
@@ -36,9 +44,18 @@ bool sop2Literal(uint32_t w, uint32_t op, uint32_t reg) {
 
 } // namespace
 
-uint32_t gfx11Mach(uint32_t gfxTargetVersion) {
+uint32_t gfx11Mach(uint32_t gfxTargetVersion) { return machOf(gfxTargetVersion); }
+
+uint32_t machOf(uint32_t gfxTargetVersion) {
     switch (gfxTargetVersion) {
-    case 110000: return 0x41;  // gfx1100
+    case 100300: return 0x36;  // gfx1030 (RDNA2)
+    case 100301: return 0x37;  // gfx1031
+    case 100302: return 0x38;  // gfx1032
+    case 100303: return 0x39;  // gfx1033
+    case 100304: return 0x3e;  // gfx1034
+    case 100305: return 0x3d;  // gfx1035
+    case 100306: return 0x45;  // gfx1036
+    case 110000: return 0x41;  // gfx1100 (RDNA3)
     case 110001: return 0x46;  // gfx1101
     case 110002: return 0x47;  // gfx1102
     case 110003: return 0x44;  // gfx1103
@@ -47,18 +64,30 @@ uint32_t gfx11Mach(uint32_t gfxTargetVersion) {
     case 110501: return 0x4a;  // gfx1151
     case 110502: return 0x55;  // gfx1152
     case 110503: return 0x58;  // gfx1153
+    case 120000: return 0x48;  // gfx1200 (RDNA4)
+    case 120001: return 0x4e;  // gfx1201
     default: return 0;
     }
 }
 
 bool gfx115Mach(uint32_t mach) { return mach == 0x43 || mach == 0x4a || mach == 0x55 || mach == 0x58; }
 
+int machFamily(uint32_t mach) {
+    switch (mach) {
+    case 0x36: case 0x37: case 0x38: case 0x39: case 0x3e: case 0x3d: case 0x45: return 10;
+    case 0x41: case 0x46: case 0x47: case 0x44: case 0x43: case 0x4a: case 0x55: case 0x58: return 11;
+    case 0x48: case 0x4e: return 12;
+    default: return 0;
+    }
+}
+
 bool Module::parse(const std::vector<uint8_t>& f) {
     mach = f.size() >= 64 ? rd<uint32_t>(f, 48) & 255 : 0;
-    if (f.size() < 64 || std::memcmp(f.data(), "\x7f" "ELF", 4) || f[4] != 2 || f[5] != 1 ||
-        rd<uint16_t>(f, 18) != 224 || (mach != 0x41 && mach != 0x46 && mach != 0x47 && mach != 0x44 && !gfx115Mach(mach))) {
-        error = "requires a little-endian gfx1100-gfx1103 or gfx1150-gfx1153 AMDGPU ELF64 code object"; return false;
+    family = machFamily(mach);
+    if (f.size() < 64 || std::memcmp(f.data(), "\x7f" "ELF", 4) || f[4] != 2 || f[5] != 1 || rd<uint16_t>(f, 18) != 224 || !family) {
+        error = "requires a little-endian RDNA2/3/4 (gfx103x, gfx110x, gfx115x, gfx120x) AMDGPU ELF64 code object"; return false;
     }
+    const Isa& I = isa(family);
     const uint64_t shoff = rd<uint64_t>(f, 0x28);
     const uint16_t shentsize = rd<uint16_t>(f, 0x3a), shnum = rd<uint16_t>(f, 0x3c), shstrndx = rd<uint16_t>(f, 0x3e);
     if (shentsize != 64 || shoff > f.size() || uint64_t(shnum) * 64 > f.size() - shoff || shstrndx >= shnum) { error = "bad section table"; return false; }
@@ -132,31 +161,35 @@ bool Module::parse(const std::vector<uint8_t>& f) {
     const size_t n = this->text.size() / 4;
     bool readsRodata = false;
     for (size_t i = 0; i + 4 < n; ++i) {
-        if ((w[i] & GETPC_MASK) != GETPC) continue;
+        if ((w[i] & GETPC_MASK) != I.getpc) continue;
         const uint32_t reg = (w[i] >> 16) & 0x7f;
-        // m4r: the compiler may put one hazard wait (s_waitcnt_depctr, s_nop) between the getpc and its add
-        const bool wait = i + 5 < n && ((w[i + 1] & 0xffff0000u) == 0xbf880000u || (w[i + 1] & 0xffff0000u) == S_NOP);
-        const size_t a = i + (wait ? 1 : 0);
-        if (!sop2Literal(w[a + 1], S_ADD_U32, reg) || !sop2Literal(w[a + 3], S_ADDC_U32, reg + 1)) {
-            error = "unhandled s_getpc_b64 at text+" + std::to_string(4 * i);
-            return false;
-        }
-        const int64_t offset = int64_t((uint64_t(w[a + 4]) << 32) | w[a + 2]);
+        // s_getpc_b64; hazard waits (any number, anywhere in the sequence); gfx12: s_sext_i32_i16 s[n+1] (its PC is 48 bits);
+        // s_add_u32 sN, sN, lit; s_addc_u32 sN+1, sN+1, lit
+        size_t a = i + 1;
+        auto skipWaits = [&] { while (a < n && hazardWait(w[a], family)) ++a; };
+        skipWaits();
+        if (family >= 12 && a < n && w[a] == (0xbe800f00u | ((reg + 1) << 16) | (reg + 1))) { ++a; skipWaits(); }
+        if (a + 1 >= n || !sop2Literal(w[a], S_ADD_U32, reg)) { error = "unhandled s_getpc_b64 at text+" + std::to_string(4 * i); return false; }
+        const uint32_t lo = w[a + 1];
+        a += 2;
+        skipWaits();
+        if (a + 1 >= n || !sop2Literal(w[a], S_ADDC_U32, reg + 1)) { error = "unhandled s_getpc_b64 at text+" + std::to_string(4 * i); return false; }
+        const uint32_t hi = w[a + 1];
+        const size_t end = a + 2;   // the sequence is [i, end)
+        const int64_t offset = int64_t((uint64_t(hi) << 32) | lo);
         const uint64_t target = textVa + 4 * (i + 1) + uint64_t(offset);
-        const uint32_t waitWord = wait ? w[i + 1] : 0;
         if (target >= dataLo && target < dataHi) {
-            sites.push_back(Site{uint32_t(i), reg, target, waitWord});
+            sites.push_back(Site{uint32_t(i), reg, target, uint32_t(end - i)});
         } else if (rodata >= 0 && target >= s[rodata].addr && target < s[rodata].addr + s[rodata].size) {
-            sites.push_back(Site{uint32_t(i), reg, target, waitWord});   // constant tables: mapped below, only for modules that read them
+            sites.push_back(Site{uint32_t(i), reg, target, uint32_t(end - i)});   // constant tables: mapped below, only for modules that read them
             readsRodata = true;
         } else if (target >= textVa && target < textVa + this->text.size()) {
             ++textGetpc;
-            i += wait ? 1 : 0;
         } else {
             error = "s_getpc_b64 at text+" + std::to_string(4 * i) + " addresses neither code nor data";
             return false;
         }
-        i += 4 + (wait ? 1 : 0);
+        i = end - 1;
     }
     if (readsRodata) {
         // m4r: the data image spans .rodata and the writable data, in whichever order the linker placed them
@@ -173,14 +206,18 @@ bool Module::parse(const std::vector<uint8_t>& f) {
     }
     for (const auto& [name, k] : kernels) {
         if (k.entry < textVa || k.entry >= textVa + this->text.size() || (k.entry - textVa) % 4) { error = name + ": entry outside .text"; return false; }
-        // Only the kernarg pointer (s[0:1]) is enabled and nothing is preloaded: any further user SGPRs are
-        // LLVM's UserSGPRInit16Bug padding (gfx1100/gfx1102), unread, and the kernel's rsrc2 places its
-        // workgroup ids after them.
+        // Only the kernarg pointer is enabled and nothing is preloaded, except on RDNA2: there LLVM always enables the private
+        // segment buffer (s[0:3], no architected flat scratch), so the kernarg pointer is s[4:5]; a kernel that uses no scratch
+        // never reads s[0:3], and createPipeline copies the push constant to s[4:5] first. Any further user SGPRs are LLVM's
+        // UserSGPRInit16Bug padding (gfx1100/gfx1102), unread, and the kernel's rsrc2 places its workgroup ids after them.
         const uint32_t user = (k.rsrc2 >> 1) & 0x1f;
         const uint32_t ids = uint32_t(std::popcount((k.rsrc2 >> 7) & 0xfu));  // tgid x/y/z, tg size (not the wave offset)
-        if ((k.props & 0x7f) != (1u << 3) || (k.preload & 0x7f) || user < 2 || (user > 2 && user + ids != 16)) {
+        const bool psb = k.props & 1u;
+        if ((k.props & 0x7e) != (1u << 3) || (k.preload & 0x7f) || user < 2 || (user > 2 && !(psb && user == 6) && user + ids != 16)) {
             error = name + ": not a kernarg-only kernel"; return false;
         }
+        if (psb && (k.scratch || (k.rsrc2 & 1u))) { error = name + ": uses scratch, which RDNA2 kernels cannot have here"; return false; }
+        kernels[name].kernargSgpr = psb ? 4 : 0;
         // wave32 or wave64 (props bit 10); the donor pipeline is created with the same subgroup size
     }
     return true;
@@ -189,15 +226,16 @@ bool Module::parse(const std::vector<uint8_t>& f) {
 std::vector<uint32_t> Module::patchedText(uint64_t dataAddress) const {
     std::vector<uint32_t> w(text.size() / 4);
     std::memcpy(w.data(), text.data(), text.size());
+    const Isa& I = isa(family);
     for (const auto& site : sites) {
+        // the whole sequence becomes two literal moves of the data address, padded with s_nop (same length)
         const uint64_t a = dataAddress + (site.target - dataLo);
-        uint32_t at = site.word;
-        if (site.wait) w[at++] = site.wait;   // the hazard wait first (waiting earlier is always allowed), then the moves
-        w[at + 0] = S_MOV_B32_LIT | (site.sdst << 16);
+        const uint32_t at = site.word;
+        w[at + 0] = I.movLit | (site.sdst << 16);
         w[at + 1] = uint32_t(a);
-        w[at + 2] = S_MOV_B32_LIT | ((site.sdst + 1) << 16);
+        w[at + 2] = I.movLit | ((site.sdst + 1) << 16);
         w[at + 3] = uint32_t(a >> 32);
-        w[at + 4] = S_NOP;
+        for (uint32_t k = 4; k < site.words; ++k) w[at + k] = S_NOP;
     }
     return w;
 }
@@ -297,7 +335,10 @@ VkPipeline createPipeline(const Device& vk, VkPipelineLayout layout, const Modul
             if (h) {
                 // the donor's config: LDS and user SGPRs must be what the kernel expects
                 const uint32_t donorRsrc2 = rd<uint32_t>(object, CFG + RSRC2);
-                if (((donorRsrc2 >> 1) & 0x1f) != 2) { fail("donor user SGPRs != 2 (push constant not inlined at s[0:1])"); bad = true; break; }
+                // the donor's user SGPRs: the push constant inlined, at s[0:1] (RDNA3) or after a ring-offsets pair
+                if (((donorRsrc2 >> 1) & 0x1f) != 2 && ((donorRsrc2 >> 1) & 0x1f) != 4) {
+                    fail("donor user SGPRs not 2 or 4 (push constant not inlined)"); bad = true; break;
+                }
                 // Fingerprint of the layout this code was written against (Mesa 26.2): a config whose fields do not
                 // agree with each other and with what the donor declares means the struct moved; refuse rather than
                 // patch the wrong words.
@@ -322,9 +363,16 @@ VkPipeline createPipeline(const Device& vk, VkPipelineLayout layout, const Modul
                 // code: s_branch to the entry, padding to 256 bytes, .text (its 256-byte alignment kept), tail
                 std::vector<uint32_t> code(64, S_NOP);
                 const uint64_t entryWord = 64 + (kernel.entry - module.textVa) / 4;
-                const int64_t simm = int64_t(entryWord) - 1;
+                // the push constant (the kernarg pointer) is the donor's last user SGPR pair; the kernel wants it at
+                // s[kernargSgpr]: one s_mov_b64 first when they differ, then the branch to the entry
+                const uint32_t donorUser = (donorRsrc2 >> 1) & 0x1f, kernelUser = (kernel.rsrc2 >> 1) & 0x1f;
+                const uint32_t pushAt = donorUser - 2;
+                if (pushAt + 2 > kernelUser) { fail("the donor's push constant lies beyond the kernel's user SGPRs"); bad = true; break; }
+                uint32_t at = 0;
+                if (pushAt != kernel.kernargSgpr) code[at++] = isa(module.family).movB64 | (kernel.kernargSgpr << 16) | pushAt;
+                const int64_t simm = int64_t(entryWord) - int64_t(at) - 1;
                 if (simm > 32767) { fail("entry beyond s_branch range"); bad = true; break; }
-                code[0] = S_BRANCH | uint32_t(simm & 0xffff);
+                code[at] = isa(module.family).branch | uint32_t(simm & 0xffff);
                 const auto text = module.patchedText(dataAddress);
                 code.insert(code.end(), text.begin(), text.end());
                 code.insert(code.end(), 64, S_CODE_END);

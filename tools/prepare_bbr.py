@@ -161,7 +161,7 @@ def build(args):
                     ir, man = m4r_air.translate(fuse_mod.fuse(text, fn, specs), fn, consts, tg)
                     try:
                         m4r_air.compile_ir(ir, base + '.hsaco')
-                        called = b's_swappc' in subprocess.run(['llvm-objdump', '-d', '--mcpu=gfx1101', base + '.hsaco'],
+                        called = b's_swappc' in subprocess.run(['llvm-objdump', '-d', f'--mcpu={m4r_air.GPU}', base + '.hsaco'],
                                                                capture_output=True, check=True).stdout
                     except RuntimeError:
                         called = True
@@ -273,7 +273,7 @@ def build(args):
     transpose_weight_tiles(out, plan)
     decl = [l for l in plan if l.split(' ', 1)[0] in ('buffer', 'texture', 'kernel', 'glsl')]
     rest = [l for l in plan if l.split(' ', 1)[0] not in ('buffer', 'texture', 'kernel', 'glsl')]
-    open(os.path.join(out, 'plan.txt'), 'w').write('\n'.join(decl + rest) + '\n')
+    open(os.path.join(out, 'plan.txt'), 'w').write('\n'.join([f'gpu {m4r_air.GPU}'] + decl + rest) + '\n')
     print(f'{len(kernels)} kernels, plan with {sum(1 for p in plan if p.startswith("pass"))} passes -> {out}')
 
 
@@ -512,8 +512,11 @@ if __name__ == '__main__':
     ap.add_argument('--out', required=True)
     ap.add_argument('--force', action='store_true')
     ap.add_argument('--input', required=True, type=lambda s: [int(x) for x in s.split('x')], help='max input size')
+    ap.add_argument('--gpu', default=m4r_air.GPU, help='target GPU (' + ', '.join(m4r_air.GPUS) + ')')
     ap.add_argument('--reversed-depth', type=int, default=1)
     ap.add_argument('--line-locking', action='store_true',
                     help="MetalFX's line locking (thin-line stability; MetalFX leaves it off unless an app compatibility flag "
                          'sets it): two lock-counter textures, about 0.06 ms at 2560x1440')
-    build(ap.parse_args())
+    args = ap.parse_args()
+    m4r_air.set_gpu(args.gpu)
+    build(args)

@@ -81,3 +81,30 @@ entering a loop is converted once in the block before it, a value read after a l
 instructions, so the results are bit-identical (every output frame of the synthetic and the captured game fixtures). At
 1280x720 -> 2560x1440: first layer 0.50 -> 0.31 ms, SBBRNet 0.43 -> 0.28, each 32-channel 3x3 convolution 0.31 -> 0.17; the
 upscaler 3.79 -> 2.96 ms. Masked MXU loads and stores with a full mask are single vector accesses (MetalFX passes 15 or 0).
+
+## Other GPU generations
+
+Plans are built for one GPU (`install.py --gpu`, detected from the amdgpu KFD topology by default; the plan's first line names
+it and the runtime refuses a plan built for another GPU, which it identifies from the chip name RADV reports). Every
+generation runs the same lowering, written against RDNA3's WMMA instructions and register layout (including the GEMM chains
+and the weights read straight into WMMA layout); only the two instructions are executed differently (`air/m4r_air.py
+wmma_impl`, `air/intrinsics.py wmma_impl_defs`; `M4R_WMMA_IMPL` overrides):
+
+| GPUs | how `v_wmma_*_16x16x16` runs |
+|---|---|
+| RDNA3, RDNA 3.5 (gfx110x, gfx115x) | natively |
+| RDNA4 (gfx120x) | gfx12's WMMA: its operands hold 8 of the 16 k (half h: k 8h .. 8h + 7), so each lane passes its half of the gfx11 operand; its accumulators hold row i + 8h in VGPR i instead of row 2i + h, converted with one cross-half exchange (`v_permlanex16`) per register before and after |
+| RDNA2 (gfx103x, no WMMA) | software: each accumulator element is the chain of `v_dot2c_f32_f16` (fp16) or `v_dot4_*` (int8) over k in increasing order starting from C, the A row broadcast with DPP `row_share` (half 1 first rotated by one lane with `row_ror`, so that row_share n reads row n + 1 there). One inline-asm statement per output row: otherwise LLVM merges the broadcasts of products sharing their A operand and keeps them alive across them, which spilled (and RDNA2 kernels may not use scratch, below) |
+
+Validated on the RX 7700 XT (gfx1101), all six captured game frames bit-identical to the native build:
+`M4R_WMMA_IMPL=soft` (the RDNA2 code, with gfx11's name of the same fused DPP dot instruction, `v_dot2acc_f32_f16`) and
+`M4R_WMMA_IMPL=gfx12emu` (the RDNA4 conversions around an emulation of gfx12's WMMA built from gfx11's, as d4r's layout shim).
+On that card the soft path takes 4.2 ms per 1440p Performance frame and the native one 2.0 ms. Not checked: whether
+`v_dot2c_f32_f16` on an RDNA2 GPU rounds as RDNA3's WMMA does (the formula is the same either way), and anything on RDNA2 or
+RDNA4 hardware.
+
+vkhip (runtime/vkhip) knows each generation's encodings of the instructions it patches (gfx10.3 numbers `s_getpc_b64`,
+`s_mov_b32`, `s_branch`, `s_mov_b64` differently; gfx12 keeps gfx11's) and gfx12's getpc sequence (`s_sext_i32_i16` and
+`s_wait_alu` inside it). RDNA2 has no architected flat scratch, so LLVM gives every kernel the private segment buffer in
+s[0:3] and the kernarg pointer in s[4:5]: vkhip copies the push constant there first (`s_mov_b64`) and refuses kernels that
+use scratch. `tests/vkhip_parse` checks the parsing and patching of code objects for any generation without a GPU.

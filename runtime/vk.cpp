@@ -1,6 +1,7 @@
 // m4r: minimal Vulkan context (see vk.h).
 // SPDX-License-Identifier: GPL-3.0-only
 #include "vk.h"
+#include <cstdlib>
 #include <cstdio>
 
 namespace m4r {
@@ -66,6 +67,7 @@ bool Context::create() {
     vkGetPhysicalDeviceMemoryProperties(physical, &memProps);
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &descProps};
     vkGetPhysicalDeviceProperties2(physical, &p2);
+    gpu = gpuTarget(p2.properties.deviceName);
     getDescriptor = reinterpret_cast<PFN_vkGetDescriptorEXT>(vkGetDeviceProcAddr(device, "vkGetDescriptorEXT"));
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; pci.queueFamilyIndex = queueFamily;
@@ -77,11 +79,31 @@ bool Context::create() {
     return createBuffer(records, 1 << 20, true);
 }
 
+std::string gpuTarget(const char* deviceName) {
+    if (const char* o = std::getenv("M4R_GPU")) return o;
+    static const struct { const char* chip; const char* gfx; } chips[] = {
+        {"NAVI21", "gfx1030"}, {"NAVI22", "gfx1031"}, {"NAVI23", "gfx1032"}, {"VANGOGH", "gfx1033"}, {"NAVI24", "gfx1034"},
+        {"REMBRANDT", "gfx1035"}, {"RAPHAEL_MENDOCINO", "gfx1036"},
+        {"NAVI31", "gfx1100"}, {"NAVI32", "gfx1101"}, {"NAVI33", "gfx1102"}, {"GFX1103_R1", "gfx1103"}, {"GFX1103_R2", "gfx1103"},
+        {"PHOENIX", "gfx1103"}, {"GFX1150", "gfx1150"}, {"GFX1151", "gfx1151"}, {"GFX1152", "gfx1152"}, {"GFX1153", "gfx1153"},
+        {"GFX1200", "gfx1200"}, {"NAVI44", "gfx1200"}, {"GFX1201", "gfx1201"}, {"NAVI48", "gfx1201"},
+    };
+    const std::string n = deviceName;
+    const size_t r = n.find("(RADV ");
+    if (r == std::string::npos) return {};
+    std::string chip = n.substr(r + 6);
+    chip = chip.substr(0, chip.find(')'));
+    for (const auto& c : chips)
+        if (chip == c.chip) return c.gfx;
+    return {};
+}
+
 bool Context::adopt(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t family) {
     instance = inst; physical = phys; device = dev; queueFamily = family; ownsDevice = false;
     vkGetPhysicalDeviceMemoryProperties(physical, &memProps);
     VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &descProps};
     vkGetPhysicalDeviceProperties2(physical, &p2);
+    gpu = gpuTarget(p2.properties.deviceName);
     getDescriptor = reinterpret_cast<PFN_vkGetDescriptorEXT>(vkGetDeviceProcAddr(device, "vkGetDescriptorEXT"));
     if (!getDescriptor) { error = "VK_EXT_descriptor_buffer is not enabled on the game's device"; return false; }
     if (descProps.sampledImageDescriptorSize > 32 || descProps.storageImageDescriptorSize > 32 || descProps.samplerDescriptorSize > 16) {
