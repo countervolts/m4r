@@ -64,9 +64,11 @@ are recorded into the game's own command list through `BeginVkCommandBufferInter
 jitter is passed as it is; m4r negates it internally (MetalFX's convention). m4r expects the sample offset, i.e. the frame
 was rendered at pixel + 0.5 + jitter. `[MetalFX] FlipJitter` is for games that report the opposite sign; whether one does can
 be measured instead of judged by eye: in static pixels of two consecutive captured inputs (`M4R_DUMP_UP`) the content shifts by
-the jitter difference (a least-squares gradient fit gives the shift). Ghost of Tsushima measured -1x the passed difference with
-FlipJitter=true in every frame, so it needs the default (false); with the wrong sign the history is merged at mirrored
-sub-pixel positions (softer each frame, shimmering).
+the difference of the true sample offsets (a search over candidate shifts, warping the earlier frame, gives it; a plain gradient
+fit underestimates on aliased content). Compare with the `jitter` lines of the capture, which are the values m4r received,
+i.e. after FlipJitter: capture with FlipJitter off to see the game's own sign. Ghost of Tsushima's raw jitter measured -1x the
+true offset at Performance and Ultra Performance (captures taken with FlipJitter off), so it needs FlipJitter=true; with the
+wrong sign the history is merged at mirrored sub-pixel positions (soft, smeared detail, shimmer).
 
 Exposure: when the game gives no exposure texture (DLSS AutoExposure, as Ghost of Tsushima), m4r runs MetalFX's own auto
 exposure (`luma_log_sum`, `luma_log_sum_to_exposure`, as MetalFX does for a descriptor with auto exposure enabled) instead of a
