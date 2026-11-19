@@ -222,6 +222,80 @@ def half_division_in_f32(text):
                   rep, text, flags=re.M)
 
 
+def pair_simd_sums(text):
+    """Two independent half simd_sums of a basic block become one simd_sum of a <2 x half> pair (air.simd_sum.v2f16): each
+    half of the pair goes through the same butterfly in the same order, so the results are the same, with one lane shuffle
+    per step instead of two (findOpticalMotionVectorsV3 sums ~290 independent costs per thread). The first sum of a pair moves
+    to the second one's place, so it is paired only when nothing reads it in between."""
+    call = re.compile(r'^(\s*)(%[-\w.]+) = tail call fast half @air\.simd_sum\.f16\(half ([^)]+)\)(.*)$')
+    out_fns, i, lines, changed = [], 0, text.split('\n'), False
+    res = []
+    while i < len(lines):
+        if not lines[i].startswith('define '):
+            res.append(lines[i]); i += 1
+            continue
+        j = i
+        while lines[j] != '}':
+            j += 1
+        fn = lines[i:j + 1]
+        if sum(1 for ln in fn if call.match(ln)) >= 2:
+            nparams = len(intrinsics.split_params(re.match(r'define [^(]*\((.*)\)[^)]*\{$', fn[0]).group(1))) \
+                if re.match(r'define [^(]*\((.*)\)[^)]*\{$', fn[0]) else 0
+            # numbered values of the body become named, so a definition can move
+            def ren(m):
+                return f'%m4rv{m.group(1)}' if int(m.group(1)) >= nparams else m.group(0)
+            body = [re.sub(r'%(\d+)(?![\w.])', ren, ln) for ln in fn[1:-1]]
+            body = [re.sub(r'^(\d+):', lambda m: f'm4rv{m.group(1)}:' if int(m.group(1)) >= nparams else m.group(0), ln) for ln in body]
+            first = next((x for x in body if x.strip() and not x.strip().startswith(';')), '')
+            if not re.match(r'^[-\w.$"]+:', first):   # the entry block's implicit number is now a name
+                body.insert(0, f'm4rv{nparams}:')
+            k, npair = 0, 0
+            while k < len(body):
+                m1 = call.match(body[k])
+                if not m1:
+                    k += 1; continue
+                r1, a1 = m1.group(2), m1.group(3).strip()
+                # readers of r1 before the next sum (and what depends on them) move after the pair when they are plain
+                # arithmetic / selects / compares and do not feed the next sum
+                dep, moved_lines, q, ok = {r1}, [], k + 1, True
+                while q < len(body) and not call.match(body[q]) and not re.match(r'^[-\w.$"]+:', body[q]) \
+                        and not re.match(r'^\s*(br|switch|ret|unreachable)\b', body[q]):
+                    ln = body[q]
+                    if any(re.search(re.escape(d) + r'(?![-\w.])', ln) for d in dep):
+                        dm = re.match(r'^\s*(%[-\w.]+) = (\w+)', ln)
+                        if not dm or dm.group(2) in ('call', 'tail', 'load', 'store', 'atomicrmw', 'cmpxchg', 'fence', 'phi'):
+                            ok = False
+                            break
+                        dep.add(dm.group(1))
+                        moved_lines.append(q)
+                    q += 1
+                m2 = call.match(body[q]) if ok and q < len(body) else None
+                if not m2 or any(re.search(re.escape(d) + r'(?![-\w.])', m2.group(3)) for d in dep):
+                    k += 1; continue
+                ind, r2, a2 = m2.group(1), m2.group(2), m2.group(3).strip()
+                npair += 1
+                pk = f'%m4rpk{npair}'
+                body[q] = (f'{ind}{pk}.a = insertelement <2 x half> poison, half {a1}, i32 0\n'
+                           f'{ind}{pk}.b = insertelement <2 x half> {pk}.a, half {a2}, i32 1\n'
+                           f'{ind}{pk}.s = tail call fast <2 x half> @air.simd_sum.v2f16(<2 x half> {pk}.b){m2.group(4)}\n'
+                           f'{ind}{r1} = extractelement <2 x half> {pk}.s, i32 0\n'
+                           f'{ind}{r2} = extractelement <2 x half> {pk}.s, i32 1')
+                body[q] += ''.join('\n' + body[x] for x in moved_lines)
+                for x in moved_lines:
+                    body[x] = None
+                body[k] = None
+                k = q + 1
+            if npair:
+                changed = True
+                fn = [fn[0]] + [ln for ln in body if ln is not None] + [fn[-1]]
+        res += fn
+        i = j + 1
+    text = '\n'.join(res)
+    if changed and 'declare <2 x half> @air.simd_sum.v2f16' not in text:
+        text += '\ndeclare <2 x half> @air.simd_sum.v2f16(<2 x half>) #0\n'.replace(' #0', '')
+    return text
+
+
 def translate(text, kernel, constants, tg, wave=32, widen=False):
     """Return (amdgpu IR text, manifest dict)."""
     args = kernel_info(text, kernel)
@@ -318,8 +392,10 @@ def translate(text, kernel, constants, tg, wave=32, widen=False):
         return f'attributes #{m.group(1)} = {{{body}}}'
     text = re.sub(r'^attributes #(\d+) = \{(.*)\}$', fix_attrs, text, flags=re.M)
 
-    # 7a. half divisions in f32 (see half_division_in_f32)
+    # 7a. half divisions in f32 (see half_division_in_f32); independent half simd_sums in pairs (see pair_simd_sums)
     text = half_division_in_f32(text)
+    if os.environ.get('M4R_PAIR_SUMS', '1') != '0':
+        text = pair_simd_sums(text)
 
     # 7b. on inlined, scalarised IR, before the intrinsics get bodies: GEMM accumulators in WMMA layout (air/gemm_chain.py) and
     # the optional widening of half arithmetic (air/widen.py)

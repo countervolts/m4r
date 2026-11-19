@@ -272,6 +272,8 @@ def lane_id(b):
 def to_i32_parts(b, t, v):
     """Split a value into a list of i32 words (for bpermute) and return (parts, rebuild)."""
     n, e = vec(t)
+    if n == 2 and e in ('half', 'i16'):   # one 32-bit word: a packed pair moves through a lane shuffle as one value
+        return [b.v(f'bitcast {t} {v} to i32')], (lambda words: b.v(f'bitcast i32 {words[0]} to {t}'))
     parts = []
     for i in range(n):
         x = v if n == 1 else b.v(f'extractelement {t} {v}, i32 {i}')
