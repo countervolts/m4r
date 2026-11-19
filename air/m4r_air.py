@@ -615,7 +615,7 @@ def translate(text, kernel, constants, tg, wave='auto', widen=False):
     if not m:
         raise ValueError('kernel definition not found')
     ret_type = m.group(1)
-    params = [re.sub(r'\s*%\d+$', '', intrinsics.clean_type(p)).strip() for p in intrinsics.split_params(m.group(2))]
+    params = [re.sub(r'\s*%[-\w.]+$', '', intrinsics.clean_type(p)).strip() for p in intrinsics.split_params(m.group(2))]
     inner = '__air_' + kernel
     head = m.group(0).replace('define ', 'define internal ', 1).replace('@' + kernel + '(', '@' + inner + '(', 1)
     if uses_imageblock:

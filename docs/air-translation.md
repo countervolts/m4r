@@ -69,6 +69,14 @@ From the seven distinct states MetalFX uses and the coordinates the kernels pass
 - LLVM 23's gfx11 true-16-bit register mode miscompiles `findOpticalMotionVectorsV3/Ref` ("expected inline
   constant"); kernels are built with `-real-true16`.
 
+## Kernel fusion
+
+`air/fuse.py` merges a producer kernel that writes one texel per thread into the consumer that reads that texel back
+(`tools/prepare_bbr.py`, `M4R_FUSE=0` turns it off): BBRNetWarpHistory and BBRNetComputeOvershootClamp run inside
+BBRNetAnisoGaussian, so flowAdjHistory and overshootClamp (two RGBA16F textures at output size) are never stored. The history
+those producers read is double-buffered (`hist0|hist1`). Output is bit-identical; at 1280x720 -> 2560x1440 the three passes
+took 0.85 ms and the fused one 0.54 ms. The module docstring lists what keeps the consumer's code generation unchanged.
+
 ## Not done yet
 
 - compute-kernel imageblocks (`air.imageblock_data`, `write_imageblock_slice_to_texture_2d`): the `unified_*_tile` kernels

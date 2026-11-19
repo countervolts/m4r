@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), 'air'))
 import bbr_params  # noqa: E402
 import metallib  # noqa: E402
 import m4r_air  # noqa: E402
+import fuse as fuse_mod  # noqa: E402
 from macho import MachO  # noqa: E402
 
 TBBR_SIZE = 288576
@@ -138,21 +139,33 @@ def build(args):
         plan.append(f'buffer {name} {max(16, int(size))}')
         return name
 
-    def kernel(fn, consts, tg):
-        key = m4r_air.specialization_key(fn, {k: str(v) for k, v in consts.items()}, tg, hashlib.sha256(m.mtl).hexdigest()[:16])
+    def source(fn):
+        if fn not in src_cache:
+            f = next(f for f in m.lib['functions'] if f.name == fn)
+            src_cache[fn] = m4r_air.to_text(metallib.bitcode(m.mtl, m.lib, f))
+        return src_cache[fn]
+
+    def kernel(fn, consts, tg, fuse=None):
+        """fuse: producers merged into this kernel (air/fuse.py), [{kernel, out_loc, read_loc, grid, base, bind_map}]"""
+        src = hashlib.sha256(m.mtl).hexdigest()[:16]
+        if fuse:
+            src = hashlib.sha256((src + json.dumps(fuse, sort_keys=True)).encode()).hexdigest()[:16]
+        key = m4r_air.specialization_key(fn, {k: str(v) for k, v in consts.items()}, tg, src)
         name = f'{fn}-{key}'
         if name not in kernels:
             base = os.path.join(out, 'k', name)
             if not os.path.exists(base + '.hsaco') or args.force:
-                if fn not in src_cache:
-                    f = next(f for f in m.lib['functions'] if f.name == fn)
-                    src_cache[fn] = m4r_air.to_text(metallib.bitcode(m.mtl, m.lib, f))
-                ir, man = m4r_air.translate(src_cache[fn], fn, consts, tg)
+                text = source(fn)
+                if fuse:
+                    text = fuse_mod.fuse(text, fn, [dict(p, text=source(p['kernel']),
+                                                         bind_map={(a, b): c for a, b, c in p['bind_map']}) for p in fuse])
+                ir, man = m4r_air.translate(text, fn, consts, tg)
                 m4r_air.compile_ir(ir, base + '.hsaco')
                 m4r_air.write_manifest(man, base)
             kernels[name] = fn
             plan.append(f'kernel {name} k/{name}')
         return name
+    kernel.source = source
 
     def dispatch(k, mode, grid, binds):
         plan.append(f'pass {k} {mode} {grid[0]} {grid[1]} {grid[2]}')
@@ -254,6 +267,63 @@ def build(args):
     print(f'{len(kernels)} kernels, plan with {sum(1 for p in plan if p.startswith("pass"))} passes -> {out}')
 
 
+def _bind_key(b):
+    w = b.split()
+    return ('t' if w[0] == 'tex' else 'b', int(w[1]))
+
+
+def _state(lines):
+    """Bindings in force after `lines` (Metal keeps a binding until it is replaced; runtime/plan.cpp does the same)."""
+    st = {}
+    for ln in lines:
+        s = ln.strip()
+        if s.split(' ', 1)[0] in ('buf', 'tex', 'bytes'):
+            st[_bind_key(s)] = s
+    return st
+
+
+def fused_pass(kernel, lines, fn, binds, grid, producers, consts, tg):
+    """One pass of `fn` with the producers merged in (air/fuse.py). Bindings are listed in full: the effective bindings of
+    each pass at its place in the unfused plan (its own, then those inherited from earlier passes)."""
+    st = _state(lines)
+    effs = []
+    for _, pb, *_ in producers:
+        st = dict(st); st.update({_bind_key(b): b for b in pb}); effs.append(st)
+    sa = dict(st); sa.update({_bind_key(b): b for b in binds})
+    cargs = m4r_air.kernel_info(kernel.source(fn), fn)
+
+    def res(b):
+        w = b.split(' ', 2)
+        return (w[0], w[2])
+    out = []
+    for a in cargs:
+        k = {'air.texture': 't', 'air.buffer': 'b'}.get(a['kind'])
+        if k and a.get('location') is not None and (k, a['location']) in sa:
+            out.append(sa[(k, a['location'])])
+    specs = []
+    for pi, ((pfn, _, out_loc, read_loc, pgrid), pst) in enumerate(zip(producers, effs)):
+        base = 100 * (pi + 1)
+        bm = []
+        for a in m4r_air.kernel_info(kernel.source(pfn), pfn):
+            k = {'air.texture': 't', 'air.buffer': 'b'}.get(a['kind'])
+            if not k or (k == 't' and a.get('location') == out_loc):
+                continue
+            b = pst.get((k, a['location']))
+            if b is None:
+                raise ValueError(f'{pfn}: nothing bound at {k} {a["location"]}')
+            same = [ca for ca in cargs if ca['kind'] == a['kind'] and ca.get('location') is not None
+                    and (k, ca['location']) in sa and res(sa[(k, ca['location'])]) == res(b)
+                    and ca.get('address_space') == a.get('address_space') and ca.get('access', 'read') in ('read', 'sample')]
+            if same:
+                bm.append([a['kind'][4:], a['location'], same[0]['location']])
+            else:
+                w = b.split(' ', 2)
+                out.append(f'{w[0]} {base + a["location"]} {w[2]}')
+        specs.append({'kernel': pfn, 'out_loc': out_loc, 'read_loc': read_loc, 'grid': list(pgrid), 'base': base, 'bind_map': bm})
+    k = kernel(fn, consts, list(tg), fuse=specs)
+    return f'pass {k} threads {grid[0]} {grid[1]} {grid[2]}\n' + '\n'.join('  ' + b for b in out)
+
+
 def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
     """Everything around the networks: BBRNet_Filter::encodePre / sBBRNet / encodeMid / encodePost and the
     sacneh history prefilter (see docs/metalfx-bbr.md for where each binding comes from)."""
@@ -273,7 +343,7 @@ def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
 
     tex('crr', 'R16G16B16A16_SFLOAT', iw, ih); tex('flowd', 'R16G16_SFLOAT', iw, ih)
     tex('fah', 'R16G16B16A16_SFLOAT', ow, oh); tex('clampt', 'R16G16B16A16_SFLOAT', ow, oh)
-    tex('hist', 'R16G16B16A16_SFLOAT', ow, oh)
+    tex('hist0', 'R16G16B16A16_SFLOAT', ow, oh); tex('hist1', 'R16G16B16A16_SFLOAT', ow, oh)
     tex('ema0', 'R16_SFLOAT', ow // 2, oh // 2); tex('ema1', 'R16_SFLOAT', ow // 2, oh // 2)
     tex('hw0', 'R8G8_UNORM', ow, oh); tex('hw1', 'R8G8_UNORM', ow, oh)
     tex('splat', 'R16G16_SFLOAT', iw, ih); tex('diff', 'R8_UNORM', iw, ih)
@@ -301,7 +371,7 @@ def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
        'buf 3 exp0|exp1', 'buf 4 exp1|exp0'])
     d('buildSpatialTensor', 'threads', (ow, oh, 1), ['buf 0 spatial_in', 'tex 0 crr', 'buf 1 params'])
     d('buildTemporalTensor', 'threads', (((ow + 15) >> 1) & ~7, ((oh + 15) >> 1) & ~7, 1),
-      ['tex 0 crr', 'tex 1 flowd', 'tex 2 hist', 'tex 4 ema0|ema1', 'tex 6 ema1|ema0', 'tex 8 temporal_tex',
+      ['tex 0 crr', 'tex 1 flowd', 'tex 2 hist0|hist1', 'tex 4 ema0|ema1', 'tex 6 ema1|ema0', 'tex 8 temporal_tex',
        'tex 9 rnn_tex', 'buf 0 temporal_in', 'buf 1 params', 'buf 2 temporal_out', 'buf 3 exp0|exp1',
        'buf 4 exp1|exp0', 'buf 5 hinv', 'buf 6 temporal_in_u8', 'buf 7 temporal_in_f16'], tg=(16, 16, 1))
     i = plan.index('#PRE')
@@ -340,17 +410,26 @@ def frame_passes(m, args, plan, blob, buffer, kernel, dispatch, sizes):
     d('BBRNet_flow_splat', 'threads', (iw, ih, 1), ['tex 0 flowd', 'tex 1 depth', 'buf 0 splatbuf', 'buf 1 params'], {'#5': rev})
     d('brnetv3_flow_splat_texture', 'threads', (iw, ih, 1), ['tex 0 flowd', 'tex 1 splat', 'buf 0 splatbuf'])
     d('BBRNet_flow_diff_texture', 'threads', (iw, ih, 1), ['tex 0 flowd', 'tex 1 splat', 'tex 2 diff'])
-    d('BBRNetWarpHistory', 'threads', (ow, (oh + 3) // 4, 1),
-      ['tex 0 crr', 'tex 2 flowd', 'tex 3 fah', 'tex 6 hist', 'tex 7 color', 'buf 2 exp0|exp1', 'buf 3 exp1|exp0',
-       'buf 4 hinv', 'buf 5 preexp', 'buf 6 hist_t0'], tg=(16, 8, 1))
-    d('BBRNetComputeOvershootClamp', 'threads', (ow, oh, 1), ['tex 2 flowd', 'tex 6 hist', 'tex 7 color', 'tex 8 clampt'], tg=(16, 16, 1))
+    warp = ['tex 0 crr', 'tex 2 flowd', 'tex 3 fah', 'tex 6 hist0|hist1', 'tex 7 color', 'buf 2 exp0|exp1', 'buf 3 exp1|exp0',
+            'buf 4 hinv', 'buf 5 preexp', 'buf 6 hist_t0']
+    clamp = ['tex 2 flowd', 'tex 6 hist0|hist1', 'tex 7 color', 'tex 8 clampt']
     # encodePost
-    post = ['buf 0 params', 'tex 0 crr', 'tex 1 fah', 'tex 6 hw0|hw1', 'tex 3 output', 'tex 4 hist', 'tex 8 hw1|hw0',
+    post = ['buf 0 params', 'tex 0 crr', 'tex 1 fah', 'tex 6 hw0|hw1', 'tex 3 output', 'tex 4 hist1|hist0', 'tex 8 hw1|hw0',
             'tex 5 diff', 'tex 7 flowd', 'tex 10 clampt', 'tex 11 temporal_tex', 'buf 1 cpf', 'buf 2 hinv',
             'buf 3 preexp', 'buf 4 exp0|exp1', 'buf 6 spatial_out', 'buf 10 hist_t1']
     if not fused:
         post += ['tex 9 rnn_tex', 'buf 5 temporal_out']
-    d('BBRNetAnisoGaussian', 'threads', ((ow + 15) & ~15, (oh + 15) & ~15, 1), post, tg=(16, 16, 1))
+    ag_grid = ((ow + 15) & ~15, (oh + 15) & ~15, 1)
+    if os.environ.get('M4R_FUSE', '1') == '0':
+        d('BBRNetWarpHistory', 'threads', (ow, (oh + 3) // 4, 1), warp, tg=(16, 8, 1))
+        d('BBRNetComputeOvershootClamp', 'threads', (ow, oh, 1), clamp, tg=(16, 16, 1))
+        d('BBRNetAnisoGaussian', 'threads', ag_grid, post, tg=(16, 16, 1))
+    else:
+        # WarpHistory and OvershootClamp computed inside AnisoGaussian at the pixel it reads (air/fuse.py): flowAdjHistory and
+        # overshootClamp are never stored; the history they read is the previous frame's (hist0|hist1), so the fused kernel's
+        # history write cannot be seen by them
+        producers = [('BBRNetWarpHistory', warp, 3, 1, (ow, (oh + 3) // 4)), ('BBRNetComputeOvershootClamp', clamp, 8, 10, (ow, oh))]
+        pre.append(fused_pass(kernel, plan + pre, 'BBRNetAnisoGaussian', post, ag_grid, producers, dict(fc), (16, 16, 1)))
     pre.append('glsl sacneh sacneh.spv 32 8 1')
     taps = m.sacneh()
     blob('sac_x', taps[0]); blob('sac_y', taps[1])
