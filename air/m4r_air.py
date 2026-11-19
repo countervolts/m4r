@@ -222,6 +222,155 @@ def half_division_in_f32(text):
                   rep, text, flags=re.M)
 
 
+def named_body(fn):
+    """Body lines of a function (fn = its lines from `define` to `}`) with the numbered values and blocks renamed (%m4rv<n>),
+    so definitions can move or disappear; parameters keep their numbers."""
+    m = re.match(r'define [^(]*\((.*)\)[^)]*\{$', fn[0])
+    nparams = len(intrinsics.split_params(m.group(1))) if m else 0
+
+    def ren(m):
+        return f'%m4rv{m.group(1)}' if int(m.group(1)) >= nparams else m.group(0)
+    body = [re.sub(r'%(\d+)(?![\w.])', ren, ln) for ln in fn[1:-1]]
+    body = [re.sub(r'^(\d+):', lambda m: f'm4rv{m.group(1)}:' if int(m.group(1)) >= nparams else m.group(0), ln) for ln in body]
+    first = next((x for x in body if x.strip() and not x.strip().startswith(';')), '')
+    if not re.match(r'^[-\w.$"]+:', first):   # the entry block's implicit number is now a name
+        body.insert(0, f'm4rv{nparams}:')
+    return body
+
+
+def scatter_simd_sums(text, lane):
+    """32 half simd_sums that each end up in one lane become one reduce-scatter (air.simd_sum_scatter32.f16).
+
+    findOpticalMotionVectorsV3 scores its candidates 32 at a time: candidate K's cost is a simd_sum, and a chain
+    `v = select(lane != K, v, sum_K)` over K = 0..31 (in some order) leaves candidate K's sum in lane K. With all 32 sums
+    (and the chain values) used nowhere else, the chain is the same as a reduce-scatter of the 32 per-lane inputs ordered by K.
+    The lowering (intrinsics.sum_scatter32) halves the set of values at each xor step 1, 2, 4, 8, 16, the order of the
+    simd_sum butterfly, so every candidate's sum is the same addition tree as before: bit-identical, with 31 lane moves per 32
+    sums instead of 160 and no selects. `lane` is the kernel's thread_index_in_simdgroup parameter (e.g. '%2')."""
+    call = re.compile(r'^\s*(%[-\w.]+) = tail call fast half @air\.simd_sum\.f16\(half ([^)]+)\)( #\d+)?.*$')
+    cmp_re = re.compile(r'^\s*(%[-\w.]+) = icmp ne i16 ' + re.escape(lane) + r', (\d+)\s*$')
+    sel_re = re.compile(r'^(\s*)(%[-\w.]+) = select (?:fast )?i1 (%[-\w.]+), half ([^,]+), half (%[-\w.]+)\s*$')
+    fabs_re = re.compile(r'^\s*(%[-\w.]+) = tail call fast <2 x half> @air\.fabs\.v2f16\(<2 x half> (%[-\w.]+)\)( #\d+)?\s*$')
+    dot_re = re.compile(r'^\s*(%[-\w.]+) = tail call fast half @air\.dot\.v2f16\(<2 x half> (%[-\w.]+), '
+                        r'<2 x half> (?:<half 0xH3C00, half 0xH3C00>|splat \(half (?:0xH3C00|1\.000000e\+00)\))\)( #\d+)?\s*$')
+    absd = False
+    lines, res, i, changed = text.split('\n'), [], 0, False
+    while i < len(lines):
+        if not lines[i].startswith('define '):
+            res.append(lines[i]); i += 1
+            continue
+        j = i
+        while lines[j] != '}':
+            j += 1
+        fn = lines[i:j + 1]
+        i = j + 1
+        if sum(1 for ln in fn if call.match(ln)) < 32:
+            res += fn
+            continue
+        body = named_body(fn)
+        uses = {}
+        for ln in body:
+            for t in re.findall(r'%[-\w.]+', ln.split(' = ', 1)[1] if re.match(r'^\s*%[-\w.]+ = ', ln) else ln):
+                uses[t] = uses.get(t, 0) + 1
+        lanes = {}                  # icmp result -> K
+        sums = {}                   # simd_sum result -> (operand, line, attr)
+        links = {}                  # select result -> (prev, K, sum, line)
+        block = {}                  # line -> block number
+        fabs = {}                   # fabs result -> operand
+        absdot = {}                 # dot(fabs(d), (1, 1)) result -> (d, fabs result)
+        nb = 0
+        for k, ln in enumerate(body):
+            if re.match(r'^[-\w.$"]+:', ln):
+                nb += 1
+            block[k] = nb
+            if (m := fabs_re.match(ln)):
+                fabs[m.group(1)] = m.group(2)
+            elif (m := dot_re.match(ln)) and m.group(2) in fabs:
+                absdot[m.group(1)] = (fabs[m.group(2)], m.group(2))
+            elif (m := cmp_re.match(ln)):
+                lanes[m.group(1)] = int(m.group(2))
+            elif (m := call.match(ln)):
+                sums[m.group(1)] = (m.group(2).strip(), k, m.group(3) or '')
+            elif (m := sel_re.match(ln)) and m.group(3) in lanes and m.group(5) in sums and uses.get(m.group(5)) == 1:
+                links[m.group(2)] = (m.group(4).strip(), lanes[m.group(3)], m.group(5), k)
+        nxt = {}
+        for r, (prev, _, _, _) in links.items():
+            if prev in links and uses.get(prev) == 1:
+                nxt[prev] = r
+        starts = [r for r, (prev, _, _, _) in links.items() if not (prev in links and nxt.get(prev) == r)]
+        ngroups = 0
+        for r in starts:
+            chain = [r]
+            while chain[-1] in nxt:
+                chain.append(nxt[chain[-1]])
+            for g in range(0, len(chain) - 31, 32):
+                grp = chain[g:g + 32]
+                ks = [links[x][1] for x in grp]
+                last = links[grp[-1]][3]
+                if sorted(ks) != list(range(32)) or any(block[links[x][3]] != block[last] or
+                                                        block[sums[links[x][2]][1]] != block[last] for x in grp):
+                    continue
+                if any(uses.get(x) != 1 for x in grp[:-1]) or (g > 0 and uses.get(chain[g - 1]) != 1):
+                    continue
+                ops = [None] * 32
+                attr = sums[links[grp[0]][2]][2]
+                for x in grp:
+                    _, kk, s, k = links[x]
+                    ops[kk] = sums[s][0]
+                    body[sums[s][1]] = None
+                    if x != grp[-1]:
+                        body[k] = None
+                ind = sel_re.match(body[last]).group(1)
+                # Apple's costs are dot(|d|, 1) = |d.x| + |d.y|: with the d's the lowering adds two candidates' halves with one
+                # packed add, already in the word layout of the reduce-scatter (the same f16 additions)
+                ds = [absdot.get(o) for o in ops]
+                if all(d and uses.get(o) == 1 and uses.get(d[1]) == 1 for o, d in zip(ops, ds)):
+                    body[last] = (f'{ind}{grp[-1]} = tail call fast half @air.simd_sum_scatter32.absdot.f16('
+                                  + ', '.join(f'<2 x half> {d[0]}' for d in ds) + f'){attr}')
+                    absd = True
+                else:
+                    body[last] = (f'{ind}{grp[-1]} = tail call fast half @air.simd_sum_scatter32.f16('
+                                  + ', '.join(f'half {o}' for o in ops) + f'){attr}')
+                ngroups += 1
+        if ngroups:
+            changed = True
+            fn = [fn[0]] + [ln for ln in body if ln is not None] + [fn[-1]]
+        res += fn
+    text = '\n'.join(res)
+    if changed:
+        attr = re.search(r'^declare half @air\.simd_sum\.f16\(half\)( local_unnamed_addr)?( #\d+)?', text, re.M)
+        tail = (attr.group(1) or '') + (attr.group(2) or '') + '\n'
+        text += '\ndeclare half @air.simd_sum_scatter32.f16(' + ', '.join(['half'] * 32) + ')' + tail
+        if absd:
+            text += 'declare half @air.simd_sum_scatter32.absdot.f16(' + ', '.join(['<2 x half>'] * 32) + ')' + tail
+    return text
+
+
+def word_selects(text):
+    """`select <2 x i1> splat(c), <2 x half> a, b` becomes one 32-bit select of the bitcast words. LLVM (gfx11, fake16) splits
+    the vector select into two 16-bit v_cndmask and a v_perm to repack; findOpticalMotionVectorsV3 has ~300 of them. The same
+    bits are chosen either way."""
+    splat_ins = dict(re.findall(r'^\s*(%[-\w.]+) = insertelement <2 x i1> (?:poison|undef), i1 (%[-\w.]+|true|false), i64 0\s*$',
+                                text, re.M))
+    splat = {}
+    for r, src in re.findall(r'^\s*(%[-\w.]+) = shufflevector <2 x i1> (%[-\w.]+), <2 x i1> (?:poison|undef), '
+                             r'<2 x i32> zeroinitializer\s*$', text, re.M):
+        if src in splat_ins:
+            splat[r] = splat_ins[src]
+    n = [0]
+
+    def rep(m):
+        ind, r, c, a, b = m.groups()
+        if c not in splat:
+            return m.group(0)
+        n[0] += 1
+        t = f'%m4r.ws{n[0]}'
+        return (f'{ind}{t}.a = bitcast <2 x half> {a} to i32\n{ind}{t}.b = bitcast <2 x half> {b} to i32\n'
+                f'{ind}{t}.s = select i1 {splat[c]}, i32 {t}.a, i32 {t}.b\n{ind}{r} = bitcast i32 {t}.s to <2 x half>')
+    return re.sub(r'^(\s*)(%[-\w.]+) = select (?:fast )?<2 x i1> (%[-\w.]+), <2 x half> ([^,]+), <2 x half> ([^,\s]+)\s*$',
+                  rep, text, flags=re.M)
+
+
 def pair_simd_sums(text):
     """Two independent half simd_sums of a basic block become one simd_sum of a <2 x half> pair (air.simd_sum.v2f16): each
     half of the pair goes through the same butterfly in the same order, so the results are the same, with one lane shuffle
@@ -239,16 +388,7 @@ def pair_simd_sums(text):
             j += 1
         fn = lines[i:j + 1]
         if sum(1 for ln in fn if call.match(ln)) >= 2:
-            nparams = len(intrinsics.split_params(re.match(r'define [^(]*\((.*)\)[^)]*\{$', fn[0]).group(1))) \
-                if re.match(r'define [^(]*\((.*)\)[^)]*\{$', fn[0]) else 0
-            # numbered values of the body become named, so a definition can move
-            def ren(m):
-                return f'%m4rv{m.group(1)}' if int(m.group(1)) >= nparams else m.group(0)
-            body = [re.sub(r'%(\d+)(?![\w.])', ren, ln) for ln in fn[1:-1]]
-            body = [re.sub(r'^(\d+):', lambda m: f'm4rv{m.group(1)}:' if int(m.group(1)) >= nparams else m.group(0), ln) for ln in body]
-            first = next((x for x in body if x.strip() and not x.strip().startswith(';')), '')
-            if not re.match(r'^[-\w.$"]+:', first):   # the entry block's implicit number is now a name
-                body.insert(0, f'm4rv{nparams}:')
+            body = named_body(fn)
             k, npair = 0, 0
             while k < len(body):
                 m1 = call.match(body[k])
@@ -408,6 +548,11 @@ def translate(text, kernel, constants, tg, wave='auto', widen=False):
 
     # 7a. half divisions in f32 (see half_division_in_f32); independent half simd_sums in pairs (see pair_simd_sums)
     text = half_division_in_f32(text)
+    if os.environ.get('M4R_WORD_SELECTS', '1') != '0':
+        text = word_selects(text)
+    lane_arg = next((a['index'] for a in args if a['kind'] == 'air.thread_index_in_simdgroup'), None)
+    if lane_arg is not None and os.environ.get('M4R_SCATTER_SUMS', '1') != '0':
+        text = scatter_simd_sums(text, f'%{lane_arg}')
     if os.environ.get('M4R_PAIR_SUMS', '1') != '0':
         text = pair_simd_sums(text)
 

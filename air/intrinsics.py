@@ -364,6 +364,64 @@ def reduce_op(kind, width):
     return f
 
 
+def sum_scatter32(b, s):
+    """air.simd_sum_scatter32.f16(x_0 .. x_31) (made by m4r_air.scatter_simd_sums): lane K gets simd_sum(x_K).
+
+    Recursive halving: at xor step 2^i (i = 0..4, the order of the simd_sum butterfly) a lane keeps the values whose index has
+    bit i equal to its own lane bit i and adds the partner's copies of them; after five steps lane K holds value K. Each
+    candidate's sum is the butterfly's addition tree (fadd is commutative, so both lanes of a pair hold the same partial sum
+    there too), and inactive lanes contribute +0 as in reduce_op: the results are bit-identical to 32 simd_sums.
+    Values travel two halves per 32-bit word: word w holds values (2w, 2w + 1) of the current set, so one v_perm picks the
+    kept halves of two words, one picks the sent ones, and one lane move and one packed add finish both."""
+    lane = lane_id(b)
+    words = []
+    for i in range(16):
+        if s.name.endswith('.absdot.f16'):
+            # value K = dot(|d_K|, (1, 1)) = |d_K.x| + |d_K.y|: the x halves of d_2i and d_2i+1 in one word, the y halves in
+            # another, one packed add (the same two f16 additions as Apple's dot, just side by side)
+            lo = intr(b, 'i32', 'llvm.amdgcn.perm', [('i32', b.v(f'bitcast <2 x half> %a{2 * i + 1} to i32')),
+                                                      ('i32', b.v(f'bitcast <2 x half> %a{2 * i} to i32')), ('i32', str(0x05040100))])
+            hi = intr(b, 'i32', 'llvm.amdgcn.perm', [('i32', b.v(f'bitcast <2 x half> %a{2 * i + 1} to i32')),
+                                                      ('i32', b.v(f'bitcast <2 x half> %a{2 * i} to i32')), ('i32', str(0x07060302))])
+            lo = b.v(f'and i32 {lo}, {0x7fff7fff}')
+            hi = b.v(f'and i32 {hi}, {0x7fff7fff}')
+            v = b.v(f'fadd {FAST} <2 x half> {b.v(f"bitcast i32 {lo} to <2 x half>")}, {b.v(f"bitcast i32 {hi} to <2 x half>")}')
+        else:
+            v = b.v(f'insertelement <2 x half> poison, half %a{2 * i}, i32 0')
+            v = b.v(f'insertelement <2 x half> {v}, half %a{2 * i + 1}, i32 1')
+        w = b.v(f'bitcast <2 x half> {v} to i32')
+        words.append(intr(b, 'i32', 'llvm.amdgcn.set.inactive.i32', [('i32', w), ('i32', '0')]))
+    for bit in range(4):
+        st = 1 << bit
+        lb = b.v(f'and i32 {lane}, {st}')
+        on = b.v(f'icmp ne i32 {lb}, 0')
+        selk = b.v(f'select i1 {on}, i32 {0x07060302}, i32 {0x05040100}')   # odd values (bit set) or even ones
+        sels = b.v(f'select i1 {on}, i32 {0x05040100}, i32 {0x07060302}')
+        src = b.v(f'xor i32 {lane}, {st}')
+        nw = []
+        for j in range(0, len(words), 2):
+            keep = intr(b, 'i32', 'llvm.amdgcn.perm', [('i32', words[j + 1]), ('i32', words[j]), ('i32', selk)])
+            send = intr(b, 'i32', 'llvm.amdgcn.perm', [('i32', words[j + 1]), ('i32', words[j]), ('i32', sels)])
+            recv = bpermute(b, src, send)
+            kh = b.v(f'bitcast i32 {keep} to <2 x half>')
+            rh = b.v(f'bitcast i32 {recv} to <2 x half>')
+            sm = b.v(f'fadd {FAST} <2 x half> {kh}, {rh}')
+            nw.append(b.v(f'bitcast <2 x half> {sm} to i32'))
+        words = nw
+    w = words[0]
+    lb = b.v(f'and i32 {lane}, 16')
+    on = b.v(f'icmp ne i32 {lb}, 0')
+    hi = b.v(f'lshr i32 {w}, 16')
+    keep = b.v(f'select i1 {on}, i32 {hi}, i32 {w}')
+    send = b.v(f'select i1 {on}, i32 {w}, i32 {hi}')
+    src = b.v(f'xor i32 {lane}, 16')
+    recv = bpermute(b, src, send)
+    kh = b.v(f'bitcast i16 {b.v(f"trunc i32 {keep} to i16")} to half')
+    rh = b.v(f'bitcast i16 {b.v(f"trunc i32 {recv} to i16")} to half')
+    r = b.v(f'fadd {FAST} half {kh}, {rh}')
+    return intr(b, 'half', 'llvm.amdgcn.strict.wwm.f16', [('half', r)])
+
+
 def simd_any(b, s):
     m = intr(b, 'i32', 'llvm.amdgcn.ballot.i32', [('i1', '%a0')])
     return b.v(f'icmp ne i32 {m}, 0')
@@ -663,6 +721,7 @@ TABLE = [
     (r'air\.all\.', reduce_bool('and')),
     (r'air\.any\.', reduce_bool('or')),
     (r'air\.(simd|quad)_shuffle_xor\.', shuffle_xor),
+    (r'air\.simd_sum_scatter32\.(absdot\.)?f16$', sum_scatter32),
     (r'air\.simd_sum\.', reduce_op('sum', 32)),
     (r'air\.simd_min\.', reduce_op('min', 32)),
     (r'air\.simd_max\.', reduce_op('max', 32)),
