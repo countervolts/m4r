@@ -11,7 +11,7 @@ The weight preparation reproduces MetalFX's host code (see docs/metalfx-bbr.md):
 Output directory: blobs/*.bin (ready-to-upload buffers), k/*.hsaco + *.args (translated kernels) and plan.txt
 (executed by runtime/plan.cpp).
 """
-import argparse, hashlib, json, os, struct, subprocess, sys
+import argparse, hashlib, json, os, shutil, struct, subprocess, sys
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -268,8 +268,11 @@ def build(args):
                'history_pitch': 32 * ((2 * ow + 63) // 64), 'reversed_depth': args.reversed_depth},
               open(os.path.join(out, 'sizes.json'), 'w'))
     shader = os.path.join(os.path.dirname(HERE), 'shaders', 'sacneh.comp')
-    subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', shader, '-o', os.path.join(out, 'sacneh.spv')],
-                   check=True, capture_output=True)
+    if os.path.isfile(shader[:-5] + '.spv'):   # compiled in a release
+        shutil.copyfile(shader[:-5] + '.spv', os.path.join(out, 'sacneh.spv'))
+    else:
+        subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', shader, '-o', os.path.join(out, 'sacneh.spv')],
+                       check=True, capture_output=True)
     transpose_weight_tiles(out, plan)
     decl = [l for l in plan if l.split(' ', 1)[0] in ('buffer', 'texture', 'kernel', 'glsl')]
     rest = [l for l in plan if l.split(' ', 1)[0] not in ('buffer', 'texture', 'kernel', 'glsl')]

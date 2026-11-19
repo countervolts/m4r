@@ -201,7 +201,7 @@ def rewrite_function(lines, used, params=()):
             if not good:
                 conv.discard(p); changed = True
     edge_conv = {}      # predecessor block -> [(value, kind)] needing a2w at its end
-    for p in conv:
+    for p in [p for p in phis if p in conv]:   # source order: a set's order changes with the hash seed (and the code)
         k, inc = phis[p]
         for v, bb in inc:
             if not (v == 'zeroinitializer' or gemms.get(v) == k or (v in conv and phis[v][0] == k)):

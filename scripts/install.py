@@ -12,12 +12,12 @@ quality, ultra quality and DLAA), and each of those rounded up to a multiple of 
 picks the plan matching the size each frame is rendered at. Give --input for sizes a game picks on its own (dynamic resolution, custom scaling).
 Plans contain Apple's translated kernels and weights made from your copy: keep them to yourself.
 
-usage: install.py --resources <MetalFX Resources dir> --binary <MetalFX binary> --game <dir with OptiScaler's dxgi.dll>
+usage: install.py --resources <MetalFX Resources dir> --binary <MetalFX binary> (--game <dir with OptiScaler's dxgi.dll> | --plans <dir>)
                   [--display 1920x1080 ...] [--modes quality,balanced,performance,ultra,dlaa,ultra-quality]
                   [--input WxH ...] [--no-align8] [--depth reversed|forward|both] [--no-fg] [--m4r-dll path] [--jobs N] [--force]
 SPDX-License-Identifier: GPL-3.0-only
 """
-import argparse, concurrent.futures, os, shutil, subprocess, sys, tempfile
+import argparse, concurrent.futures, os, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RATIOS = {'ultra': 3.0, 'performance': 2.0, 'balanced': 1.7, 'quality': 1.5, 'ultra-quality': 1.3, 'dlaa': 1.0}
@@ -58,7 +58,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--resources', required=True, help="MetalFX.framework/Versions/A/Resources of your macOS install")
     ap.add_argument('--binary', required=True, help='the MetalFX binary extracted from the dyld shared cache')
-    ap.add_argument('--game', required=True, help="folder with OptiScaler's dxgi.dll; m4r/ is created in it")
+    ap.add_argument('--game', help="folder with OptiScaler's dxgi.dll; m4r/ is created in it")
+    ap.add_argument('--plans', help='write the plans here instead of <game>/m4r/plans (and copy no m4r.dll)')
     ap.add_argument('--display', action='append', type=size, help='display resolution, e.g. 2560x1440 (default 1920x1080, 2560x1440, 3840x2160)')
     ap.add_argument('--modes', default='quality,balanced,performance,ultra', help='quality modes: ' + ', '.join(RATIOS))
     ap.add_argument('--input', action='append', type=size, help='extra render resolution (used with every --display)')
@@ -77,10 +78,18 @@ def main():
         sys.exit(f'{a.resources} has no default.metallib')
     if not os.path.isfile(a.binary):
         sys.exit(f'{a.binary} not found')
-    if not os.path.isfile(a.m4r_dll):
+    if not a.game and not a.plans:
+        sys.exit('pass --game or --plans')
+    if not a.plans and not os.path.isfile(a.m4r_dll):
         sys.exit(f'{a.m4r_dll} not found (build it with: cmake --build build-win, or pass --m4r-dll)')
-    for t in ('llvm-as', 'opt', 'llc', 'ld.lld', 'glslangValidator'):
+    for t in ('llvm-as', 'llvm-dis', 'opt', 'llc', 'ld.lld', 'llvm-nm', 'llvm-objdump'):
         need(t)
+    if not os.path.isfile(os.path.join(ROOT, 'shaders', 'sacneh.spv')):   # a release ships it compiled
+        need('glslangValidator')
+    llc = subprocess.run(['llc', '--version'], capture_output=True, text=True).stdout
+    major = next((int(w.split('.')[0]) for l in llc.split('\n') if 'LLVM version' in l for w in l.split() if w[:1].isdigit()), 0)
+    if major < 23:
+        sys.exit(f'LLVM {major or "?"} found; m4r needs LLVM 23 or newer (it reads Apple\'s bitcode)')
 
     if not a.gpu:
         gpus = detect_gpu()
@@ -108,13 +117,10 @@ def main():
         if inp[0] > disp[0] or inp[1] > disp[1] or inp[0] * 3.1 < disp[0] or inp[1] * 3.1 < disp[1]:
             sys.exit(f'{inp[0]}x{inp[1]} -> {disp[0]}x{disp[1]}: MetalFX scales by 1x to 3x')
 
-    plans_dir = os.path.join(a.game, 'm4r', 'plans')
+    plans_dir = a.plans or os.path.join(a.game, 'm4r', 'plans')
     os.makedirs(plans_dir, exist_ok=True)
-    shutil.copyfile(a.m4r_dll, os.path.join(a.game, 'm4r', 'm4r.dll'))
-
-    spv = os.path.join(tempfile.mkdtemp(prefix='m4r-sacneh-'), 'sacneh.spv')
-    subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', os.path.join(ROOT, 'shaders', 'sacneh.comp'), '-o', spv],
-                   check=True, capture_output=True)
+    if not a.plans:
+        shutil.copyfile(a.m4r_dll, os.path.join(a.game, 'm4r', 'm4r.dll'))
 
     jobs = []   # (name, command)
     for disp, inp in pairs:
@@ -125,12 +131,12 @@ def main():
                 continue
             jobs.append((f'bbr-{tag}{suffix}', [sys.executable, '-I', os.path.join(ROOT, 'tools', 'prepare_bbr.py'), *common,
                                                 '--binary', a.binary, '--reversed-depth', str(rev)]
-                         + (['--line-locking'] if a.line_locking else []), True))
+                         + (['--line-locking'] if a.line_locking else [])))
         if not a.no_fg:
-            jobs.append((f'fg-{tag}', [sys.executable, '-I', os.path.join(ROOT, 'tools', 'prepare_fg.py'), *common], False))
+            jobs.append((f'fg-{tag}', [sys.executable, '-I', os.path.join(ROOT, 'tools', 'prepare_fg.py'), *common]))
 
     def run(job):
-        name, cmd, needs_sacneh = job
+        name, cmd = job
         out = os.path.join(plans_dir, name)
         if os.path.exists(os.path.join(out, 'plan.txt')) and not a.force:
             return name, 'kept'
@@ -139,8 +145,6 @@ def main():
         r = subprocess.run(cmd + ['--out', out] + (['--force'] if a.force else []), capture_output=True, text=True)
         if r.returncode:
             return name, 'FAILED\n' + (r.stderr or r.stdout)[-2000:]
-        if needs_sacneh:
-            shutil.copyfile(spv, os.path.join(out, 'sacneh.spv'))
         return name, 'done'
 
     failed = 0
@@ -148,7 +152,6 @@ def main():
         for name, state in pool.map(run, jobs):
             print(f'{name}: {state}', flush=True)
             failed += state.startswith('FAILED')
-    shutil.rmtree(os.path.dirname(spv), ignore_errors=True)
     print(f'{len(jobs) - failed} plans ready in {plans_dir}' + (f', {failed} failed' if failed else ''))
     sys.exit(1 if failed else 0)
 

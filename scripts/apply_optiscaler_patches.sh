@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Applies m4r's patches to an OptiScaler checkout: MetalFX in the upscaler dropdown and MetalFX FG in the frame
-# generation menu. m4r ships these patches only, no OptiScaler build.
+# generation menu. The release's dxgi.dll is OptiScaler built with exactly these (scripts/package.sh).
 # usage: scripts/apply_optiscaler_patches.sh <OptiScaler git checkout> [--clang-cl]
 #   --clang-cl   also apply optiscaler/clang-cl.patch (only needed to build OptiScaler with clang-cl on Linux)
 # SPDX-License-Identifier: GPL-3.0-only
@@ -13,7 +13,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIR="$(realpath "$1")"; shift
 PIN=fd3a45a   # OptiScaler commit the patches were made against ("Display asi's version")
 
-[[ -d "$DIR/.git" ]] || { echo "$DIR is not a git checkout of OptiScaler" >&2; exit 1; }
+git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1 || { echo "$DIR is not a git checkout of OptiScaler" >&2; exit 1; }
 HEAD="$(git -C "$DIR" rev-parse --short=7 HEAD)"
 if [[ "$HEAD" != "$PIN" ]]; then
   echo "warning: checkout is at $HEAD, the patches were made against $PIN; they may not apply" >&2

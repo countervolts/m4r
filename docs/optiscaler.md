@@ -1,7 +1,8 @@
 # MetalFX in OptiScaler
 
-m4r does not ship an OptiScaler build. It ships patches (`patches/optiscaler/`) against upstream
-[OptiScaler](https://github.com/optiscaler/OptiScaler) that add
+m4r's changes to OptiScaler are patches (`patches/optiscaler/`) against upstream
+[OptiScaler](https://github.com/optiscaler/OptiScaler); the release zip ships OptiScaler built from them (`scripts/package.sh`
+checks that the checkout it builds is exactly the pinned commit with these patches). They add
 
 - **MetalFX** to the upscaler dropdown (`Dx12Upscaler=metalfx`), and
 - **MetalFX FG** to the frame generation output list (`FGOutput=metalfx`).
