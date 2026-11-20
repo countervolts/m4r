@@ -5,6 +5,7 @@
 // frames/NN/flags.txt (one flag name per line, set for the frame). M4R_DUMP_TEX=name,... writes tex-<name>-NN.raw after each frame.
 // SPDX-License-Identifier: GPL-3.0-only
 #include "plan.h"
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -71,6 +72,10 @@ int main(int argc, char** argv) {
         vk.createTexture(rough, VK_FORMAT_R16_SFLOAT, rw, rh); plan.bindTexture("roughness", &rough);
         vk.createTexture(exposure, VK_FORMAT_R32_SFLOAT, 1, 1); plan.bindTexture("exposure", &exposure);
         const float one = 1.0f; vk.upload(exposure, &one, 4);
+        VkQueryPool qp;
+        { VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO}; qci.queryType = VK_QUERY_TYPE_TIMESTAMP; qci.queryCount = 2; vkCreateQueryPool(vk.device, &qci, nullptr, &qp); }
+        VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(vk.physical, &props);
+        std::vector<double> ptotal(plan.passes(), 0.0);
         for (int t = 0; t < frames; ++t) {
             const std::string id = std::to_string(first + t);
             for (size_t i = 0; i < tex.size(); ++i) {
@@ -94,12 +99,33 @@ int main(int argc, char** argv) {
                 while (fl >> f) plan.setFlag(f, true);
             }
             plan.setParity(t);
+            const auto t0 = std::chrono::steady_clock::now();
             rt.resetTransient();
+            if (std::getenv("M4R_PASS_TIME")) {   // GPU time of every pass (one submission each), averaged over frames >= 1
+                for (size_t i = 0; i < plan.passes(); ++i) {
+                    VkCommandBuffer pcb = vk.begin();
+                    vkCmdResetQueryPool(pcb, qp, 0, 2);
+                    vkCmdWriteTimestamp(pcb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+                    if (!plan.record(pcb, i, 1)) { std::fprintf(stderr, "record: %s\n", plan.error.c_str()); rc = 1; goto done; }
+                    vk.barrier(pcb);
+                    vkCmdWriteTimestamp(pcb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+                    if (!vk.submit(pcb)) { std::fprintf(stderr, "submit: %s\n", vk.error.c_str()); rc = 1; goto done; }
+                    uint64_t ts[2];
+                    vkGetQueryPoolResults(vk.device, qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                    if (t > 0) ptotal[i] += double(ts[1] - ts[0]) * props.limits.timestampPeriod * 1e-6;
+                }
+                if (t == frames - 1) {
+                    double sum = 0;
+                    for (size_t i = 0; i < plan.passes(); ++i) { std::printf("pass %2zu %-56s %7.3f ms\n", i, plan.passLabel(i).c_str(), ptotal[i] / std::max(1, frames - 1)); sum += ptotal[i] / std::max(1, frames - 1); }
+                    std::printf("sum %.3f ms\n", sum);
+                }
+                continue;
+            }
             VkCommandBuffer cb = vk.begin();
             if (!plan.record(cb)) { std::fprintf(stderr, "record: %s\n", plan.error.c_str()); rc = 1; break; }
             vk.barrier(cb);
             if (!vk.submit(cb)) { std::fprintf(stderr, "submit: %s\n", vk.error.c_str()); rc = 1; break; }
-            std::printf("frame %d done\n", t);
+            std::printf("frame %d done %.2f ms\n", t, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             if (const char* names = std::getenv("M4R_DUMP_TEX")) {
                 std::string all = names;
                 for (size_t a = 0; a < all.size();) {
@@ -127,6 +153,7 @@ int main(int argc, char** argv) {
             }
         }
     done:
+        vkDestroyQueryPool(vk.device, qp, nullptr);
         for (auto& x : tex) vk.destroyTexture(x);
         vk.destroyTexture(rough); vk.destroyTexture(exposure);
     }

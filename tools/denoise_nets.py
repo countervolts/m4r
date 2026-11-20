@@ -93,8 +93,8 @@ class Plan:
             self.lines.append(f'glsl {name} {name}.spv {lx} {ly} 1')
             self.kernels.add(name)
 
-    def run(self, kernel, w, h, bufs, consts):
-        self.lines.append(f'pass {kernel} threads {w} {h} 1')
+    def run(self, kernel, w, h, bufs, consts, z=1):
+        self.lines.append(f'pass {kernel} threads {w} {h} {z}')
         for i, b in enumerate(bufs):
             self.lines.append(f'  buf {i} {b}')
         for i, c in enumerate(consts):
@@ -114,7 +114,7 @@ def conv_pass(p, dat, L, idx, src, dst, Hin, Win, stride=1, relu=True):
     p.buffer(f'b{idx}', co * 2, dat[bo:bo + co * 2])
     p.glsl('nn_conv', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'shaders', 'nn_conv.comp'))
     p.run('nn_conv', Wo, Ho, [src, dst, f'w{idx}', f'b{idx}'],
-          [Wo, Ho, ci, co, Win, Hin, k | stride << 8 | pad << 16, 1 if relu else 0])
+          [Wo, Ho, ci, co, Win, Hin, k | stride << 8 | pad << 16, 1 if relu else 0], z=(co + 7) // 8)
     return Ho, Wo
 
 

@@ -66,8 +66,8 @@ class Gen:
             self.lines.append(f'glsl {name} {name}.spv {lx} {ly} 1')
             self.kernels[('glsl', name)] = name
 
-    def run(self, kernel, w, h, bufs, consts):   # GLSL pass (shaders/nn_*.comp): buffers in slots 0.., constants from binding 8
-        self.lines.append(f'pass {kernel} threads {w} {h} 1')
+    def run(self, kernel, w, h, bufs, consts, z=1):   # GLSL pass (shaders/nn_*.comp): buffers in slots 0.., constants from binding 8
+        self.lines.append(f'pass {kernel} threads {w} {h} {z}')
         for i, b in enumerate(bufs):
             self.lines.append(f'  buf {i} {b}')
         for i, c in enumerate(consts):
