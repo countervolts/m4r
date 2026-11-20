@@ -1,14 +1,14 @@
 // m4r: NHWC fp16 convolution (stride 1, zero padding) for MetalFX's DBFNet as an implicit GEMM on RDNA3 WMMA
 // (v_wmma_f32_16x16x16_f16: fp16 inputs, fp32 accumulation, like nn_conv.comp). One wave computes 16 consecutive pixels of a row for
-// NT tiles of 16 output channels. Specialised per layer with -D W H CIN COUT K NT RELU; built by tools/denoise_nets.py (wmma_conv).
-// args: 0 input [H][W][CIN], 1 output [H][W][COUT], 2 weights packed [tap][cin block][cout block][16 cout][16 cin] (zero padded),
+// NT tiles of 16 output channels. Specialised per layer with -D W H (output size) WI HI (input size) CIN COUT K ST (stride) PADV NT ACT
+// (0 none, 1 relu, 2 sigmoid); built by tools/denoise_nets.py (wmma_kernel).
+// args: 0 input [HI][WI][CIN], 1 output [H][W][COUT], 2 weights packed [tap][cin block][cout block][16 cout][16 cin] (zero padded),
 //       3 bias [COUT]; launch: x = ceil(W/16) workgroups of 32, y = H, z = ceil(ceil(COUT/16)/NT)
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 typedef half half16 __attribute__((ext_vector_type(16)));
 typedef float float8 __attribute__((ext_vector_type(8)));
 
-#define PAD (K / 2)
 #define CIB ((CIN + 15) / 16)
 #define COB ((COUT + 15) / 16)
 
@@ -25,9 +25,9 @@ kernel void nn_conv(global const half* src, global half* dst, global const half*
     for (int ky = 0; ky < K; ++ky) {
 #pragma unroll
         for (int kx = 0; kx < K; ++kx) {
-            const int yy = y + ky - PAD, xx = x + kx - PAD;
-            const bool ok = yy >= 0 && yy < H && xx >= 0 && xx < W;
-            global const half* px = src + ((size_t)(yy * W + xx)) * CIN;
+            const int yy = y * ST + ky - PADV, xx = x * ST + kx - PADV;
+            const bool ok = yy >= 0 && yy < HI && xx >= 0 && xx < WI && x < W;
+            global const half* px = src + ((size_t)(yy * WI + xx)) * CIN;
 #pragma unroll
             for (int cb = 0; cb < CIB; ++cb) {
                 half16 a = (half16)(0.0h);
@@ -61,8 +61,10 @@ kernel void nn_conv(global const half* src, global half* dst, global const half*
                 const int p = tx * 16 + 2 * i + (l >> 4);
                 if (p < W) {
                     float v = acc[t][i] + bs;
-#if RELU
+#if ACT == 1
                     v = v > 0.0f ? v : 0.0f;
+#elif ACT == 2
+                    v = 1.0f / (1.0f + native_exp(-v));
 #endif
                     dst[((size_t)(y * W + p)) * COUT + co] = (half)v;
                 }

@@ -26,8 +26,8 @@ def layer(dat, L):
     return w, b
 
 
-def conv_ref(x, w, b, stride=1, relu=True):
-    k = w.shape[0]; pad = (k - 1) // 2 if stride == 1 else 2
+def conv_ref(x, w, b, stride=1, relu=True, pad=None, sigmoid=False):
+    k = w.shape[0]; pad = ((k - 1) // 2 if stride == 1 else 2) if pad is None else pad
     H, W, _ = x.shape
     xp = np.pad(x.astype(np.float32), ((pad, pad), (pad, pad), (0, 0)))
     Ho, Wo = (H + 2 * pad - k) // stride + 1, (W + 2 * pad - k) // stride + 1
@@ -36,7 +36,9 @@ def conv_ref(x, w, b, stride=1, relu=True):
         for kx in range(k):
             patch = xp[ky:ky + stride * Ho:stride, kx:kx + stride * Wo:stride]
             out += patch @ w[ky, kx].astype(np.float32)
-    if relu:
+    if sigmoid:
+        out = 1.0 / (1.0 + np.exp(-out))
+    elif relu:
         out = np.maximum(out, 0)
     return out.astype(np.float16)
 
@@ -144,32 +146,37 @@ def wmma_kernel(p, defs):
     return name
 
 
-def wmma_conv_pass(p, dat, L, idx, src, dst, H, W, relu, nt):
+def wmma_conv_pass(p, dat, L, idx, src, dst, Hin, Win, act, nt, stride=1, pad=None):
     wo, bo, k, ci, co = L
+    pad = (k - 1) // 2 if pad is None else pad
+    H, W = (Hin + 2 * pad - k) // stride + 1, (Win + 2 * pad - k) // stride + 1
     w, b = layer(dat, L)
     blob = pack_wmma_weights(w, k, ci, co)
     p.buffer(f'w{idx}', len(blob), blob)
     p.buffer(f'b{idx}', co * 2, dat[bo:bo + co * 2])
-    name = wmma_kernel(p, dict(W=W, H=H, CIN=ci, COUT=co, K=k, NT=nt, RELU=1 if relu else 0))
+    name = wmma_kernel(p, dict(W=W, H=H, WI=Win, HI=Hin, CIN=ci, COUT=co, K=k, ST=stride, PADV=pad, NT=nt, ACT=act))
     cob = (co + 15) // 16
     p.lines.append(f'pass {name} threads {((W + 15) // 16) * 32} {H} {(cob + nt - 1) // nt}')
     for i, bn in enumerate((src, dst, f'w{idx}', f'b{idx}')):
         p.lines.append(f'  buf {i} {bn}')
 
 
-def conv_pass(p, dat, L, idx, src, dst, Hin, Win, stride=1, relu=True):
+def conv_pass(p, dat, L, idx, src, dst, Hin, Win, stride=1, relu=True, pad=None, act=None):
+    """one convolution; act None = relu if relu else none, or 0 none / 1 relu / 2 sigmoid; returns the output size"""
     wo, bo, k, ci, co = L
-    if getattr(p, 'wmma', False) and stride == 1:
-        nt = 1 if Hin * Win < 40000 else min(4, (co + 15) // 16)   # low resolution: spread the channel tiles over waves
-        wmma_conv_pass(p, dat, L, idx, src, dst, Hin, Win, relu, nt)
-        return Hin, Win
-    pad = (k - 1) // 2 if stride == 1 else 2
+    act = (1 if relu else 0) if act is None else act
+    pad = ((k - 1) // 2 if stride == 1 else 2) if pad is None else pad
+    if getattr(p, 'wmma', False):
+        Ho, Wo = (Hin + 2 * pad - k) // stride + 1, (Win + 2 * pad - k) // stride + 1
+        nt = 1 if Ho * Wo < 40000 else min(4, (co + 15) // 16)   # low resolution: spread the channel tiles over waves
+        wmma_conv_pass(p, dat, L, idx, src, dst, Hin, Win, act, nt, stride, pad)
+        return Ho, Wo
     Ho, Wo = (Hin + 2 * pad - k) // stride + 1, (Win + 2 * pad - k) // stride + 1
     p.buffer(f'w{idx}', k * k * ci * co * 2, dat[wo:wo + k * k * ci * co * 2])
     p.buffer(f'b{idx}', co * 2, dat[bo:bo + co * 2])
     p.glsl('nn_conv', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'shaders', 'nn_conv.comp'))
     p.run('nn_conv', Wo, Ho, [src, dst, f'w{idx}', f'b{idx}'],
-          [Wo, Ho, ci, co, Win, Hin, k | stride << 8 | pad << 16, 1 if relu else 0], z=(co + 7) // 8)
+          [Wo, Ho, ci, co, Win, Hin, k | stride << 8 | pad << 16, act], z=(co + 7) // 8)
     return Ho, Wo
 
 
@@ -205,6 +212,81 @@ def dbf_net(p, dat, H, W, in_name='dbf_in', out_name='dbf_out'):
     buf(out_name, H, W, 7); conv_pass(p, dat, P[14], 14, 't7', out_name, H, W, relu=False)
 
 
+# ---- UBFNet (the denoiser's upscaling network): 5 channels in at HxW, 11 channels out at H/2 x W/2 ---------------------------------
+# (weights offset, bias offset, kernel, cin, cout) in emit_ubfnet_v3_2_constants.dat (docs/metalfx-denoiser.md); the head (3x3 16 -> 44)
+# is not stored as plain fp16 there, so it comes from ubf.mtlpackage's resources.bin: bias at 2, weights at 39143 (blob headers of 2 and 3 bytes)
+UBF = dict(E0=(0x10, 0x0, 6, 5, 8), E1=(0xb90, 0xb50, 6, 8, 32), E2=(0x53d0, 0x5390, 3, 32, 32), E3=(0x9c50, 0x9bd0, 3, 32, 64),
+           E4=(0x12d50, 0x12c50, 3, 64, 128), B1=(0x36e50, 0x36d50, 1, 128, 128), B2=(0x3eed0, 0x3ee50, 1, 128, 64),
+           U1a=(0x42f60, 0x42ee0, 1, 64, 64), U1b=(0x44fa0, 0x44f60, 1, 64, 32), U2a=(0x45ff0, 0x45fb0, 1, 32, 32),
+           U2b=(0x46810, 0x467f0, 1, 32, 16), U3a=(0x46c60, 0x46c20, 1, 16, 32), U3b=(0x47080, 0x47060, 1, 32, 16),
+           U3c=(0x474a0, 0x47480, 1, 16, 16))
+UBF_HEAD = (39143, 2, 3, 16, 44)
+
+
+def ubf_head_blob(res_dir):
+    return open(os.path.join(res_dir, 'ubf.mtlpackage', 'library.mpsgraphpackage', 'resources.bin'), 'rb').read()
+
+
+def ubf_ref(dat, head, x):
+    """numpy reference: x [H][W][5] fp16 (H, W multiples of 32) -> [H/2][W/2][11] fp16"""
+    P = {k: layer(dat, v) for k, v in UBF.items()}
+    hw, hb = layer(head, UBF_HEAD)
+    c = lambda n, a, st=1, pad=None: conv_ref(a, *P[n], stride=st, pad=pad)
+    e0 = c('E0', x, 2, 2); e1 = c('E1', e0, 2, 2); e2 = c('E2', e1, 2, 1); e3 = c('E3', e2, 2, 1)
+    a = c('E4', pool_ref(e3))
+    a = c('B2', c('B1', a))
+    a = c('U1b', c('U1a', up_ref(a, e3)))
+    a = c('U2b', c('U2a', up_ref(a, e2)))
+    a = c('U3c', c('U3b', c('U3a', up_ref(a, e1[..., :16]))))
+    h = conv_ref(a, hw, hb, relu=False, sigmoid=False)         # [H/4][W/4][44]
+    H4, W4, _ = h.shape
+    t = h.astype(np.float32).reshape(H4, W4, 11, 2, 2).transpose(0, 3, 1, 4, 2).reshape(H4 * 2, W4 * 2, 11)   # channel = c * 4 + i * 2 + j
+    return (1.0 / (1.0 + np.exp(-t))).astype(np.float16)
+
+
+def ubf_net(p, dat, head, H, W, in_name='ubf_in', out_name='ubf_out', pre=''):
+    """appends the UBFNet passes to plan generator p; in_name [H][W][5] f16 (NHWC), out_name [H/2][W/2][11]; H, W multiples of 32.
+    Buffers it creates are named pre + <layer>."""
+    assert H % 32 == 0 and W % 32 == 0
+    sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'shaders')
+    def buf(name, h, w, c):
+        p.buffer(pre + name, h * w * c * 2)
+    n = [0]
+    def conv(key, src, dst, h, w, stride=1, pad=None, L=None, d=None, act=None):
+        L = L or UBF[key]
+        ho = (h + 2 * (((L[2] - 1) // 2) if pad is None else pad) - L[2]) // stride + 1
+        wo = (w + 2 * (((L[2] - 1) // 2) if pad is None else pad) - L[2]) // stride + 1
+        buf(dst, ho, wo, L[4])
+        n[0] += 1
+        conv_pass(p, d if d is not None else dat, L, pre + 'u' + key, pre + src if src != in_name else src, pre + dst, h, w, stride=stride, pad=pad, act=act)
+        return ho, wo
+    def pool(src, dst, h, w, c):
+        buf(dst, h // 2, w // 2, c)
+        p.glsl('nn_pool', sh + '/nn_pool.comp'); p.run('nn_pool', (w // 2) * c // 4, h // 2, [pre + src, pre + dst], [w // 2, h // 2, c])
+    def up(src, skip, dst, h, w, c, skip_c):
+        buf(dst, h, w, c)
+        p.glsl('nn_upadd', sh + '/nn_upadd.comp'); p.run('nn_upadd', w * c // 4, h, [pre + src, pre + skip, pre + dst], [w, h, c, skip_c])
+    h0, w0 = conv('E0', in_name, 'e0', H, W, 2, 2, act=1)
+    h1, w1 = conv('E1', 'e0', 'e1', h0, w0, 2, 2, act=1)
+    h2, w2 = conv('E2', 'e1', 'e2', h1, w1, 2, 1, act=1)
+    h3, w3 = conv('E3', 'e2', 'e3', h2, w2, 2, 1, act=1)
+    pool('e3', 'p3', h3, w3, 64)
+    h4, w4 = h3 // 2, w3 // 2
+    conv('E4', 'p3', 'e4', h4, w4, act=1)
+    conv('B1', 'e4', 'b1', h4, w4, act=1); conv('B2', 'b1', 'b2', h4, w4, act=1)
+    up('b2', 'e3', 'u1', h3, w3, 64, 64)
+    conv('U1a', 'u1', 'u1a', h3, w3, act=1); conv('U1b', 'u1a', 'u1b', h3, w3, act=1)
+    up('u1b', 'e2', 'u2', h2, w2, 32, 32)
+    conv('U2a', 'u2', 'u2a', h2, w2, act=1); conv('U2b', 'u2a', 'u2b', h2, w2, act=1)
+    up('u2b', 'e1', 'u3', h1, w1, 16, 32)                     # skip: the first 16 channels of E1's 32
+    conv('U3a', 'u3', 'u3a', h1, w1, act=1); conv('U3b', 'u3a', 'u3b', h1, w1, act=1); conv('U3c', 'u3b', 'u3c', h1, w1, act=1)
+    conv('head', 'u3c', 'head', h1, w1, L=UBF_HEAD, d=head, act=0)
+    if out_name == 'ubf_out':   # standalone plan: declare the output (callers that pass their own buffer declare it)
+        p.buffer(out_name, h1 * 2 * w1 * 2 * 11 * 2)
+    p.glsl('nn_d2s', sh + '/nn_d2s.comp'); p.run('nn_d2s', w1, h1, [pre + 'head', out_name], [w1, h1])
+    return h1 * 2, w1 * 2
+
+
 def dbf_plan(dat, out, H, W):
     p = Plan(out)
     p.buffer('dbf_in', H * W * 13 * 2)
@@ -212,8 +294,26 @@ def dbf_plan(dat, out, H, W):
     p.save()
 
 
+def ubf_plan(res, out, H, W, wmma=True):
+    p = Plan(out)
+    p.wmma = wmma
+    dat = open(os.path.join(res, 'emit_ubfnet_v3_2_constants.dat'), 'rb').read()
+    p.buffer('ubf_in', H * W * 5 * 2)
+    ho, wo = ubf_net(p, dat, ubf_head_blob(res), H, W, 'ubf_in', 'ubf_out')
+    p.save()
+    return ho, wo
+
+
 if __name__ == '__main__':
     mode, res = sys.argv[1], sys.argv[2]
+    if mode == 'ubf':
+        ubf_plan(res, sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), os.environ.get('M4R_NO_WMMA') is None)
+        sys.exit(0)
+    if mode == 'ubf-ref':
+        H, W = int(sys.argv[3]), int(sys.argv[4])
+        x = np.fromfile(sys.argv[5], '<f2').reshape(H, W, 5)
+        ubf_ref(open(os.path.join(res, 'emit_ubfnet_v3_2_constants.dat'), 'rb').read(), ubf_head_blob(res), x).astype('<f2').tofile(sys.argv[6])
+        sys.exit(0)
     dat = open(os.path.join(res, 'emit_dbfnet_v3_2_constants.dat'), 'rb').read()
     if mode == 'dbf':
         dbf_plan(dat, sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))

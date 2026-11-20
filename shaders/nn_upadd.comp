@@ -1,5 +1,5 @@
 // m4r: bilinear x2 upsample (half-pixel centres, edge clamp) plus skip, NHWC fp16.
-// args: 0 input [H/2][W/2][C], 1 skip [H][W][C], 2 output [H][W][C]; consts 8 W, 9 H, 10 C (multiple of 4); launch W * C / 4 x H
+// args: 0 input [H/2][W/2][C], 1 skip [H][W][C], 2 output [H][W][C]; consts 8 W, 9 H, 10 C (multiple of 4), 11 channels per skip pixel (0 = C; only the first C are used); launch W * C / 4 x H
 // SPDX-License-Identifier: GPL-3.0-only
 #version 460
 #extension GL_EXT_buffer_reference : require
@@ -10,7 +10,7 @@ layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Arg
 layout(push_constant) uniform Push { Args a; } pc;
 void main() {
     Args a = pc.a;
-    const uint W = a.c[0], H = a.c[1], C4 = a.c[2] / 4u;   // threads: x = pixel * C4 + channel group, y = row
+    const uint W = a.c[0], H = a.c[1], C4 = a.c[2] / 4u, S4 = (a.c[3] != 0u ? a.c[3] : a.c[2]) / 4u;   // threads: x = pixel * C4 + channel group, y = row
     const uint t = gl_GlobalInvocationID.x;
     const uint px = t / C4, g = t % C4, py = gl_GlobalInvocationID.y;
     if (px >= W || py >= H) return;
@@ -25,5 +25,5 @@ void main() {
     const vec4 v00 = vec4(src.v[(ya * Wi + xa) * C4 + g]), v10 = vec4(src.v[(ya * Wi + xb) * C4 + g]);
     const vec4 v01 = vec4(src.v[(yb * Wi + xa) * C4 + g]), v11 = vec4(src.v[(yb * Wi + xb) * C4 + g]);
     const vec4 u = mix(mix(v00, v10, tx), mix(v01, v11, tx), ty);
-    dst.v[(py * W + px) * C4 + g] = f16vec4(u + vec4(skip.v[(py * W + px) * C4 + g]));
+    dst.v[(py * W + px) * C4 + g] = f16vec4(u + vec4(skip.v[(py * W + px) * S4 + g]));
 }
