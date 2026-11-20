@@ -1,0 +1,56 @@
+// m4r: exposure for Ray Reconstruction games whose colour is scene-referred (Alan Wake 2: B10G11R11 colour around 1e3..6e4, an
+// exposure texture holding {exposure, 1/exposure} = {5e-5, 2e4}). MetalFX's denoiser kernels are calibrated for display-range colour
+// (what Cyberpunk gives); fed 1e4 and up they clip and the picture falls apart. So the colour is multiplied by the exposure before the
+// denoiser (mode 0, game's colour -> RGBA16F), the denoiser runs on that, and its result is divided by the exposure again (mode 1,
+// in place) so the upscaler after it sees the game's own units together with the game's exposure texture.
+// args: 0 input, 1 output, 2 params, 3 raw copy of the 1x1 exposure texture; consts 8 W, 9 H, 10 mode (0 in, 1 out)
+// params: uint colour_format (0 RGBA16F, 1 B10G11R11_UFLOAT), uint exposure_format (0 R32/R32G32 float, 1 R16 half)
+// mode 0: input = raw colour texels ([H][W], 4 B each for format 1, 8 B for format 0), output [H][W] f16vec4
+// mode 1: input = output = [H][W] f16vec4 (the denoised colour)
+// SPDX-License-Identifier: GPL-3.0-only
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Px { f16vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Words { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Fl { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer Hf { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Par { uint colorFmt; uint expFmt; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
+layout(push_constant) uniform Push { Args a; } pc;
+
+// unsigned 11 / 10 bit floats (5 exponent bits)
+float ufloat(uint bits, uint mantissaBits) {
+    const uint m = bits & ((1u << mantissaBits) - 1u);
+    const uint e = bits >> mantissaBits;
+    if (e == 0u) return float(m) / float(1u << mantissaBits) * exp2(-14.0);
+    if (e == 31u) return 65504.0;   // inf / NaN
+    return (1.0 + float(m) / float(1u << mantissaBits)) * exp2(float(e) - 15.0);
+}
+
+void main() {
+    Args a = pc.a;
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= a.c[0] || p.y >= a.c[1]) return;
+    const uint i = p.y * a.c[0] + p.x;
+    Par par = Par(a.slot[2]);
+    const float e = par.expFmt == 1u ? float(Hf(a.slot[3]).v[0]) : Fl(a.slot[3]).v[0];
+    if (!(e > 0.0)) {   // no usable exposure: pass the colour through
+        if (a.c[2] == 1u) return;
+    }
+    const float scale = e > 0.0 ? e : 1.0;
+    if (a.c[2] == 0u) {
+        vec3 c;
+        if (par.colorFmt == 1u) {
+            const uint w = Words(a.slot[0]).v[i];
+            c = vec3(ufloat(w & 0x7ffu, 6u), ufloat((w >> 11) & 0x7ffu, 6u), ufloat((w >> 22) & 0x3ffu, 5u));
+        } else {
+            c = vec3(Px(a.slot[0]).v[i].rgb);
+        }
+        Px(a.slot[1]).v[i] = f16vec4(vec4(clamp(c * scale, 0.0, 65504.0), 1.0));
+    } else {
+        const vec4 v = vec4(Px(a.slot[0]).v[i]);
+        Px(a.slot[1]).v[i] = f16vec4(vec4(clamp(v.rgb / scale, 0.0, 65504.0), v.a));
+    }
+}

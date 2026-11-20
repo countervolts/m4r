@@ -58,6 +58,11 @@ typedef struct m4r_denoise_desc {
     float jitter_x, jitter_y, motion_scale_x, motion_scale_y, pre_exposure;
     int reset, depth_reversed, hardware_depth, roughness_in_normals_w, motion_low_res, specular_hit_in_w;
     int flip_upscale_jitter;   /* the jitter is given in DLSS's convention; the upscaling step wants MetalFX's (opposite sign) */
+    /* Optional: when denoised_out is set, the denoised colour (render size, RGBA16F, in the game's units) is copied into it and the
+     * MetalFX upscaler is NOT run (the caller upscales, e.g. with DLSS Super Resolution). For games without hardware depth
+     * (hardware_depth = 0) depth_out (R32F, render size) receives the depth in the game's own projection convention
+     * (z * [2][2] + [3][2]) / (z * [2][3] + [3][3]), sky = the far value, for that upscaler. */
+    m4r_image denoised_out, depth_out;
 } m4r_denoise_desc;
 
 /* Frame generation at present time. The finished frame (backbuffer, display size) and this frame's render-size depth

@@ -1,8 +1,8 @@
 diff --git a/OptiScaler.ini b/OptiScaler.ini
-index 54b3b44..5e02d8b 100644
+index 54b3b44..77b1af6 100644
 --- a/OptiScaler.ini
 +++ b/OptiScaler.ini
-@@ -1344,6 +1344,12 @@ FlipJitter=auto
+@@ -1344,6 +1344,19 @@ FlipJitter=auto
  ; true or false - Default (auto) is true
  FGPacing=auto
  
@@ -12,46 +12,56 @@ index 54b3b44..5e02d8b 100644
 +; true or false - Default (auto) is false
 +Denoiser=auto
 +
++; With Denoiser=true: upscale the denoised image with DLSS Super Resolution (the NGX proxy given by Libraries.NvngxPath, e.g. d4r)
++; instead of the MetalFX upscaler. m4r writes the denoised colour (and the depth, for games without hardware depth) into two
++; textures and the DLSS feature upscales those with the game's motion vectors, exposure and jitter. Falls back to the MetalFX
++; upscaler when DLSS cannot be created.
++; true or false - Default (auto) is false
++DenoiserDlss=auto
++
  ; -------------------------------------------------------
  [Log]
  ; -------------------------------------------------------
 diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
-index 6969a99..1a35932 100644
+index 6969a99..ba54592 100644
 --- a/OptiScaler/Config.cpp
 +++ b/OptiScaler/Config.cpp
-@@ -248,6 +248,7 @@ bool Config::Reload(std::filesystem::path iniPath)
+@@ -248,6 +248,8 @@ bool Config::Reload(std::filesystem::path iniPath)
          {
              MetalFXFlipJitter.set_from_config(readBool("MetalFX", "FlipJitter"));
              MetalFXFGPacing.set_from_config(readBool("MetalFX", "FGPacing"));
 +            MetalFXDenoiser.set_from_config(readBool("MetalFX", "Denoiser"));
++            MetalFXDenoiserDlss.set_from_config(readBool("MetalFX", "DenoiserDlss"));
          }
  
          // FSR FG Inputs
-@@ -1075,6 +1076,7 @@ bool Config::SaveIni()
+@@ -1075,6 +1077,8 @@ bool Config::SaveIni()
      {
          ini.SetValue("MetalFX", "FlipJitter", GetBoolValue(Instance()->MetalFXFlipJitter.value_for_config()).c_str());
          ini.SetValue("MetalFX", "FGPacing", GetBoolValue(Instance()->MetalFXFGPacing.value_for_config()).c_str());
 +        ini.SetValue("MetalFX", "Denoiser", GetBoolValue(Instance()->MetalFXDenoiser.value_for_config()).c_str());
++        ini.SetValue("MetalFX", "DenoiserDlss", GetBoolValue(Instance()->MetalFXDenoiserDlss.value_for_config()).c_str());
      }
  
      // OptiFG
 diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
-index 09c7252..3720918 100644
+index 09c7252..d234b9a 100644
 --- a/OptiScaler/Config.h
 +++ b/OptiScaler/Config.h
-@@ -263,6 +263,7 @@ class Config
+@@ -263,6 +263,8 @@ class Config
  
      // MetalFX (m4r)
      CustomOptional<bool> MetalFXFlipJitter { false };
 +    CustomOptional<bool> MetalFXDenoiser { false }; // answer NGX feature 13 (Ray Reconstruction) with m4r
++    CustomOptional<bool> MetalFXDenoiserDlss { false }; // upscale the denoised image with DLSS Super Resolution (an NGX proxy such as d4r) instead of BBR
      CustomOptional<bool> MetalFXFGPacing { true }; // hold the real frame back by half a frame after the generated one
  
      // Logging
 diff --git a/OptiScaler/NVNGX_Parameter.cpp b/OptiScaler/NVNGX_Parameter.cpp
-index 910886e..dc45d6c 100644
+index 910886e..f4585a8 100644
 --- a/OptiScaler/NVNGX_Parameter.cpp
 +++ b/OptiScaler/NVNGX_Parameter.cpp
-@@ -795,8 +795,10 @@ void InitNGXParameters(NVSDK_NGX_Parameter* InParams, API api)
+@@ -795,8 +795,20 @@ void InitNGXParameters(NVSDK_NGX_Parameter* InParams, API api)
              InParams->Set("SuperSamplingDenoising.MinDriverVersionMinor", 0);
          }
  
@@ -61,6 +71,16 @@ index 910886e..dc45d6c 100644
 +        const bool m4rDenoiser = Config::Instance()->MetalFXDenoiser.value_or_default();
 +        InParams->Set("SuperSamplingDenoising.Available", m4rDenoiser ? 1 : 0);
 +        InParams->Set("SuperSamplingDenoising.FeatureInitResult", m4rDenoiser ? 1 : 0);
++    }
++    else if (Config::Instance()->MetalFXDenoiser.value_or_default())
++    {
++        // dxvk-nvapi's NVIDIA spoof makes this GPU look DLSS capable, but there is no NGX to ask (Streamline's sl.dlss_d
++        // reads these keys): the user chose m4r for Ray Reconstruction
++        InParams->Set("SuperSamplingDenoising.NeedsUpdatedDriver", 0);
++        InParams->Set("SuperSamplingDenoising.MinDriverVersionMajor", 0);
++        InParams->Set("SuperSamplingDenoising.MinDriverVersionMinor", 0);
++        InParams->Set("SuperSamplingDenoising.Available", 1);
++        InParams->Set("SuperSamplingDenoising.FeatureInitResult", 1);
      }
  
      if ((api == API::DX12 || api == API::Vulkan) && (State::Instance().activeFgInput == FGInput::DLSSG ||
@@ -78,25 +98,24 @@ index 4c02eab..887cc8b 100644
      <ClCompile Include="scanner\rtti.cpp" />
      <ClCompile Include="scanner\scanner.cpp" />
 diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
-index 682ac48..fc3e8f8 100644
+index 682ac48..fc5d98f 100644
 --- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
 +++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
-@@ -906,7 +906,12 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
+@@ -906,7 +906,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
      const bool isFG = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
      const bool dlssgAdjacent = Nvngx_FG::isDx12Available() || State::Instance().activeFgInput == FGInput::DLSSG;
  
 -    if (isUpscaling || (isFG && dlssgAdjacent))
 +    // Ray Reconstruction answered by m4r ([MetalFX] Denoiser): Streamline asks for feature 13 before it offers the option
 +    const bool isRR = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_RayReconstruction &&
-+                      Config::Instance()->MetalFXDenoiser.value_or_default() &&
-+                      !IdentifyGpu::getPrimaryGpu().dlssCapable;
++                      Config::Instance()->MetalFXDenoiser.value_or_default();
 +
 +    if (isUpscaling || isRR || (isFG && dlssgAdjacent))
      {
          if (OutSupported == nullptr)
          {
 diff --git a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
-index 408173c..fb3e6a9 100644
+index 408173c..05ff4f0 100644
 --- a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
 +++ b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
 @@ -1,6 +1,7 @@
@@ -107,20 +126,23 @@ index 408173c..fb3e6a9 100644
  
  #include "Util.h"
  #include "Config.h"
-@@ -65,6 +66,13 @@ bool FeatureProvider_Dx12::GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NG
-             *feature = std::make_unique<DLSSDFeatureDx12>(handleId, parameters);
-             break;
+@@ -60,7 +61,15 @@ bool FeatureProvider_Dx12::GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NG
          }
-+        else if (cfg.MetalFXDenoiser.value_or_default())
+ 
+     case Upscaler::DLSSD:
+-        if (primaryGpu.dlssCapable && state.NVNGX_DLSSD_Path.has_value())
++        if (cfg.MetalFXDenoiser.value_or_default())
 +        {
-+            // Ray Reconstruction answered by m4r (stored in the config as MetalFX, not DLSS)
++            // Ray Reconstruction answered by m4r (stored in the config as MetalFX, not DLSS). First, whatever NVAPI says:
++            // dxvk-nvapi's NVIDIA spoof makes the GPU look DLSS capable, and the game's nvngx_dlssd.dll cannot run here
 +            *feature = std::make_unique<MetalFXDenoiserFeatureDx12>(handleId, parameters);
 +            upscaler = Upscaler::MetalFX;
 +            break;
 +        }
-         else
++        else if (primaryGpu.dlssCapable && state.NVNGX_DLSSD_Path.has_value())
          {
-             *feature = std::make_unique<FSR2FeatureDx12_212>(handleId, parameters);
+             *feature = std::make_unique<DLSSDFeatureDx12>(handleId, parameters);
+             break;
 diff --git a/OptiScaler/upscalers/metalfx/M4R_Proxy.h b/OptiScaler/upscalers/metalfx/M4R_Proxy.h
 index e86ccb8..0a51187 100644
 --- a/OptiScaler/upscalers/metalfx/M4R_Proxy.h
@@ -157,10 +179,10 @@ index e86ccb8..0a51187 100644
              LOG_ERROR("MetalFX: m4r.dll is missing exports");
 diff --git a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
 new file mode 100644
-index 0000000..bd22aed
+index 0000000..7d648b0
 --- /dev/null
 +++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,309 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include <pch.h>
 +#include "MetalFXDenoiserFeature_Dx12.h"
@@ -287,7 +309,94 @@ index 0000000..bd22aed
 +    }
 +    _denoise = true;
 +    LOG_INFO("MetalFX denoiser: ready, {}x{}", RenderWidth(), RenderHeight());
++    if (Config::Instance()->MetalFXDenoiserDlss.value_or_default() && !InitDlss(InCommandList, InParameters))
++        LOG_WARN("MetalFX denoiser: DLSS Super Resolution is not available, upscaling with the MetalFX upscaler");
 +    return true;
++}
++
++MetalFXDenoiserFeatureDx12::~MetalFXDenoiserFeatureDx12()
++{
++    ReleaseDlss();
++}
++
++void MetalFXDenoiserFeatureDx12::ReleaseDlss()
++{
++    _dlss.reset();
++    if (_dnColor) { _dnColor->Release(); _dnColor = nullptr; }
++    if (_dnDepth) { _dnDepth->Release(); _dnDepth = nullptr; }
++}
++
++static ID3D12Resource* CreateTexture(ID3D12Device* device, UINT w, UINT h, DXGI_FORMAT format)
++{
++    D3D12_HEAP_PROPERTIES hp {};
++    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC rd {};
++    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    rd.Width = w;
++    rd.Height = h;
++    rd.DepthOrArraySize = 1;
++    rd.MipLevels = 1;
++    rd.Format = format;
++    rd.SampleDesc.Count = 1;
++    rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++    ID3D12Resource* res = nullptr;
++    if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
++                                               IID_PPV_ARGS(&res))))
++        return nullptr;
++    return res;
++}
++
++bool MetalFXDenoiserFeatureDx12::InitDlss(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters)
++{
++    if (NVNGXProxy::NVNGXModule() == nullptr)
++        NVNGXProxy::InitNVNGX();
++    if (NVNGXProxy::NVNGXModule() == nullptr)
++    {
++        LOG_ERROR("MetalFX denoiser + DLSS: no NGX proxy loaded (Libraries.NvngxPath, e.g. d4r\\nvngx.dll)");
++        return false;
++    }
++    int hwDepth = 0;
++    InParameters->Get("DLSS.Use.HW.Depth", &hwDepth);
++    _dnColor = CreateTexture(Device, RenderWidth(), RenderHeight(), DXGI_FORMAT_R16G16B16A16_FLOAT);
++    if (hwDepth == 0)
++        _dnDepth = CreateTexture(Device, RenderWidth(), RenderHeight(), DXGI_FORMAT_R32_FLOAT);
++    if (_dnColor == nullptr || (hwDepth == 0 && _dnDepth == nullptr))
++    {
++        LOG_ERROR("MetalFX denoiser + DLSS: could not create the intermediate textures");
++        ReleaseDlss();
++        return false;
++    }
++    _dlss = std::make_unique<DLSSFeatureDx12>(IFeature::GetNextHandleId(), InParameters);
++    if (!_dlss->Init(Device, InCommandList, InParameters) || !_dlss->IsInited())
++    {
++        LOG_ERROR("MetalFX denoiser + DLSS: creating the DLSS Super Resolution feature failed");
++        ReleaseDlss();
++        return false;
++    }
++    _dnShaderState = false;
++    LOG_INFO("MetalFX denoiser: the denoised image is upscaled by DLSS Super Resolution ({}x{} -> {}x{}, {} depth)", RenderWidth(),
++             RenderHeight(), DisplayWidth(), DisplayHeight(), hwDepth ? "the game's" : "converted");
++    return true;
++}
++
++void MetalFXDenoiserFeatureDx12::Transition(ID3D12GraphicsCommandList* cmd, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
++{
++    D3D12_RESOURCE_BARRIER b[2] {};
++    UINT n = 0;
++    for (ID3D12Resource* r : { _dnColor, _dnDepth })
++    {
++        if (r == nullptr)
++            continue;
++        b[n].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b[n].Transition.pResource = r;
++        b[n].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b[n].Transition.StateBefore = from;
++        b[n].Transition.StateAfter = to;
++        ++n;
++    }
++    if (n)
++        cmd->ResourceBarrier(n, b);
 +}
 +
 +bool MetalFXDenoiserFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
@@ -331,12 +440,46 @@ index 0000000..bd22aed
 +        m4r_denoise_desc d {};
 +        if (FillDesc(InParameters, d))
 +        {
++            const bool useDlss = _dlss != nullptr;
++            if (useDlss)
++            {
++                if (_dnShaderState)   // DLSS read the textures last frame: back to writable
++                    Transition(InCommandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++                _dnShaderState = false;
++                d.denoised_out = Image(_dnColor, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++                if (_dnDepth)
++                    d.depth_out = Image(_dnDepth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++            }
 +            VkCommandBuffer cb = VK_NULL_HANDLE;
 +            if (SUCCEEDED(_interop->BeginVkCommandBufferInterop(InCommandList, &cb)) && cb != VK_NULL_HANDLE)
 +            {
 +                auto& m4r = M4RProxy::Get();
 +                const int r = m4r.denoise(_ctx, cb, &d);
 +                _interop->EndVkCommandBufferInterop(InCommandList);
++                if (r == 0 && useDlss)
++                {
++                    // m4r wrote the denoised colour (and depth); DLSS Super Resolution upscales it with the game's own other inputs
++                    Transition(InCommandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++                    _dnShaderState = true;
++                    void* origColor = nullptr;
++                    void* origDepth = nullptr;
++                    InParameters->Get(NVSDK_NGX_Parameter_Color, &origColor);
++                    InParameters->Get(NVSDK_NGX_Parameter_Depth, &origDepth);
++                    InParameters->Set(NVSDK_NGX_Parameter_Color, (void*) _dnColor);
++                    if (_dnDepth)
++                        InParameters->Set(NVSDK_NGX_Parameter_Depth, (void*) _dnDepth);
++                    const bool ok = _dlss->EvaluateInternal(InCommandList, InParameters);
++                    InParameters->Set(NVSDK_NGX_Parameter_Color, origColor);
++                    InParameters->Set(NVSDK_NGX_Parameter_Depth, origDepth);
++                    if (ok)
++                    {
++                        _frameCount++;
++                        return true;
++                    }
++                    LOG_ERROR("MetalFX denoiser: DLSS Super Resolution failed, upscaling with the MetalFX upscaler from now on");
++                    ReleaseDlss();
++                    return MetalFXFeatureDx12::EvaluateInternal(InCommandList, InParameters);
++                }
 +                if (r == 0)
 +                {
 +                    _frameCount++;
@@ -351,15 +494,17 @@ index 0000000..bd22aed
 +}
 diff --git a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
 new file mode 100644
-index 0000000..c2918a0
+index 0000000..0885e5d
 --- /dev/null
 +++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,36 @@
 +#pragma once
 +// NGX feature 13 (DLSS Ray Reconstruction) answered by m4r on GPUs without DLSS: MetalFX's temporal denoiser (render size), then
 +// the MetalFX upscaler. Without a denoiser plan (m4r\\plans\\dn-WxH) or with M4R_NO_DENOISE set it only upscales the noisy colour.
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include "MetalFXFeature_Dx12.h"
++#include <upscalers/dlss/DLSSFeature_Dx12.h>
++#include <memory>
 +
 +class MetalFXDenoiserFeatureDx12 : public MetalFXFeatureDx12
 +{
@@ -371,11 +516,23 @@ index 0000000..c2918a0
 +
 +    bool InitInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
 +    bool EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
++    ~MetalFXDenoiserFeatureDx12();
 +
 +  private:
 +    bool FillDesc(NVSDK_NGX_Parameter* p, m4r_denoise_desc& d);
 +    void Capture(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* p);
 +    bool _denoise = false;   // the denoiser plan is loaded
++
++    // [MetalFX] DenoiserDlss: the denoised image is upscaled by DLSS Super Resolution (the NGX proxy, e.g. d4r) instead of BBR.
++    // m4r writes the denoised colour (and, for games without hardware depth, the depth in the game's convention) into these
++    // textures; the DLSS feature then runs on them with the game's motion vectors, exposure and jitter.
++    bool InitDlss(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters);
++    void ReleaseDlss();
++    void Transition(ID3D12GraphicsCommandList* cmd, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to);
++    std::unique_ptr<DLSSFeatureDx12> _dlss;
++    ID3D12Resource* _dnColor = nullptr;   // RGBA16F, render size
++    ID3D12Resource* _dnDepth = nullptr;   // R32F, render size (only when the game has no hardware depth)
++    bool _dnShaderState = false;          // the textures are in the shader-resource state (DLSS read them last)
 +};
 diff --git a/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h b/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h
 index 089d8c2..69eb3d0 100644
@@ -397,10 +554,10 @@ index 089d8c2..69eb3d0 100644
      feature_version Version() override { return feature_version { 1, 0, 0 }; }
      Upscaler GetUpscalerType() const final { return Upscaler::MetalFX; }
 diff --git a/OptiScaler/upscalers/metalfx/m4r.h b/OptiScaler/upscalers/metalfx/m4r.h
-index 8930aa6..7038002 100644
+index 8930aa6..fcda6a1 100644
 --- a/OptiScaler/upscalers/metalfx/m4r.h
 +++ b/OptiScaler/upscalers/metalfx/m4r.h
-@@ -48,6 +48,18 @@ typedef struct m4r_interpolate_desc {
+@@ -48,6 +48,23 @@ typedef struct m4r_interpolate_desc {
      int depth_reversed, reset;
  } m4r_interpolate_desc;
  
@@ -414,12 +571,17 @@ index 8930aa6..7038002 100644
 +    float jitter_x, jitter_y, motion_scale_x, motion_scale_y, pre_exposure;
 +    int reset, depth_reversed, hardware_depth, roughness_in_normals_w, motion_low_res, specular_hit_in_w;
 +    int flip_upscale_jitter;   /* the jitter is given in DLSS's convention; the upscaling step wants MetalFX's (opposite sign) */
++    /* Optional: when denoised_out is set, the denoised colour (render size, RGBA16F, in the game's units) is copied into it and the
++     * MetalFX upscaler is NOT run (the caller upscales, e.g. with DLSS Super Resolution). For games without hardware depth
++     * (hardware_depth = 0) depth_out (R32F, render size) receives the depth in the game's own projection convention
++     * (z * [2][2] + [3][2]) / (z * [2][3] + [3][3]), sky = the far value, for that upscaler. */
++    m4r_image denoised_out, depth_out;
 +} m4r_denoise_desc;
 +
  /* Frame generation at present time. The finished frame (backbuffer, display size) and this frame's render-size depth
   * and motion vectors go in; m4r keeps a copy of the frame and, once it has the previous one, writes the MetalFX
   * in-between frame into the backbuffer. */
-@@ -65,6 +77,16 @@ M4R_API void m4r_destroy(m4r_context* ctx);
+@@ -65,6 +82,16 @@ M4R_API void m4r_destroy(m4r_context* ctx);
  /* 0 on success; a non-zero return means the configuration is not prepared or not supported (see m4r_last_error) */
  M4R_API int m4r_upscale_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t max_in_w, uint32_t max_in_h);
  M4R_API int m4r_upscale(m4r_context* ctx, VkCommandBuffer cb, const m4r_upscale_desc* desc);

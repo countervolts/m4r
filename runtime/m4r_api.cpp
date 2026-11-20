@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <fstream>
 #include <cstdlib>
 #include <map>
 #include <memory>
@@ -37,6 +38,7 @@ struct m4r_context {
     bool exposureOneCleared = false;   // bbr[1]: plan for reversed depth, bbr[0]: forward depth (plans are specialised for it)
     uint32_t bbrSize[4] = {}, fgSize[4] = {};
     bool bbrInit = false;
+    bool bbrTried[2] = {false, false};   // the plan of this depth convention was loaded (or failed to) on its first use
     std::map<uint64_t, bool> bbrNoPlan;   // content sizes without a plan of their own (looked up once)
     uint64_t bbrFrame[2] = {}, fgFrame = 0;
     float prevDt = 1.0f / 60.0f;
@@ -321,18 +323,22 @@ M4R_API int m4r_upscale_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t 
     if (c->bbrInit && !std::memcmp(s, c->bbrSize, sizeof s)) return 0;
     // The plan depends on the depth convention (the kernels differ), so each one has its own: bbr-WxH-wxh for reversed depth
     // (what most engines use), bbr-WxH-wxh-fwd for forward depth. Either is enough here; m4r_upscale picks by desc->depth_reversed.
-    std::unique_ptr<Plan> plans[2];
+    // Only checked here, loaded on the first m4r_upscale of that convention: a plan holds about 260 MB of textures and buffers at
+    // 1280x720 -> 2560x1440, and a game uses one convention (Ray Reconstruction with DLSS Super Resolution after it uses none).
+    // With the VRAM full every spilled megabyte slows the frame, so what is not used is not allocated.
     std::string why;
+    bool any = false;
     for (int rev = 0; rev < 2; ++rev) {
-        auto p = std::make_unique<Plan>(c->rt);
-        if (p->load(c->dir + "/" + sizeName("bbr", s) + (rev ? "" : "-fwd"))) plans[rev] = std::move(p);
-        else why += (why.empty() ? "" : "; ") + p->error;
+        const std::string dir = c->dir + "/" + sizeName("bbr", s) + (rev ? "" : "-fwd");
+        if (std::ifstream(dir + "/plan.txt")) any = true;
+        else why += (why.empty() ? "" : "; ") + dir + "/plan.txt missing";
     }
-    if (!plans[0] && !plans[1]) { c->error = why; return 1; }
+    if (!any) { c->error = why; return 1; }
     if (!c->exposureOne.image) {
         if (!c->vk.createTexture(c->exposureOne, VK_FORMAT_R32_SFLOAT, 1, 1)) { c->error = "exposure texture"; return 1; }
     }
-    c->bbr[0] = std::move(plans[0]); c->bbr[1] = std::move(plans[1]);
+    c->bbr[0].reset(); c->bbr[1].reset();
+    c->bbrTried[0] = c->bbrTried[1] = false;
     std::memcpy(c->bbrSize, s, sizeof s);
     c->bbrInit = true;
     c->bbrFrame[0] = c->bbrFrame[1] = 0;
@@ -584,6 +590,44 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
         return 1;
     }
     Plan& p = *c->dn;
+    // Games without hardware depth (DLSS.Use.HW.Depth = 0; Alan Wake 2 gives linear view depth in R16F): the plan's lindepth pass makes
+    // reversed hardware depth from it (shaders/nn_lin2hw.comp) and everything after, the upscaler included, works on that with a
+    // matching projection (z row replaced: clip.z = near), see below. Hardware depth games are untouched.
+    const bool linearDepth = !d->hardware_depth;
+    constexpr float kLinNear = 0.02f;
+    m4r_denoise_desc fixedDesc = *d;
+    const bool kOut = d->denoised_out.image != nullptr;   // the caller upscales: copy the denoised colour out, no BBR
+    float gameV2c[16];
+    std::memcpy(gameV2c, d->view_to_clip, sizeof gameV2c);   // the game's own projection (fixedDesc gets the synthetic z row)
+    if (linearDepth) {
+        if (p.firstOnly("lindepth") >= p.passes() || !p.buffer("depth_raw") || !p.buffer("depth_hw_buf") || !p.texture("depth_hw") ||
+            (kOut && (p.firstOnly("lindepthk") >= p.passes() || !p.buffer("depth_k_buf")))) {
+            c->error = "the game gives linear depth and the denoiser plan has no lindepth pass (prepare it again with m4r's install script)";
+            return 1;
+        }
+        if (d->depth.format != VK_FORMAT_R16_SFLOAT && d->depth.format != VK_FORMAT_R32_SFLOAT) {
+            c->error = "linear depth must be R16_FLOAT or R32_FLOAT";
+            return 1;
+        }
+        fixedDesc.view_to_clip[10] = 0.0f; fixedDesc.view_to_clip[14] = kLinNear;   // row-vector convention: clip.z = z * [2][2] + [3][2]
+        fixedDesc.depth_reversed = 1;
+    }
+    if (kOut && linearDepth && !d->depth_out.image) { c->error = "denoised_out with linear depth needs depth_out"; return 1; }
+    d = &fixedDesc;
+    // Games with an exposure texture and scene-referred colour (Alan Wake 2): the colour goes through the denoiser multiplied by the exposure
+    // and comes back divided by it (plan passes expose_in / expose_out, shaders/nn_expose.comp); the upscaler then gets the game's units
+    // and exposure texture. Without an exposure texture (Cyberpunk) nothing changes.
+    const bool colorOk = d->color.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || d->color.format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    const bool expOk = d->exposure.image && (d->exposure.format == VK_FORMAT_R32_SFLOAT || d->exposure.format == VK_FORMAT_R32G32_SFLOAT ||
+                                             d->exposure.format == VK_FORMAT_R16_SFLOAT) && !std::getenv("M4R_NO_EXPOSE");
+    const bool expose = expOk && colorOk;
+    if (expose) {
+        if (p.firstOnly("expose_in") >= p.passes() || p.firstOnly("expose_out") >= p.passes() || !p.buffer("col_raw") || !p.texture("color_exp")) {
+            c->error = "the game gives an exposure texture and the denoiser plan has no exposure passes (prepare it again with m4r's install script)";
+            return 1;
+        }
+        if (c->dnV3) { c->error = "the V3 denoiser plan does not handle exposure yet (use the dn plan: remove the dn3 plans)"; return 1; }
+    }
     const Texture *color = c->wrap(d->color), *depth = c->wrap(d->depth), *motion = c->wrap(d->motion), *normals = c->wrap(d->normals),
                   *diffuse = c->wrap(d->diffuse_albedo), *specular = c->wrap(d->specular_albedo);
     if (!color || !depth || !motion || !normals || !diffuse || !specular || !d->output.image) {
@@ -599,6 +643,11 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     LayoutGuard g{cb};
     for (const m4r_image* im : {&d->color, &d->depth, &d->motion, &d->normals, &d->diffuse_albedo, &d->specular_albedo, &d->roughness})
         g.add(*im);
+    if (expose) g.add(d->exposure);
+    if (kOut) { g.add(d->denoised_out); if (linearDepth) g.add(d->depth_out); }
+    // the game's specular hit distance replaces the 1x1 placeholder; the kernels read it only in plans built with spec_hit_dist_enabled
+    const Texture* specHit = d->specular_hit.image && !d->specular_hit_in_w ? c->wrap(d->specular_hit) : nullptr;
+    if (specHit) g.add(d->specular_hit);
     if (c->dnV3 && !c->dnHybrid && !c->dnAlbedo) g.add(d->output);
     g.begin();
     if (!c->exposureOneCleared) {
@@ -611,6 +660,7 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     p.bindTexture("color", color); p.bindTexture("depth", depth); p.bindTexture("motion", motion); p.bindTexture("normals", normals);
     p.bindTexture("diffuse", diffuse); p.bindTexture("specular", specular); p.bindTexture("exposure", exposure);
     if (rough) p.bindTexture("roughness", rough);
+    if (specHit) p.bindTexture("spechit", specHit);
 
     // Per-frame parameters (BRNetShaderParams-style structs of MetalFX's BFNet filter, docs/metalfx-denoiser.md)
     const uint32_t W = (iw + 7) & ~7u, H = (ih + 7) & ~7u, tw = ((iw + 15) >> 1) & ~7u, th = ((ih + 15) >> 1) & ~7u;
@@ -695,6 +745,61 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
         c->vk.barrier(cb);
         first = 1;
     }
+    bool exposeOut = false;
+    if (expose && ok) {   // colour * exposure -> color_exp (plan pass expose_in); the denoiser reads that
+        Buffer *craw = p.buffer("col_raw"), *cexp = p.buffer("col_exp_buf"), *eraw = p.buffer("exp_raw");
+        Texture* cet = p.texture("color_exp");
+        struct { uint32_t colorFmt, expFmt; } xp{d->color.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ? 1u : 0u,
+                                                  d->exposure.format == VK_FORMAT_R16_SFLOAT ? 1u : 0u};
+        p.bindBuffer("ex_par", c->rt.transient(&xp, sizeof xp));
+        VkBufferImageCopy cp{}, ce{};
+        cp.imageSubresource = ce.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        cp.imageExtent = {iw, ih, 1}; ce.imageExtent = {1, 1, 1};
+        c->vk.barrier(cb);
+        vkCmdCopyImageToBuffer(cb, color->image, VK_IMAGE_LAYOUT_GENERAL, craw->buffer, 1, &cp);
+        vkCmdCopyImageToBuffer(cb, d->exposure.image, VK_IMAGE_LAYOUT_GENERAL, eraw->buffer, 1, &ce);
+        c->vk.barrier(cb);
+        p.setFlag("expose_in", true);
+        ok = p.record(cb, p.firstOnly("expose_in"), 1);
+        p.setFlag("expose_in", false);
+        c->vk.barrier(cb);
+        vkCmdCopyBufferToImage(cb, cexp->buffer, cet->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        c->vk.barrier(cb);
+        p.bindTexture("color", cet);
+        exposeOut = true;
+    }
+    if (linearDepth && ok) {   // linear depth -> reversed hardware depth (plan pass lindepth), then it is the game's depth for the rest
+        Buffer *raw = p.buffer("depth_raw"), *hwb = p.buffer("depth_hw_buf");
+        Texture* hwt = p.texture("depth_hw");
+        // the game's own projection terms (the synthetic z row is in fixedDesc, not in the descriptor the caller gave)
+        struct { float nearZ, m23, m33; uint32_t isFloat; float sky, m22, m32; } pp{kLinNear, std::fabs(d->view_to_clip[11]), d->view_to_clip[15],
+                                                                              d->depth.format == VK_FORMAT_R32_SFLOAT ? 1u : 0u, 6.0e4f, 0.0f, 0.0f};
+        p.bindBuffer("lin_par", c->rt.transient(&pp, sizeof pp));
+        if (kOut) {   // the same depth in the game's convention for the upscaler that follows (plan pass lindepthk)
+            auto pk = pp; pk.m22 = gameV2c[10]; pk.m32 = gameV2c[14]; pk.m23 = gameV2c[11]; pk.m33 = gameV2c[15];
+            p.bindBuffer("lin_par_k", c->rt.transient(&pk, sizeof pk));
+        }
+        VkBufferImageCopy cp{};
+        cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        cp.imageExtent = {iw, ih, 1};
+        c->vk.barrier(cb);
+        vkCmdCopyImageToBuffer(cb, depth->image, VK_IMAGE_LAYOUT_GENERAL, raw->buffer, 1, &cp);
+        c->vk.barrier(cb);
+        p.setFlag("lindepth", true);
+        ok = p.record(cb, p.firstOnly("lindepth"), 1);
+        p.setFlag("lindepth", false);
+        if (kOut && ok) {
+            p.setFlag("lindepthk", true);
+            ok = p.record(cb, p.firstOnly("lindepthk"), 1);
+            p.setFlag("lindepthk", false);
+        }
+        c->vk.barrier(cb);
+        vkCmdCopyBufferToImage(cb, hwb->buffer, hwt->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        if (kOut && ok) vkCmdCopyBufferToImage(cb, p.buffer("depth_k_buf")->buffer, fixedDesc.depth_out.image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        c->vk.barrier(cb);
+        p.bindTexture("depth", hwt);
+        fixedDesc.depth = ownedImage(*hwt);
+    }
     // m4r's own passes on the denoised colour, a block of `only despeckle` / `only glossy` passes right after MetalFX's denoiser (before
     // the V3 stage, if the plan has one), run on buffer copies: the interim firefly clamp (den_raw -> den_cl) and the glossy-in-motion
     // smoothing (den_cl -> ... -> den_cl; needs the normals copy with roughness in w and buffer copies of int_depth / int_motion).
@@ -711,8 +816,39 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     const bool glossy = !noGlossy && dRaw && dCl && denTex && glD && glM && iDepth && iMotion && first == 1 &&
                         p.firstOnly("glossy") < p.passes();
     p.setFlag("despeckle", despeckle); p.setFlag("glossy", glossy);
+    // mirror gating (m4r, not MetalFX; shaders/nn_mirror.comp, M4R_NO_MIRROR_GATE=1 off): needs the plan's temporal-only remodulation
+    // (flag mirrort) and the roughness extracted from the normals; not on V3 plans
+    static const bool noMirror = std::getenv("M4R_NO_MIRROR_GATE") != nullptr;
+    Buffer *mDen = p.buffer("mir_den"), *mT = p.buffer("mir_t"), *mRough = p.buffer("rough_raw");
+    Texture* dnT = p.texture("denoised_t");
+    const bool mirror = !noMirror && !c->dnV3 && mDen && mT && mRough && dnT && denTex && first == 1 && p.firstOnly("mirrorb") < p.passes();
+    p.setFlag("mirrort", mirror);
+    // The fourth (largest, 32 px) bilateral pass of MetalFX's filter is skipped by default: about -0.5 ms at 720p, and on Alan Wake 2 and
+    // Cyberpunk captures (static and moving) the rough-surface noise and sharpness do not change (0.0712 -> 0.0715, 0.184 -> 0.185).
+    // M4R_ATROUS_ITERS=4 runs all four as MetalFX does (m4r, not MetalFX).
+    static const bool atr3 = !(std::getenv("M4R_ATROUS_ITERS") && std::atoi(std::getenv("M4R_ATROUS_ITERS")) == 4);
+    p.setFlag("atr3", atr3);
     ok = ok && p.record(cb, first, lo > first ? lo - first : 0);
     c->vk.barrier(cb);
+    if (mirror && ok) {   // filtered result := temporal-only result on mirror-like pixels (roughness gate in the shader)
+        static const float r0 = std::getenv("M4R_MIRROR_R0") ? float(std::atof(std::getenv("M4R_MIRROR_R0"))) : 0.10f;
+        static const float r1 = std::getenv("M4R_MIRROR_R1") ? float(std::atof(std::getenv("M4R_MIRROR_R1"))) : 0.15f;
+        const float mp[4] = {r0, r1, 1.0f, 0.0f};
+        p.bindBuffer("mir_par", c->rt.transient(mp, sizeof mp));
+        VkBufferImageCopy cp{};
+        cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        cp.imageExtent = {iw, ih, 1};
+        vkCmdCopyImageToBuffer(cb, denTex->image, VK_IMAGE_LAYOUT_GENERAL, mDen->buffer, 1, &cp);
+        vkCmdCopyImageToBuffer(cb, dnT->image, VK_IMAGE_LAYOUT_GENERAL, mT->buffer, 1, &cp);
+        c->vk.barrier(cb);
+        p.setFlag("mirrorb", true);
+        ok = p.record(cb, p.firstOnly("mirrorb"), 1);
+        p.setFlag("mirrorb", false);
+        c->vk.barrier(cb);
+        vkCmdCopyBufferToImage(cb, mDen->buffer, denTex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        c->vk.barrier(cb);
+    }
+    p.setFlag("mirrort", false);
     if ((despeckle || glossy) && ok) {
         VkBufferImageCopy cp{};
         cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -733,6 +869,31 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
         ok = p.record(cb, hi);
         c->vk.barrier(cb);
     }
+    if (exposeOut && ok) {   // the denoised colour / exposure: back to the game's units for the upscaler
+        Buffer* eden = p.buffer("ex_den");
+        Texture* denT = p.texture("denoised");
+        if (eden && denT) {
+            VkBufferImageCopy cp{};
+            cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            cp.imageExtent = {iw, ih, 1};
+            vkCmdCopyImageToBuffer(cb, denT->image, VK_IMAGE_LAYOUT_GENERAL, eden->buffer, 1, &cp);
+            c->vk.barrier(cb);
+            p.setFlag("expose_out", true);
+            ok = p.record(cb, p.firstOnly("expose_out"), 1);
+            p.setFlag("expose_out", false);
+            c->vk.barrier(cb);
+            vkCmdCopyBufferToImage(cb, eden->buffer, denT->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+            c->vk.barrier(cb);
+        }
+    }
+    if (kOut && ok) {   // the denoised colour, in the game's units, into the caller's image
+        Texture* denK = p.texture("denoised");
+        VkImageCopy ic{};
+        ic.srcSubresource = ic.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        ic.extent = {iw, ih, 1};
+        vkCmdCopyImage(cb, denK->image, VK_IMAGE_LAYOUT_GENERAL, fixedDesc.denoised_out.image, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+        c->vk.barrier(cb);
+    }
     g.end();
     if (!ok) { c->error = p.error; return 1; }
     std::memcpy(c->dnPrevVp, curr.data(), sizeof c->dnPrevVp);
@@ -742,6 +903,7 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     Texture* den = p.texture("denoised");
     if (!den) { c->error = "denoiser plan has no 'denoised' texture"; return 1; }
     captureOut(c, cb, 0, den->image, den->width, den->height, den->format);
+    if (kOut) return 0;   // the caller upscales
     if (c->dnV3 && c->dnAlbedo) return albedoDetail(c, cb, p, d);
     if (c->dnV3 && !c->dnHybrid) {   // the plan wrote the final image into the game's output texture
         if (g_rrCurrent) {
@@ -830,6 +992,11 @@ M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_de
         }
     }
     const int rev = d->depth_reversed ? 1 : 0;
+    if (!c->bbr[rev] && !c->bbrTried[rev]) {   // first use of this depth convention: load its plan now
+        c->bbrTried[rev] = true;
+        auto p = std::make_unique<Plan>(c->rt);
+        if (p->load(c->dir + "/" + sizeName("bbr", c->bbrSize) + (rev ? "" : "-fwd"))) c->bbr[rev] = std::move(p);
+    }
     if (!c->bbr[rev]) { c->error = std::string("no plan for ") + (rev ? "reversed" : "forward") + " depth (prepare it with --reversed-depth " + (rev ? "1" : "0") + ")"; return 1; }
     dumpUpscale(c, cb, d, cw, ch);
     ++c->upCalls;

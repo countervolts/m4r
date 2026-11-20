@@ -67,8 +67,10 @@ class Gen:
             self.lines.append(f'glsl {name} {name}.spv {lx} {ly} 1')
             self.kernels[('glsl', name)] = name
 
-    def run(self, kernel, w, h, bufs, consts, z=1):   # GLSL pass (shaders/nn_*.comp): buffers in slots 0.., constants from binding 8
+    def run(self, kernel, w, h, bufs, consts, z=1, only=None):   # GLSL pass (shaders/nn_*.comp): buffers in slots 0.., constants from binding 8
         self.lines.append(f'pass {kernel} threads {w} {h} {z}')
+        if only:
+            self.lines.append('  only ' + only)
         for i, b in enumerate(bufs):
             self.lines.append(f'  buf {i} {b}')
         for i, c in enumerate(consts):
@@ -115,6 +117,23 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
         g.texture('roughness', 'R16_SFLOAT', iw, ih); g.texture('spechit', 'R32_SFLOAT', 1, 1)
         g.glsl('nn_rough', os.path.join(ROOT, 'shaders', 'nn_rough.comp'))
         g.run('nn_rough', iw, ih, ['nrm_raw', 'rough_raw'], [iw, ih])
+        # games without hardware depth (DLSS.Use.HW.Depth = 0, Alan Wake 2: linear R16F): m4r copies the depth to depth_raw, this pass
+        # (flag lindepth) makes reversed hardware depth in depth_hw_buf, m4r copies that into depth_hw and uses it as 'depth'
+        g.buffer('depth_raw', iw * ih * 4); g.buffer('depth_hw_buf', iw * ih * 4); g.buffer('lin_par', 32)
+        g.texture('depth_hw', 'R32_SFLOAT', iw, ih)
+        g.glsl('nn_lin2hw', os.path.join(ROOT, 'shaders', 'nn_lin2hw.comp'))
+        g.run('nn_lin2hw', iw, ih, ['depth_raw', 'depth_hw_buf', 'lin_par'], [iw, ih, 0], only='lindepth')
+        # the same depth in the game's own convention for DLSS Super Resolution after the denoiser (flag lindepthk, mode 1)
+        g.buffer('depth_k_buf', iw * ih * 4); g.buffer('lin_par_k', 32)
+        g.run('nn_lin2hw', iw, ih, ['depth_raw', 'depth_k_buf', 'lin_par_k'], [iw, ih, 1], only='lindepthk')
+        # games with an exposure texture and scene-referred colour (Alan Wake 2: colour ~1e4, exposure 5e-5): flag expose_in multiplies the
+        # colour by the exposure into color_exp (the denoiser's colour), flag expose_out divides the denoised colour by it again
+        g.buffer('col_raw', iw * ih * 8); g.buffer('col_exp_buf', iw * ih * 8); g.buffer('ex_den', iw * ih * 8)
+        g.buffer('exp_raw', 16); g.buffer('ex_par', 16)
+        g.texture('color_exp', 'R16G16B16A16_SFLOAT', iw, ih)
+        g.glsl('nn_expose', os.path.join(ROOT, 'shaders', 'nn_expose.comp'))
+        g.run('nn_expose', iw, ih, ['col_raw', 'col_exp_buf', 'ex_par', 'exp_raw'], [iw, ih, 0], only='expose_in')
+        g.run('nn_expose', iw, ih, ['ex_den', 'ex_den', 'ex_par', 'exp_raw'], [iw, ih, 1], only='expose_out')
     # DPreProcessing: BRNet_v3_Filter::encodeExposureCalcForDenoiser. With an exposure texture: exposure_texture_to_buffer; without one
     # (DLSS AutoExposure) MetalFX's auto exposure over the content area: luma_log_sum_denoiser (one group of 1024) and
     # luma_log_sum_to_exposure_denoiser (one group of 1024). The runtime picks the path per frame (flag autoexp).
@@ -185,18 +204,40 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
             ['tex 0 warp_color', 'tex 1 warp_prev', 'tex 2 warp_color', 'tex 3 bw1|bw0', 'tex 22 boost', 'tex 5 dbf_tw',
              'tex 6 fc0|fc1', 'tex 7 dy0|dy1'])
     srcs = ['warp_color', 'hist', 'warp_color', 'warp_prev']; dsts = ['hist', 'warp_color', 'warp_prev', 'warp_color']
-    for i in range(4):
+    if runtime and not os.environ.get('M4R_PLAN_NO_MIRROR'):
+        # mirror gating (m4r, not MetalFX; shaders/nn_mirror.comp): the temporal blend alone, remodulated like the final colour, into
+        # denoised_t before the bilateral passes overwrite it (flag mirrort, on for the frame); m4r then blends it into the filtered
+        # result on mirror-like pixels (flag mirrorb, set for that one pass)
+        g.texture('denoised_t', 'R16G16B16A16_SFLOAT', iw, ih)
+        g.buffer('mir_den', iw * ih * 8); g.buffer('mir_t', iw * ih * 8); g.buffer('mir_par', 16)
+        g.run_k('denoiser_between_processing', {'bfnet1_enabled': True, 'str_mask_enabled': False, 'compose_buffer_enabled': False},
+                (8, 8, 1), (W, H, 1),
+                ['tex 0 warp_color', 'tex 1 color', 'tex 4 shin', 'tex 5 denoised_t', 'tex 6 specular', 'tex 7 diffuse', 'tex 8 roughness',
+                 'tex 9 dbf_tw', 'buf 10 exp0|exp1', 'buf 11 preexp'], only='mirrort')
+        g.glsl('nn_mirror', os.path.join(ROOT, 'shaders', 'nn_mirror.comp'))
+        g.run('nn_mirror', iw, ih, ['mir_den', 'mir_t', 'rough_raw', 'mir_par'], [iw, ih], only='mirrorb')
+    iters = int(os.environ.get('M4R_PLAN_ITERS', '4'))   # experiment: fewer a-trous iterations (the filter's result is in finals[iters])
+    finals = ['warp_color', 'hist', 'warp_color', 'warp_prev', 'warp_color']
+    for i in range(iters):
         m = 4 << i
         g.run_k('bilateral', {'bfnet1_enabled': True, 'spec_hit_dist_enabled': False}, (8, 8, 1),
                 ((W + m - 1) // m * m, (H + m - 1) // m * m, 1),
                 [f'tex 0 {srcs[i]}', 'tex 1 nr1|nr0', f'tex 2 {dsts[i]}', 'tex 3 shin', 'tex 4 dbf_noise', 'tex 5 dbf_feat',
                  'tex 6 int_depth', 'tex 7 mmr',
                  'bytes 0 ' + struct.pack('<4I', 1 << i, i, (~(-1 << i)) & 0xffffffff, (-4 << i) & 0xffffffff).hex(),
-                 'bytes 1 ' + struct.pack('<I', i).hex(), 'buf 2 reset'])
-    g.run_k('denoiser_between_processing', {'bfnet1_enabled': True, 'str_mask_enabled': False, 'compose_buffer_enabled': False},
-            (8, 8, 1), (W, H, 1),
-            ['tex 0 warp_color', 'tex 1 color', 'tex 4 shin', 'tex 5 denoised', 'tex 6 specular', 'tex 7 diffuse', 'tex 8 roughness',
-             'tex 9 dbf_tw', 'buf 10 exp0|exp1', 'buf 11 preexp'])
+                 'bytes 1 ' + struct.pack('<I', i).hex(), 'buf 2 reset'], only='!atr3' if runtime and iters == 4 and i == 3 else None)
+    # runtime plans: the fourth (32 px) bilateral pass is skipped when the run-time flag atr3 is set (M4R_ATROUS_ITERS=3: about -0.5 ms at
+    # 720p); the remodulation then reads the third pass's result. With the flag clear (the default everywhere) it is MetalFX's four passes.
+    def between(src, only=None):
+        g.run_k('denoiser_between_processing', {'bfnet1_enabled': True, 'str_mask_enabled': False, 'compose_buffer_enabled': False},
+                (8, 8, 1), (W, H, 1),
+                ['tex 0 ' + src, 'tex 1 color', 'tex 4 shin', 'tex 5 denoised', 'tex 6 specular', 'tex 7 diffuse', 'tex 8 roughness',
+                 'tex 9 dbf_tw', 'buf 10 exp0|exp1', 'buf 11 preexp'], only=only)
+    if runtime and iters == 4:
+        between(finals[4], '!atr3')
+        between(finals[3], 'atr3')
+    else:
+        between(finals[iters])
     if runtime:
         # m4r's own passes on the denoised colour (not MetalFX): m4r copies 'denoised' out to buffers, runs these, copies den_cl back.
         # The interim firefly clamp (only despeckle, den_raw -> den_cl) on both paths (before V3 it cuts the puddle grain V3 leaves,

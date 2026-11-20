@@ -1,0 +1,43 @@
+// m4r: linear view depth -> reversed hardware depth, for Ray Reconstruction games that do not give hardware depth
+// (DLSS.Use.HW.Depth = 0; Alan Wake 2: R16_FLOAT, distance along the view axis, sky = 65504). MetalFX's denoiser kernels
+// (and the BBR upscaler) read hardware depth and rebuild positions from it with the inverse of ViewToClip, so the depth is made
+// with a projection of the game's own x/y/w terms and a reversed infinite-far z row (z_clip = near): d = near / w. The runtime
+// gives the denoiser the same synthetic matrix (view_to_clip[2][2] = 0, [3][2] = near), so the round trip is exact.
+// args: 0 input [H][W] half or float (the image's raw texels), 1 output [H][W] float, 2 params;
+// params: float near, float |view_to_clip[2][3]|, float view_to_clip[3][3], uint input_is_float32, float sky_threshold,
+//         float view_to_clip[2][2], float view_to_clip[3][2]
+// consts 8 W, 9 H, 10 mode: 0 = the synthetic reversed depth above (for the denoiser); 1 = the game's own projection,
+//         d = (z * [2][2] + [3][2]) / (z * [2][3] + [3][3]) clamped to 0..1, sky = [2][2] clamped (what the game's hardware depth would
+//         be; for DLSS Super Resolution, which takes the game's depth convention)
+// SPDX-License-Identifier: GPL-3.0-only
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer Half { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Flt { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Out { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Par { float nearZ, m23, m33; uint isFloat; float sky; float m22, m32; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
+layout(push_constant) uniform Push { Args a; } pc;
+void main() {
+    Args a = pc.a;
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= a.c[0] || p.y >= a.c[1]) return;
+    const uint i = p.y * a.c[0] + p.x;
+    Par par = Par(a.slot[2]);
+    const float lin = par.isFloat != 0u ? Flt(a.slot[0]).v[i] : float(Half(a.slot[0]).v[i]);
+    // no surface (zero, negative, NaN) or the far marker: infinitely far = 0 in reversed depth
+    float d = 0.0;
+    if (a.c[2] == 1u) {
+        d = clamp(par.m22, 0.0, 1.0);   // the far value of the game's projection
+        if (lin > 0.0 && lin < par.sky) {
+            const float w = lin * par.m23 + par.m33;
+            if (w > 0.0) d = clamp((lin * par.m22 + par.m32) / w, 0.0, 1.0);
+        }
+    } else if (lin > 0.0 && lin < par.sky) {
+        const float w = lin * par.m23 + par.m33;
+        if (w > 0.0) d = par.nearZ / w;
+    }
+    Out(a.slot[1]).v[i] = d;
+}
