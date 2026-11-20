@@ -315,8 +315,19 @@ M4R_API int m4r_denoise_capture(m4r_context* c, VkCommandBuffer cb, const m4r_de
     writeRrDumps(c, false);
     const char* st = std::getenv("M4R_DUMP_RR_START");
     const char* nn = std::getenv("M4R_DUMP_RR_COUNT");
-    const uint64_t start = st ? std::strtoull(st, nullptr, 10) : 300, count = nn ? std::strtoull(nn, nullptr, 10) : 6;
+    // Capture is started by creating the file <dir>/trigger (checked every 10 frames; the file is removed when it is seen), or
+    // at frame M4R_DUMP_RR_START when that is set.
+    static uint64_t start = ~0ull;
+    const uint64_t count = nn ? std::strtoull(nn, nullptr, 10) : 6;
     const uint64_t call = g_rrCalls++;
+    if (start == ~0ull) {
+        if (st && call >= std::strtoull(st, nullptr, 10)) start = call;
+        else if (call % 10 == 0) {
+            char tr[512];
+            std::snprintf(tr, sizeof tr, "%s/trigger", dir);
+            if (FILE* f = std::fopen(tr, "rb")) { std::fclose(f); std::remove(tr); start = call + 1; }
+        }
+    }
     if (call < start || call >= start + count) return 0;
     RrDump u;
     u.call = call;

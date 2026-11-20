@@ -76,7 +76,7 @@ M4R_API void m4r_destroy(m4r_context* ctx);
 /* 0 on success; a non-zero return means the configuration is not prepared or not supported (see m4r_last_error) */
 M4R_API int m4r_upscale_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t max_in_w, uint32_t max_in_h);
 M4R_API int m4r_upscale(m4r_context* ctx, VkCommandBuffer cb, const m4r_upscale_desc* desc);
-/* M4R_DUMP_RR=<dir> (+ M4R_DUMP_RR_START, M4R_DUMP_RR_COUNT): writes the raw texels of the Ray Reconstruction inputs and the
+/* M4R_DUMP_RR=<dir> (+ M4R_DUMP_RR_COUNT, default 6 frames): creating the file <dir>/trigger starts a capture; writes the raw texels of the Ray Reconstruction inputs and the
  * frame's parameters (rr-NN-<name>.raw, rr-NN.txt) for offline work on the denoiser. Does nothing when unset. 0 = ok. */
 M4R_API int m4r_denoise_capture(m4r_context* ctx, VkCommandBuffer cb, const m4r_denoise_desc* desc);
 M4R_API int m4r_interpolate_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);
