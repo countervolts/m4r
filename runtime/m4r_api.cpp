@@ -184,6 +184,35 @@ static void dumpUpscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_de
     c->upDumps.push_back(std::move(u));
 }
 
+// M4R_DUMP_RR: Ray Reconstruction inputs
+struct RrDump {
+    static const int N = 11;
+    Buffer buf[N]; uint32_t w[N] = {}, h[N] = {}, bpp[N] = {}; uint64_t call = 0; std::string meta; bool written = false;
+};
+static std::vector<RrDump> g_rrDumps;
+static uint64_t g_rrCalls = 0;
+static const char* const kRrNames[RrDump::N] = {"color", "depth", "motion", "diffuse_albedo", "specular_albedo", "normals", "roughness",
+                                                "specular_hit", "diffuse_hit", "before_particles", "exposure"};
+
+static void writeRrDumps(m4r_context* c, bool all) {
+    const char* dir = std::getenv("M4R_DUMP_RR");
+    if (!dir) return;
+    for (size_t i = 0; i < g_rrDumps.size(); ++i) {
+        auto& u = g_rrDumps[i];
+        if (u.written || (!all && g_rrCalls < u.call + 6)) continue;
+        char nm[512];
+        for (int k = 0; k < RrDump::N; ++k) {
+            if (!u.buf[k].buffer) continue;
+            std::snprintf(nm, sizeof nm, "%s/rr-%02llu-%s.raw", dir, (unsigned long long) u.call, kRrNames[k]);
+            if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(u.buf[k].map, 1, size_t(u.w[k]) * u.h[k] * u.bpp[k], f); std::fclose(f); }
+            c->vk.destroyBuffer(u.buf[k]);
+        }
+        std::snprintf(nm, sizeof nm, "%s/rr-%02llu.txt", dir, (unsigned long long) u.call);
+        if (FILE* f = std::fopen(nm, "w")) { std::fputs(u.meta.c_str(), f); std::fclose(f); }
+        u.written = true;
+    }
+}
+
 // full-image layout change with a full memory dependency (used around transfers on caller images)
 static void transition(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to) {
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -243,6 +272,7 @@ M4R_API void m4r_destroy(m4r_context* c) {
     if (!c) return;
     flushDump(c);
     writeUpDumps(c, true);
+    writeRrDumps(c, true);
     if (c->dumpDepth.buffer) { c->vk.destroyBuffer(c->dumpDepth); c->vk.destroyBuffer(c->dumpMotion); }
     c->bbr[0].reset(); c->bbr[1].reset(); c->fg.reset();
     for (auto& [img, t] : c->wrapped) c->vk.destroyTexture(t);
@@ -276,6 +306,58 @@ M4R_API int m4r_upscale_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t 
     std::memcpy(c->bbrSize, s, sizeof s);
     c->bbrInit = true;
     c->bbrFrame[0] = c->bbrFrame[1] = 0;
+    return 0;
+}
+
+M4R_API int m4r_denoise_capture(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_desc* d) {
+    const char* dir = std::getenv("M4R_DUMP_RR");
+    if (!dir) return 0;
+    writeRrDumps(c, false);
+    const char* st = std::getenv("M4R_DUMP_RR_START");
+    const char* nn = std::getenv("M4R_DUMP_RR_COUNT");
+    const uint64_t start = st ? std::strtoull(st, nullptr, 10) : 300, count = nn ? std::strtoull(nn, nullptr, 10) : 6;
+    const uint64_t call = g_rrCalls++;
+    if (call < start || call >= start + count) return 0;
+    RrDump u;
+    u.call = call;
+    const m4r_image* ims[RrDump::N] = {&d->color, &d->depth, &d->motion, &d->diffuse_albedo, &d->specular_albedo, &d->normals,
+                                       &d->roughness, &d->specular_hit, &d->diffuse_hit, &d->color_before_particles, &d->exposure};
+    LayoutGuard g{cb};
+    for (auto* im : ims) g.add(*im);
+    g.begin();
+    std::string meta;
+    char line[2048];
+    for (int k = 0; k < RrDump::N; ++k) {
+        const m4r_image& im = *ims[k];
+        if (!im.image) continue;
+        u.w[k] = im.width; u.h[k] = im.height; u.bpp[k] = texelBytes(im.format);
+        std::snprintf(line, sizeof line, "image %s format %d size %u %u bpp %u\n", kRrNames[k], int(im.format), im.width, im.height, u.bpp[k]);
+        meta += line;
+        if (!u.bpp[k]) continue;
+        c->vk.createBuffer(u.buf[k], size_t(im.width) * im.height * u.bpp[k], true);
+        const bool depthFmt = im.format == VK_FORMAT_D32_SFLOAT || im.format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                              im.format == VK_FORMAT_D24_UNORM_S8_UINT || im.format == VK_FORMAT_X8_D24_UNORM_PACK32 ||
+                              im.format == VK_FORMAT_D16_UNORM;
+        VkBufferImageCopy r{};
+        r.imageSubresource = {VkImageAspectFlags(depthFmt ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 0, 1};
+        r.imageExtent = {im.width, im.height, 1};
+        vkCmdCopyImageToBuffer(cb, im.image, VK_IMAGE_LAYOUT_GENERAL, u.buf[k].buffer, 1, &r);
+    }
+    c->vk.barrier(cb);
+    g.end();
+    std::snprintf(line, sizeof line, "output %u %u\ncontent %u %u\njitter %.9g %.9g\nmvscale %.9g %.9g\npreexposure %.9g\nreset %d\n"
+                  "depth_reversed %d\nhardware_depth %d\nroughness_in_normals_w %d\nmotion_low_res %d\nspecular_hit_in_w %d\n",
+                  d->output.width, d->output.height, d->content_width, d->content_height, d->jitter_x, d->jitter_y, d->motion_scale_x,
+                  d->motion_scale_y, d->pre_exposure, d->reset, d->depth_reversed, d->hardware_depth, d->roughness_in_normals_w,
+                  d->motion_low_res, d->specular_hit_in_w);
+    meta += line;
+    for (int m = 0; m < 2; ++m) {
+        meta += m ? "view_to_clip" : "world_to_view";
+        for (int i = 0; i < 16; ++i) { std::snprintf(line, sizeof line, " %.9g", m ? d->view_to_clip[i] : d->world_to_view[i]); meta += line; }
+        meta += "\n";
+    }
+    u.meta = meta;
+    g_rrDumps.push_back(std::move(u));
     return 0;
 }
 

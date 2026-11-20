@@ -48,6 +48,17 @@ typedef struct m4r_interpolate_desc {
     int depth_reversed, reset;
 } m4r_interpolate_desc;
 
+/* Ray Reconstruction (NGX feature 13) inputs, as the game gives them. Matrices are row-major float[16], row-vector convention
+ * (v' = v * M) as NGX uses them. Images that the game does not provide are VK_NULL_HANDLE. */
+typedef struct m4r_denoise_desc {
+    m4r_image color, depth, motion, diffuse_albedo, specular_albedo, normals, roughness, specular_hit, diffuse_hit,
+              color_before_particles, exposure, output;
+    float world_to_view[16], view_to_clip[16];
+    uint32_t content_width, content_height;
+    float jitter_x, jitter_y, motion_scale_x, motion_scale_y, pre_exposure;
+    int reset, depth_reversed, hardware_depth, roughness_in_normals_w, motion_low_res, specular_hit_in_w;
+} m4r_denoise_desc;
+
 /* Frame generation at present time. The finished frame (backbuffer, display size) and this frame's render-size depth
  * and motion vectors go in; m4r keeps a copy of the frame and, once it has the previous one, writes the MetalFX
  * in-between frame into the backbuffer. */
@@ -65,6 +76,9 @@ M4R_API void m4r_destroy(m4r_context* ctx);
 /* 0 on success; a non-zero return means the configuration is not prepared or not supported (see m4r_last_error) */
 M4R_API int m4r_upscale_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t max_in_w, uint32_t max_in_h);
 M4R_API int m4r_upscale(m4r_context* ctx, VkCommandBuffer cb, const m4r_upscale_desc* desc);
+/* M4R_DUMP_RR=<dir> (+ M4R_DUMP_RR_START, M4R_DUMP_RR_COUNT): writes the raw texels of the Ray Reconstruction inputs and the
+ * frame's parameters (rr-NN-<name>.raw, rr-NN.txt) for offline work on the denoiser. Does nothing when unset. 0 = ok. */
+M4R_API int m4r_denoise_capture(m4r_context* ctx, VkCommandBuffer cb, const m4r_denoise_desc* desc);
 M4R_API int m4r_interpolate_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);
 M4R_API int m4r_interpolate(m4r_context* ctx, VkCommandBuffer cb, const m4r_interpolate_desc* desc);
 /* Returns 1 when the generated frame was written to desc->backbuffer: present it, then call m4r_framegen_restore with
