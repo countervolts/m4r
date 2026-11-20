@@ -346,6 +346,7 @@ M4R_API int m4r_denoise_capture(m4r_context* c, VkCommandBuffer cb, const m4r_de
             if (FILE* f = std::fopen(tr, "rb")) { std::fclose(f); std::remove(tr); start = call + 1; }
         }
     }
+    if (start != ~0ull && call >= start + count) start = ~0ull;   // window over: arm again for the next trigger
     if (call < start || call >= start + count) return 0;
     RrDump u;
     u.call = call;
