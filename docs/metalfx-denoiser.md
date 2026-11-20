@@ -241,3 +241,9 @@ same denoised colour into the game's output, and BBR is clamped per channel to V
 sharpness (gradient 0.056 vs BBR 0.058, V3 0.041) with fewer fireflies. Capture k (fast pan over a wet floor): mirror-pixel flicker as
 high as BBR (0.127 vs 0.124; V3 0.042) and more fireflies than BBR (its BBR input skips the despeckle clamp), so it is not the default.
 Costs both upscalers (~+2 ms) and two output-size buffers in every dn3 plan.
+
+**Speed (2026-11-20, RX 7700 XT, 1280x720 -> 2560x1440, V3 path, offline harness):** 5.86 -> 5.46 ms per frame, outputs
+bit-identical. `nn_d2s` one thread per output pixel (0.29 -> 0.11 ms); WMMA convs at most 2 channel tiles per wave above 40k pixels
+(4 made the 320x180 64->64 layers 2x slower; convs 1.33 -> 1.09 ms). Left as they are: Apple's `bilateral` x4 (2.0 ms; 173 VGPRs,
+fewer spills to scratch, which the runtime does not support, and LLVM's unrolling is faster than not unrolling; about 70% of its
+memory-bandwidth bound), the anisotropic filter (0.4 ms) and the other Apple kernels (49-83 VGPRs, texture-bound).

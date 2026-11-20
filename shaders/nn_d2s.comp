@@ -1,5 +1,6 @@
 // m4r: UBFNet's last step: depth-to-space (block 2, channel = c * 4 + sub-pixel row * 2 + sub-pixel column) and sigmoid.
-// args: 0 input [H][W][44] half, 1 output [2H][2W][11] half; consts 8 W, 9 H (input size), 10 sigmoid (1) or raw logits (0)
+// args: 0 input [H][W][44] half, 1 output [2H][2W][11] half; consts 8 W, 9 H (input size), 10 sigmoid (1) or raw logits (0);
+// dispatched over the output (2W x 2H)
 // SPDX-License-Identifier: GPL-3.0-only
 #version 460
 #extension GL_EXT_buffer_reference : require
@@ -8,16 +9,17 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer Half { float16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
 layout(push_constant) uniform Push { Args a; } pc;
-void main() {
+void main() {   // one thread per OUTPUT pixel (2W x 2H): 11 loads, 11 adjacent half stores (neighbouring threads write neighbouring memory)
     Args a = pc.a;
     const uint W = a.c[0], H = a.c[1];
-    const uvec2 p = gl_GlobalInvocationID.xy;
-    if (p.x >= W || p.y >= H) return;
+    const uvec2 q = gl_GlobalInvocationID.xy;
+    if (q.x >= 2u * W || q.y >= 2u * H) return;
     Half src = Half(a.slot[0]), dst = Half(a.slot[1]);
-    for (uint c = 0u; c < 11u; ++c)
-        for (uint i = 0u; i < 2u; ++i)
-            for (uint j = 0u; j < 2u; ++j) {
-                const float v = float(src.v[(p.y * W + p.x) * 44u + c * 4u + i * 2u + j]);
-                dst.v[((p.y * 2u + i) * (W * 2u) + p.x * 2u + j) * 11u + c] = float16_t(a.c[2] != 0u ? 1.0 / (1.0 + exp(-v)) : v);
-            }
+    const uint sb = ((q.y >> 1) * W + (q.x >> 1)) * 44u + (q.y & 1u) * 2u + (q.x & 1u);
+    const uint db = (q.y * (W * 2u) + q.x) * 11u;
+    const bool sig = a.c[2] != 0u;
+    for (uint c = 0u; c < 11u; ++c) {
+        const float v = float(src.v[sb + c * 4u]);
+        dst.v[db + c] = float16_t(sig ? 1.0 / (1.0 + exp(-v)) : v);
+    }
 }

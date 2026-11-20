@@ -168,7 +168,9 @@ def conv_pass(p, dat, L, idx, src, dst, Hin, Win, stride=1, relu=True, pad=None,
     pad = ((k - 1) // 2 if stride == 1 else 2) if pad is None else pad
     if getattr(p, 'wmma', False):
         Ho, Wo = (Hin + 2 * pad - k) // stride + 1, (Win + 2 * pad - k) // stride + 1
-        nt = 1 if Ho * Wo < 40000 else min(4, (co + 15) // 16)   # low resolution: spread the channel tiles over waves
+        # channel tiles per wave: 1 at low resolution (spread over waves), 2 above (measured on gfx1101: 4 was 2x slower on the
+        # 320x180 64->64 layers; results are identical for any value, only the split over waves changes)
+        nt = 1 if Ho * Wo < 40000 else min(2, (co + 15) // 16)
         wmma_conv_pass(p, dat, L, idx, src, dst, Hin, Win, act, nt, stride, pad)
         return Ho, Wo
     Ho, Wo = (Hin + 2 * pad - k) // stride + 1, (Win + 2 * pad - k) // stride + 1
@@ -283,7 +285,7 @@ def ubf_net(p, dat, head, H, W, in_name='ubf_in', out_name='ubf_out', pre='', si
     conv('head', 'u3c', 'head', h1, w1, L=UBF_HEAD, d=head, act=0)
     if out_name == 'ubf_out':   # standalone plan: declare the output (callers that pass their own buffer declare it)
         p.buffer(out_name, h1 * 2 * w1 * 2 * 11 * 2)
-    p.glsl('nn_d2s', sh + '/nn_d2s.comp'); p.run('nn_d2s', w1, h1, [pre + 'head', out_name], [w1, h1, 1 if sigmoid else 0])
+    p.glsl('nn_d2s', sh + '/nn_d2s.comp'); p.run('nn_d2s', 2 * w1, 2 * h1, [pre + 'head', out_name], [w1, h1, 1 if sigmoid else 0])
     return h1 * 2, w1 * 2
 
 
