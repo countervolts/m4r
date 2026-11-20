@@ -1,4 +1,4 @@
-// m4r: glossy-in-motion smoothing (NOT MetalFX behaviour; stop-gap for the BBR path, M4R_NO_GLOSSY_SMOOTH=1 disables it).
+// m4r: glossy-in-motion smoothing (NOT MetalFX behaviour; stop-gap for the BBR path, opt-in: M4R_GLOSSY_SMOOTH=1; off by default since in game it flattened moving reflections into plastic-looking patches).
 // MetalFX's reproject_warp drops the history of low-roughness pixels that move more than a pixel or so (by design: their reflection
 // moves differently from the surface), and the stage Apple relies on for them (UBFNet + V3 filter) is not usable yet. So moving glossy
 // pixels leave the denoiser with one frame's worth of samples. This pass blurs them in place, one a-trous iteration (5x5 B-spline taps

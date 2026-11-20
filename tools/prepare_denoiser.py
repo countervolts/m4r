@@ -287,6 +287,12 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
              'tex 13 aabbmin', 'tex 14 aabbmax', 'tex 15 v3se1|v3se0', 'tex 16 v3sq1|v3sq0',
              'tex 19 v3fblend', 'tex 20 v3blend', 'buf 0 bparams', 'bytes 1 ' + (struct.pack('<2f', ow / iw, oh / ih) if os.environ.get('M4R_CPF') == 'inv' else struct.pack('<2f', 1.0, 1.0) if os.environ.get('M4R_CPF') == 'one' else struct.pack('<2f', iw / ow, ih / oh)).hex(),
              'buf 2 ' + ('v3resetA' if os.environ.get('M4R_RESET_ANISO') else 'hinv'), 'buf 3 preexp', 'buf 4 exp0|exp1'])
+    # m4r's hybrid output (not MetalFX; shaders/nn_hybrid.comp): after the run, m4r upscales 'denoised' with BBR into the game's output,
+    # copies v3out and that output into these buffers, runs this pass (only hybrid) and copies hy_bbr back
+    g.buffer('hy_v3', ow * oh * 8); g.buffer('hy_bbr', ow * oh * 8)
+    g.glsl('nn_hybrid', os.path.join(ROOT, 'shaders', 'nn_hybrid.comp'))
+    g.run('nn_hybrid', ow, oh, ['hy_v3', 'hy_bbr'], [ow, oh])
+    g.lines.append('  only hybrid')
 
 
 def mat(v):

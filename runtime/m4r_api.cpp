@@ -21,6 +21,7 @@ struct m4r_context {
     std::unique_ptr<Plan> bbr[2], fg, dn;   // dn: the denoiser plan (render size)
     uint32_t dnSize[2] = {};
     bool dnV3 = false;   // the plan is the V3 one (dn3-*): it writes the final image, no separate upscaler
+    bool dnHybrid = false;   // V3 plan + BBR upscaler, BBR clamped to V3 (m4r's hybrid, shaders/nn_hybrid.comp; opt-in M4R_HYBRID=1)
     uint32_t dnOut[2] = {};
     uint64_t dnFrame = 0;
     double dnPrevVp[16] = {};
@@ -442,7 +443,7 @@ static void captureOut(m4r_context* c, VkCommandBuffer cb, int slot, VkImage ima
 
 M4R_API int m4r_denoise_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t iw, uint32_t ih) {
     if (c->dn && c->dnSize[0] == iw && c->dnSize[1] == ih && c->dnOut[0] == ow && c->dnOut[1] == oh)
-        return c->dnV3 ? 0 : m4r_upscale_init(c, ow, oh, iw, ih);
+        return c->dnV3 && !c->dnHybrid ? 0 : m4r_upscale_init(c, ow, oh, iw, ih);
     char name[96];
     // preferred: the plan with MetalFX's own upscaling network (dn3-<out>-<in>); M4R_NO_V3=1 keeps the older denoiser + BBR upscaler
     if (!std::getenv("M4R_NO_V3")) {
@@ -451,8 +452,14 @@ M4R_API int m4r_denoise_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t 
         if (p3->load(c->dir + name)) {
             c->dn = std::move(p3);
             c->dnSize[0] = iw; c->dnSize[1] = ih; c->dnOut[0] = ow; c->dnOut[1] = oh;
-            c->dnFrame = 0; c->dnV3 = true;
+            c->dnFrame = 0; c->dnV3 = true; c->dnHybrid = false;
             if (!c->exposureOne.image && !c->vk.createTexture(c->exposureOne, VK_FORMAT_R32_SFLOAT, 1, 1)) { c->error = "exposure texture"; return 1; }
+            // hybrid (m4r, not MetalFX, opt-in: M4R_HYBRID=1): also the BBR upscaler; without its plan pass, V3 alone
+            if (std::getenv("M4R_HYBRID") && c->dn->firstOnly("hybrid") < c->dn->passes()) {
+                const std::string keep = c->error;
+                if (m4r_upscale_init(c, ow, oh, iw, ih) == 0) c->dnHybrid = true;
+                else c->error = keep;
+            }
             return 0;
         }
     }
@@ -491,7 +498,7 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     LayoutGuard g{cb};
     for (const m4r_image* im : {&d->color, &d->depth, &d->motion, &d->normals, &d->diffuse_albedo, &d->specular_albedo, &d->roughness})
         g.add(*im);
-    if (c->dnV3) g.add(d->output);
+    if (c->dnV3 && !c->dnHybrid) g.add(d->output);
     g.begin();
     if (!c->exposureOneCleared) {
         c->vk.toGeneral(cb, c->exposureOne);
@@ -546,7 +553,7 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
         const int32_t rowBytes = 10; const uint16_t hh = uint16_t(Hn), ww = uint16_t(Wn);
         std::memcpy(v3d + 16, &rowBytes, 4); std::memcpy(v3d + 20, &hh, 2); std::memcpy(v3d + 22, &ww, 2);
         p.bindBuffer("bparams", c->rt.transient(bsp, sizeof bsp)); p.bindBuffer("v3desc", c->rt.transient(v3d, sizeof v3d));
-        p.bindTexture("v3out", c->wrap(d->output));
+        if (!c->dnHybrid) p.bindTexture("v3out", c->wrap(d->output));   // hybrid: V3 writes the plan's own v3out
     }
     p.setParity(int(c->dnFrame & 1));
     // MetalFX's auto exposure (no exposure texture) scales the denoised colour by the exposure; that is only right once the stage after
@@ -574,9 +581,10 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     // m4r's own passes on the denoised colour, a block of `only despeckle` / `only glossy` passes right after MetalFX's denoiser (before
     // the V3 stage, if the plan has one), run on buffer copies: the interim firefly clamp (den_raw -> den_cl) and the glossy-in-motion
     // smoothing (den_cl -> ... -> den_cl; needs the normals copy with roughness in w and buffer copies of int_depth / int_motion).
-    // Neither is MetalFX behaviour; M4R_NO_DESPECKLE=1 / M4R_NO_GLOSSY_SMOOTH=1 turn them off.
+    // Neither is MetalFX behaviour; M4R_NO_DESPECKLE=1 turns the clamp off, M4R_GLOSSY_SMOOTH=1 turns the smoothing on.
     static const bool noDespeckle = std::getenv("M4R_NO_DESPECKLE") != nullptr;
-    static const bool noGlossy = std::getenv("M4R_NO_GLOSSY_SMOOTH") != nullptr;
+    // the glossy smoothing is opt-in since 2026-11-20 (in game it flattened moving reflections into plastic-looking patches)
+    static const bool noGlossy = std::getenv("M4R_GLOSSY_SMOOTH") == nullptr;
     Buffer *dRaw = p.buffer("den_raw"), *dCl = p.buffer("den_cl"), *glD = p.buffer("gl_depth"), *glM = p.buffer("gl_motion");
     Texture *denTex = p.texture("denoised"), *iDepth = p.texture("int_depth"), *iMotion = p.texture("int_motion");
     const size_t lo = std::min(p.firstOnly("despeckle"), p.firstOnly("glossy"));
@@ -617,7 +625,7 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     Texture* den = p.texture("denoised");
     if (!den) { c->error = "denoiser plan has no 'denoised' texture"; return 1; }
     captureOut(c, cb, 0, den->image, den->width, den->height, den->format);
-    if (c->dnV3) {   // the plan wrote the final image into the game's output texture
+    if (c->dnV3 && !c->dnHybrid) {   // the plan wrote the final image into the game's output texture
         if (g_rrCurrent) {
             LayoutGuard og{cb};
             og.add(d->output);
@@ -635,7 +643,33 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     u.jitter_x = fj * d->jitter_x; u.jitter_y = fj * d->jitter_y;
     u.motion_scale_x = d->motion_scale_x; u.motion_scale_y = d->motion_scale_y;
     u.pre_exposure = d->pre_exposure; u.reset = d->reset; u.depth_reversed = d->depth_reversed;
-    const int r = m4r_upscale(c, cb, &u);
+    int r = m4r_upscale(c, cb, &u);
+    if (r == 0 && c->dnHybrid) {
+        // hybrid (m4r, not MetalFX): BBR's output clamped to the V3 output's neighbourhood range (last plan pass, only hybrid)
+        Texture* v3 = p.texture("v3out");
+        Buffer *hv = p.buffer("hy_v3"), *hb = p.buffer("hy_bbr");
+        const Texture* out = c->wrap(d->output);
+        if (v3 && hv && hb && out && out->format == VK_FORMAT_R16G16B16A16_SFLOAT && out->width == v3->width && out->height == v3->height) {
+            LayoutGuard og{cb};
+            og.add(d->output);
+            og.begin();
+            VkBufferImageCopy cp{};
+            cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            cp.imageExtent = {v3->width, v3->height, 1};
+            c->vk.barrier(cb);
+            vkCmdCopyImageToBuffer(cb, v3->image, VK_IMAGE_LAYOUT_GENERAL, hv->buffer, 1, &cp);
+            vkCmdCopyImageToBuffer(cb, out->image, VK_IMAGE_LAYOUT_GENERAL, hb->buffer, 1, &cp);
+            c->vk.barrier(cb);
+            p.setFlag("hybrid", true);
+            const bool hok = p.record(cb, p.firstOnly("hybrid"), 1);
+            p.setFlag("hybrid", false);
+            c->vk.barrier(cb);
+            if (hok) vkCmdCopyBufferToImage(cb, hb->buffer, out->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+            c->vk.barrier(cb);
+            og.end();
+            if (!hok) { c->error = p.error; r = 1; }
+        }
+    }
     if (r == 0 && g_rrCurrent) {   // the output (UAV state for the caller) as m4r left it
         LayoutGuard og{cb};
         og.add(d->output);
