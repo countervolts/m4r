@@ -214,7 +214,7 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
             g.run('nn_glossy', iw, ih, [a, b, 'nrm_raw', 'gl_depth', 'gl_motion', 'rw_ms'], [iw, ih, step])
             g.lines.append('  only glossy')
     if stage >= 'E':
-        v3_ubf(g, iw, ih, W, H, ow, oh, full=stage >= 'F')
+        v3_ubf(g, iw, ih, W, H, ow, oh, full=stage >= 'F', runtime=runtime)
     return dict(W=W, H=H, tw=tw, th=th)
 
 
@@ -224,7 +224,7 @@ def v3_sizes(ow, oh):
     return Wn, Hn, Wn // 2, Hn // 2
 
 
-def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
+def v3_ubf(g, iw, ih, W, H, ow, oh, full=False, runtime=False):
     """BRNet_v3_Filter::encodePreForDenoise (build_tensors_low_resolution, warp_history_high_resolution, lowres_signals), the UBFNet
     pass and, with full, encodePost (the two output conversions and the anisotropic gaussian filter that writes 'v3out' and the history).
     Bindings from the host code (docs/metalfx-denoiser-passes.txt, fn_BRN_*.txt). The network input is half the output size padded
@@ -275,6 +275,13 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
     dn.ubf_net(g, g.dat['ubf'], dn.ubf_head_blob(g.res), Hn, Wn, 'ubf_in', 'ubf_out', pre='ubf_', sigmoid=True)
     if not full:
         return
+    if runtime:
+        # m4r's reflection-lag switch (not MetalFX, opt-in, shaders/nn_mircap.comp): caps the network's temporal history weight on
+        # low-roughness pixels while the camera translates; m4r binds mc_gate per frame and sets the flag
+        g.buffer('mc_gate', 16)
+        g.glsl('nn_mircap', os.path.join(ROOT, 'shaders', 'nn_mircap.comp'))
+        g.run('nn_mircap', ow // 4, oh // 4, ['ubf_out', 'rough_raw', 'mc_gate'], [Wt, Ht, ow // 4, oh // 4, iw, ih])
+        g.lines.append('  only mircap')
     fc = {'quantized': False, 'is_tensor_layout_nchw': False, 'bfnet1_enabled': True}
     g.run_k('brnetv3_output_spatial_lr', fc, (8, 8, 1), (Wq, Hq, 1), ['tex 0 v3spatial', 'buf 0 ubf_out', 'buf 1 v3bd'])
     g.run_k('brnetv3_output_temporal', fc, (8, 8, 1), (Wh, Hh, 1), ['tex 0 v3temporal2', 'buf 0 ubf_out', 'buf 1 v3bd'])

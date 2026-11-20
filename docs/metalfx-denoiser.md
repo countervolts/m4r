@@ -247,3 +247,11 @@ bit-identical. `nn_d2s` one thread per output pixel (0.29 -> 0.11 ms); WMMA conv
 (4 made the 320x180 64->64 layers 2x slower; convs 1.33 -> 1.09 ms). Left as they are: Apple's `bilateral` x4 (2.0 ms; 173 VGPRs,
 fewer spills to scratch, which the runtime does not support, and LLVM's unrolling is faster than not unrolling; about 70% of its
 memory-bandwidth bound), the anisotropic filter (0.4 ms) and the other Apple kernels (49-83 VGPRs, texture-bound).
+
+**Reflection-lag switch (opt-in `M4R_REFLECTION_LAG_FIX=1`, or `=<cap>`; not MetalFX; `shaders/nn_mircap.comp`).** Walking makes
+reflections trail: they move differently from the surface, the game gives surface motion vectors only, and V3 blends reflection
+history from the wrong place. The pass caps UBFNet's temporal history weight (channels 3..6) on low-roughness pixels (full below 0.08,
+none above 0.2) by `mix(1, cap, gate)`, default cap 0.3, gate from the camera's translation per frame (smoothstep 0.003..0.02 m;
+walking in Cyberpunk is 0.03-0.05 m/frame, turning or standing <= 0.001), so turning the camera is untouched (capture d bit-identical
+with the switch on). Capture m (walking): ghosted tile lines across reflections fade, puddle grain 0.074 -> 0.089 (cap 0.3) /
+0.119 (cap 0.01).

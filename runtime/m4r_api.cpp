@@ -26,6 +26,7 @@ struct m4r_context {
     uint64_t dnFrame = 0;
     double dnPrevVp[16] = {};
     float dnPrevJitter[2] = {};
+    double dnPrevCam[3] = {};
     bool exposureOneCleared = false;   // bbr[1]: plan for reversed depth, bbr[0]: forward depth (plans are specialised for it)
     uint32_t bbrSize[4] = {}, fgSize[4] = {};
     bool bbrInit = false;
@@ -553,6 +554,22 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
         const int32_t rowBytes = 10; const uint16_t hh = uint16_t(Hn), ww = uint16_t(Wn);
         std::memcpy(v3d + 16, &rowBytes, 4); std::memcpy(v3d + 20, &hh, 2); std::memcpy(v3d + 22, &ww, 2);
         p.bindBuffer("bparams", c->rt.transient(bsp, sizeof bsp)); p.bindBuffer("v3desc", c->rt.transient(v3d, sizeof v3d));
+        // reflection-lag switch (m4r, not MetalFX; opt-in M4R_REFLECTION_LAG_FIX=1 or =<cap>): gate from the camera's translation per
+        // frame (walking in Cyberpunk: 0.03-0.05 m/frame; turning or standing: <= 0.001), cap on the history weight
+        static const char* lagFix = std::getenv("M4R_REFLECTION_LAG_FIX");
+        float gate[4] = {0.0f, 0.3f, 0.0f, 0.0f};
+        if (lagFix) {
+            const double v = std::atof(lagFix);
+            if (v > 0.0 && v < 1.0) gate[1] = float(v);
+            if (!reset) {
+                const double dx = cam[0] - c->dnPrevCam[0], dy = cam[1] - c->dnPrevCam[1], dz = cam[2] - c->dnPrevCam[2];
+                const double m = std::sqrt(dx * dx + dy * dy + dz * dz), x = std::clamp((m - 0.003) / (0.02 - 0.003), 0.0, 1.0);
+                gate[0] = float(x * x * (3.0 - 2.0 * x));
+            }
+        }
+        p.bindBuffer("mc_gate", c->rt.transient(gate, sizeof gate));
+        p.setFlag("mircap", lagFix != nullptr && gate[0] > 0.0f && p.buffer("rough_raw") != nullptr && d->roughness_in_normals_w && !rough);
+        c->dnPrevCam[0] = cam[0]; c->dnPrevCam[1] = cam[1]; c->dnPrevCam[2] = cam[2];
         if (!c->dnHybrid) p.bindTexture("v3out", c->wrap(d->output));   // hybrid: V3 writes the plan's own v3out
     }
     p.setParity(int(c->dnFrame & 1));

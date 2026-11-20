@@ -1,0 +1,36 @@
+// m4r: reflection-lag switch (NOT MetalFX behaviour; opt-in M4R_REFLECTION_LAG_FIX=1, or =<cap> e.g. 0.3).
+// When the camera translates, reflections move differently from the surface carrying them, but the game only gives surface motion
+// vectors: MetalFX's V3 stage then blends in reflection history from the wrong place and moving reflections trail behind. This pass
+// caps UBFNet's temporal history weight (output channels 3..6, one per output sub-pixel) on low-roughness pixels while the camera
+// moves: A' = min(A, mix(1, CAP, gate)), gate = (1 - smoothstep(R0, R1, roughness)) * camera-translation gate (computed by m4r per
+// frame; zero when the camera only turns, where reflections follow the surface). Less lag, a little more grain.
+// args: 0 UBFNet output [Ht][Wt][11] half (in place), 1 roughness [ih][iw] half, 2 {float translation gate, float CAP}
+// consts 8 Wt, 9 Ht, 10 ow/4 (valid tensor width), 11 oh/4 (valid height), 12 iw, 13 ih
+// SPDX-License-Identifier: GPL-3.0-only
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer Half { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Gate { float t; float cap; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
+layout(push_constant) uniform Push { Args a; } pc;
+const float R0 = 0.08, R1 = 0.20;
+void main() {
+    Args a = pc.a;
+    const uint Wt = a.c[0], Wv = a.c[2], Hv = a.c[3], iw = a.c[4], ih = a.c[5];
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= Wv || p.y >= Hv) return;
+    Gate g = Gate(a.slot[2]);
+    if (!(g.t > 0.0)) return;
+    Half t = Half(a.slot[0]), rough = Half(a.slot[1]);
+    // the tensor pixel covers output pixels [4x, 4x + 4): its centre in render pixels
+    const uint rx = min(iw - 1u, uint((float(p.x) + 0.5) * float(iw) / float(Wv)));
+    const uint ry = min(ih - 1u, uint((float(p.y) + 0.5) * float(ih) / float(Hv)));
+    const float s = (1.0 - smoothstep(R0, R1, float(rough.v[ry * iw + rx]))) * g.t;
+    if (!(s > 0.0)) return;
+    const float cap = mix(1.0, g.cap, s);
+    const uint b = (p.y * Wt + p.x) * 11u;
+    for (uint c = 3u; c < 7u; ++c)
+        t.v[b + c] = float16_t(min(float(t.v[b + c]), cap));
+}
