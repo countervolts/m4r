@@ -1,0 +1,22 @@
+// m4r: 2x2 stride-2 max pool, NHWC fp16. args: 0 input [2H][2W][C], 1 output [H][W][C]; consts 8 W, 9 H, 10 C
+// SPDX-License-Identifier: GPL-3.0-only
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer Half { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
+layout(push_constant) uniform Push { Args a; } pc;
+void main() {
+    Args a = pc.a;
+    const uint W = a.c[0], H = a.c[1], C = a.c[2];
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= W || p.y >= H) return;
+    Half src = Half(a.slot[0]), dst = Half(a.slot[1]);
+    const uint Wi = W * 2u;
+    for (uint c = 0u; c < C; ++c) {
+        const uint i0 = ((p.y * 2u) * Wi + p.x * 2u) * C + c;
+        float m = max(max(float(src.v[i0]), float(src.v[i0 + C])), max(float(src.v[i0 + Wi * C]), float(src.v[i0 + Wi * C + C])));
+        dst.v[(p.y * W + p.x) * C + c] = float16_t(m);
+    }
+}

@@ -22,6 +22,7 @@ scripts/apply_optiscaler_patches.sh /path/to/OptiScaler        # prints what fai
 | Patch | Adds |
 |---|---|
 | `0001-metalfx-upscaler.patch` | `Upscaler::MetalFX` (ini code `metalfx`), `MetalFXFeatureDx12` (an NGX D3D12 feature, built on vkd3d-proton's Vulkan interop), the dropdown entry, `[MetalFX] FlipJitter`, the loader for `m4r\m4r.dll`, a copy of `m4r.h`, and `OptiScaler.ini` documentation |
+| `0003-metalfx-ray-reconstruction.patch` | `[MetalFX] Denoiser`: reports Ray Reconstruction available on non-DLSS GPUs and answers NGX feature 13 with `MetalFXDenoiserFeatureDx12` (logs the RR inputs, upscales the noisy colour; the MetalFX denoiser itself is not wired). See `docs/dlssd-inputs.md` |
 | `0002-metalfx-frame-generation.patch` | `FGOutput::MetalFX` (`MetalFXFG_Dx12`), the "MetalFX FG" entry and a pacing checkbox in the frame generation menu, `[MetalFX] FGPacing`, two `State` fields that carry the game's present arguments |
 
 `m4r.h` inside patch 0001 is a copy of `runtime/m4r.h`; keep them equal when the API changes.

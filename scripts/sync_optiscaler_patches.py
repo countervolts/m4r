@@ -20,6 +20,8 @@ OWNED = {
     '0002-metalfx-frame-generation.patch': [
         'OptiScaler/State.h', 'OptiScaler/hooks/FG_Hooks.cpp', 'OptiScaler/framegen/metalfx/MetalFXFG_Dx12.cpp',
         'OptiScaler/framegen/metalfx/MetalFXFG_Dx12.h'],
+    '0003-metalfx-ray-reconstruction.patch': [
+        'OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp', 'OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h'],
 }
 
 

@@ -1,0 +1,231 @@
+diff --git a/OptiScaler.ini b/OptiScaler.ini
+index 54b3b44..00055da 100644
+--- a/OptiScaler.ini
++++ b/OptiScaler.ini
+@@ -1344,6 +1344,12 @@ FlipJitter=auto
+ ; true or false - Default (auto) is true
+ FGPacing=auto
+ 
++; Answers a game's DLSS Ray Reconstruction request (NGX feature 13) with m4r on GPUs that are not DLSS capable. Needs
++; m4r\m4r.dll and an upscaler plan for the sizes in use. Currently upscales the noisy colour and logs the Ray
++; Reconstruction inputs; the MetalFX denoiser itself is not wired yet.
++; true or false - Default (auto) is false
++Denoiser=auto
++
+ ; -------------------------------------------------------
+ [Log]
+ ; -------------------------------------------------------
+diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
+index 09c7252..3720918 100644
+--- a/OptiScaler/Config.h
++++ b/OptiScaler/Config.h
+@@ -263,6 +263,7 @@ class Config
+ 
+     // MetalFX (m4r)
+     CustomOptional<bool> MetalFXFlipJitter { false };
++    CustomOptional<bool> MetalFXDenoiser { false }; // answer NGX feature 13 (Ray Reconstruction) with m4r
+     CustomOptional<bool> MetalFXFGPacing { true }; // hold the real frame back by half a frame after the generated one
+ 
+     // Logging
+diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
+index 6969a99..1a35932 100644
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -248,6 +248,7 @@ bool Config::Reload(std::filesystem::path iniPath)
+         {
+             MetalFXFlipJitter.set_from_config(readBool("MetalFX", "FlipJitter"));
+             MetalFXFGPacing.set_from_config(readBool("MetalFX", "FGPacing"));
++            MetalFXDenoiser.set_from_config(readBool("MetalFX", "Denoiser"));
+         }
+ 
+         // FSR FG Inputs
+@@ -1075,6 +1076,7 @@ bool Config::SaveIni()
+     {
+         ini.SetValue("MetalFX", "FlipJitter", GetBoolValue(Instance()->MetalFXFlipJitter.value_for_config()).c_str());
+         ini.SetValue("MetalFX", "FGPacing", GetBoolValue(Instance()->MetalFXFGPacing.value_for_config()).c_str());
++        ini.SetValue("MetalFX", "Denoiser", GetBoolValue(Instance()->MetalFXDenoiser.value_for_config()).c_str());
+     }
+ 
+     // OptiFG
+diff --git a/OptiScaler/OptiScaler.vcxproj b/OptiScaler/OptiScaler.vcxproj
+index 4c02eab..887cc8b 100644
+--- a/OptiScaler/OptiScaler.vcxproj
++++ b/OptiScaler/OptiScaler.vcxproj
+@@ -823,6 +823,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
+     <ClCompile Include="upscalers\xess\XeSSFeature_Dx11on12.cpp" />
+     <ClCompile Include="upscalers\xess\XeSSFeature_Dx12.cpp" />
+     <ClCompile Include="upscalers\metalfx\MetalFXFeature_Dx12.cpp" />
++    <ClCompile Include="upscalers\metalfx\MetalFXDenoiserFeature_Dx12.cpp" />
++    <ClInclude Include="upscalers\metalfx\MetalFXDenoiserFeature_Dx12.h" />
+     <ClInclude Include="upscalers\xess\XeSSFeature_Dx12.h" />
+     <ClCompile Include="scanner\rtti.cpp" />
+     <ClCompile Include="scanner\scanner.cpp" />
+diff --git a/OptiScaler/NVNGX_Parameter.cpp b/OptiScaler/NVNGX_Parameter.cpp
+index 910886e..dc45d6c 100644
+--- a/OptiScaler/NVNGX_Parameter.cpp
++++ b/OptiScaler/NVNGX_Parameter.cpp
+@@ -795,8 +795,10 @@ void InitNGXParameters(NVSDK_NGX_Parameter* InParams, API api)
+             InParams->Set("SuperSamplingDenoising.MinDriverVersionMinor", 0);
+         }
+ 
+-        InParams->Set("SuperSamplingDenoising.Available", 0);
+-        InParams->Set("SuperSamplingDenoising.FeatureInitResult", 0);
++        // m4r answers feature 13 itself (see MetalFXDenoiserFeature_Dx12)
++        const bool m4rDenoiser = Config::Instance()->MetalFXDenoiser.value_or_default();
++        InParams->Set("SuperSamplingDenoising.Available", m4rDenoiser ? 1 : 0);
++        InParams->Set("SuperSamplingDenoising.FeatureInitResult", m4rDenoiser ? 1 : 0);
+     }
+ 
+     if ((api == API::DX12 || api == API::Vulkan) && (State::Instance().activeFgInput == FGInput::DLSSG ||
+diff --git a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
+index 408173c..fb3e6a9 100644
+--- a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
++++ b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
+@@ -1,6 +1,7 @@
+ #include "pch.h"
+ #include "FeatureProvider_Dx12.h"
+ #include "upscalers/metalfx/MetalFXFeature_Dx12.h"
++#include "upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h"
+ 
+ #include "Util.h"
+ #include "Config.h"
+@@ -65,6 +66,13 @@ bool FeatureProvider_Dx12::GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NG
+             *feature = std::make_unique<DLSSDFeatureDx12>(handleId, parameters);
+             break;
+         }
++        else if (cfg.MetalFXDenoiser.value_or_default())
++        {
++            // Ray Reconstruction answered by m4r (stored in the config as MetalFX, not DLSS)
++            *feature = std::make_unique<MetalFXDenoiserFeatureDx12>(handleId, parameters);
++            upscaler = Upscaler::MetalFX;
++            break;
++        }
+         else
+         {
+             *feature = std::make_unique<FSR2FeatureDx12_212>(handleId, parameters);
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+index 682ac48..fc3e8f8 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+@@ -906,7 +906,12 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
+     const bool isFG = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
+     const bool dlssgAdjacent = Nvngx_FG::isDx12Available() || State::Instance().activeFgInput == FGInput::DLSSG;
+ 
+-    if (isUpscaling || (isFG && dlssgAdjacent))
++    // Ray Reconstruction answered by m4r ([MetalFX] Denoiser): Streamline asks for feature 13 before it offers the option
++    const bool isRR = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_RayReconstruction &&
++                      Config::Instance()->MetalFXDenoiser.value_or_default() &&
++                      !IdentifyGpu::getPrimaryGpu().dlssCapable;
++
++    if (isUpscaling || isRR || (isFG && dlssgAdjacent))
+     {
+         if (OutSupported == nullptr)
+         {
+diff --git a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
+new file mode 100644
+index 0000000..15d7136
+--- /dev/null
++++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
+@@ -0,0 +1,16 @@
++#pragma once
++// NGX feature 13 (DLSS Ray Reconstruction) answered by m4r on GPUs without DLSS. First stage: logs the Ray Reconstruction
++// inputs the game provides and upscales the noisy colour with the MetalFX upscaler; the MetalFX denoiser is not wired yet.
++// SPDX-License-Identifier: GPL-3.0-only
++#include "MetalFXFeature_Dx12.h"
++
++class MetalFXDenoiserFeatureDx12 : public MetalFXFeatureDx12
++{
++  public:
++    MetalFXDenoiserFeatureDx12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters)
++        : IFeature(InHandleId, InParameters), MetalFXFeatureDx12(InHandleId, InParameters)
++    {
++    }
++
++    bool EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
++};
+diff --git a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
+new file mode 100644
+index 0000000..3e7c3c8
+--- /dev/null
++++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: GPL-3.0-only
++#include <pch.h>
++#include "MetalFXDenoiserFeature_Dx12.h"
++#include <Config.h>
++#include <State.h>
++
++namespace
++{
++// The keys d4r's FSR Ray Regeneration adapter reads for the same request (docs/dlssd-inputs.md in the m4r repository).
++struct RrInput
++{
++    const char* key;
++    const char* label;
++};
++constexpr RrInput kInputs[] = {
++    { "Color", "color" },
++    { "Depth", "depth" },
++    { "MotionVectors", "motion" },
++    { "DLSS.Input.DiffuseAlbedo", "diffuse albedo" },
++    { "GBuffer.DiffuseAlbedo", "diffuse albedo (GBuffer)" },
++    { "DLSS.Input.SpecularAlbedo", "specular albedo" },
++    { "GBuffer.SpecularAlbedo", "specular albedo (GBuffer)" },
++    { "GBuffer.Normals", "normals" },
++    { "GBuffer.Roughness", "roughness" },
++    { "DLSSD.SpecularHitDistance", "specular hit distance" },
++    { "DLSSD.SpecularRayDirectionHitDistance", "specular ray dir + hit distance" },
++    { "DLSSD.DiffuseHitDistance", "diffuse hit distance" },
++    { "DLSSD.DiffuseRayDirectionHitDistance", "diffuse ray dir + hit distance" },
++    { "DLSSD.ColorBeforeParticles", "color before particles" },
++    { "DLSSD.OutputAlpha", "output alpha" },
++    { "ExposureTexture", "exposure" },
++    { "Output", "output" },
++};
++
++ID3D12Resource* Res(NVSDK_NGX_Parameter* p, const char* key)
++{
++    ID3D12Resource* r = nullptr;
++    if (p->Get(key, &r) != NVSDK_NGX_Result_Success)
++        p->Get(key, (void**) &r);
++    return r;
++}
++} // namespace
++
++bool MetalFXDenoiserFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
++                                                  NVSDK_NGX_Parameter* InParameters)
++{
++    // first frames, then once in a while: what the game gave us
++    if (_frameCount < 3 || _frameCount % 600 == 0)
++    {
++        LOG_INFO("MetalFX Ray Reconstruction, frame {}: render {}x{} -> {}x{}", _frameCount, RenderWidth(),
++                 RenderHeight(), DisplayWidth(), DisplayHeight());
++        for (const auto& in : kInputs)
++        {
++            ID3D12Resource* r = Res(InParameters, in.key);
++            if (r == nullptr)
++                continue;
++            const auto d = r->GetDesc();
++            LOG_INFO("  {} ({}): {}x{} format {}", in.label, in.key, (unsigned) d.Width, d.Height, (int) d.Format);
++        }
++        int hwDepth = -1, roughnessMode = -1, denoiseMode = -1, reset = 0;
++        InParameters->Get("DLSS.Use.HW.Depth", &hwDepth);
++        InParameters->Get("DLSS.Roughness.Mode", &roughnessMode);
++        InParameters->Get("DLSS.Denoise.Mode", &denoiseMode);
++        InParameters->Get(NVSDK_NGX_Parameter_Reset, &reset);
++        float jx = 0, jy = 0, mvx = 1, mvy = 1, pre = 1;
++        InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &jx);
++        InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &jy);
++        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_X, &mvx);
++        InParameters->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &mvy);
++        InParameters->Get(NVSDK_NGX_Parameter_DLSS_Pre_Exposure, &pre);
++        void *world = nullptr, *proj = nullptr;
++        InParameters->Get("WorldToViewMatrix", &world);
++        InParameters->Get("ViewToClipMatrix", &proj);
++        LOG_INFO("  hwDepth {} roughnessMode {} denoiseMode {} reset {} jitter {:.3f},{:.3f} mvScale {:.3f},{:.3f} "
++                 "preExposure {:.3f} depthInverted {} lowResMV {} matrices {}/{}",
++                 hwDepth, roughnessMode, denoiseMode, reset, jx, jy, mvx, mvy, pre, DepthInverted(), LowResMV(),
++                 world != nullptr, proj != nullptr);
++    }
++    return MetalFXFeatureDx12::EvaluateInternal(InCommandList, InParameters);
++}
