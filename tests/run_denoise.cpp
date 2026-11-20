@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
                     if (!plan.record(pcb, i, 1)) { std::fprintf(stderr, "record: %s\n", plan.error.c_str()); rc = 1; goto done; }
                     vk.barrier(pcb);
                     vkCmdWriteTimestamp(pcb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
-                    if (!vk.submit(pcb)) { std::fprintf(stderr, "submit: %s\n", vk.error.c_str()); rc = 1; goto done; }
+                    if (!vk.submit(pcb)) { std::fprintf(stderr, "submit failed in pass %zu (%s): %s\n", i, plan.passLabel(i).c_str(), vk.error.c_str()); rc = 1; goto done; }
                     uint64_t ts[2];
                     vkGetQueryPoolResults(vk.device, qp, 0, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
                     if (t > 0) ptotal[i] += double(ts[1] - ts[0]) * props.limits.timestampPeriod * 1e-6;
@@ -126,6 +126,11 @@ int main(int argc, char** argv) {
             if (!plan.record(cb)) { std::fprintf(stderr, "record: %s\n", plan.error.c_str()); rc = 1; break; }
             vk.barrier(cb);
             if (!vk.submit(cb)) { std::fprintf(stderr, "submit: %s\n", vk.error.c_str()); rc = 1; break; }
+            if (Texture* dn = plan.texture("denoised"); dn && plan.texture("v3hist")) {   // stand-in history for the V3 experiment
+                std::vector<uint8_t> tmp(size_t(dn->width) * dn->height * 8);
+                vk.download(*dn, tmp.data(), tmp.size());
+                vk.upload(*plan.texture("v3hist"), tmp.data(), tmp.size());
+            }
             std::printf("frame %d done %.2f ms\n", t, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             if (const char* names = std::getenv("M4R_DUMP_TEX")) {
                 std::string all = names;

@@ -27,6 +27,7 @@ class Gen:
         self.mtl = open(res + '/default.metallib', 'rb').read()
         self.lib = metallib.parse(self.mtl)
         self.lines = []; self.kernels = {}; self.src = {}; self.wmma = not os.environ.get('M4R_NO_WMMA')   # WMMA convs (shaders/nn_conv_wmma.cl); M4R_NO_WMMA=1: plain GLSL convs
+        self.res = res
         self.dat = {n: open(f'{res}/emit_{n}net_v3_2_constants.dat', 'rb').read() for n in ('dbf', 'ubf')}
 
     def source(self, fn):
@@ -82,12 +83,16 @@ class Gen:
             self.lines.append('  ' + b)
 
     def save(self):
+        names = [l.split()[1] for l in self.lines if l.split(' ', 1)[0] in ('buffer', 'texture')]
+        dup = sorted({n for n in names if names.count(n) > 1})
+        assert not dup, f'buffers/textures declared twice (they would share memory under different sizes): {dup}'
         decl = [l for l in self.lines if l.split(' ', 1)[0] in ('buffer', 'texture', 'kernel', 'glsl')]
         rest = [l for l in self.lines if l.split(' ', 1)[0] not in ('buffer', 'texture', 'kernel', 'glsl')]
         open(self.out + '/plan.txt', 'w').write('\n'.join([f'gpu {m4r_air.GPU}'] + decl + rest) + '\n')
 
 
-def build(g, iw, ih, stage, runtime=False):
+def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
+    ow, oh = ow or iw * 3, oh or ih * 3
     W, H = (iw + 7) & ~7, (ih + 7) & ~7          # BFNet size: render size rounded up to 8
     tw, th = ((iw + 15) >> 1) & ~7, ((ih + 15) >> 1) & ~7   # DBF tensor (half resolution)
     ROW = 26                                       # NHWC, 13 half channels per pixel
@@ -174,6 +179,8 @@ def build(g, iw, ih, stage, runtime=False):
             (8, 8, 1), (W, H, 1),
             ['tex 0 warp_color', 'tex 1 color', 'tex 4 shin', 'tex 5 denoised', 'tex 6 specular', 'tex 7 diffuse', 'tex 8 roughness',
              'tex 9 dbf_tw', 'buf 10 exp0|exp1', 'buf 11 preexp'])
+    if stage >= 'E':
+        v3_ubf(g, iw, ih, W, H, ow, oh)
     if runtime:
         # last pass: interim firefly clamp on the denoised colour (m4r copies 'denoised' to den_raw first and den_cl back afterwards)
         g.buffer('den_raw', iw * ih * 8); g.buffer('den_cl', iw * ih * 8)
@@ -181,6 +188,42 @@ def build(g, iw, ih, stage, runtime=False):
         g.run('nn_despeckle', iw, ih, ['den_raw', 'den_cl'], [iw, ih])
         g.lines.append('  only despeckle')
     return dict(W=W, H=H, tw=tw, th=th)
+
+
+def v3_ubf(g, iw, ih, W, H, ow, oh):
+    """BRNet_v3_Filter::encodePreForDenoise (build_tensors_low_resolution, lowres_signals) and the UBFNet pass, for frames without history
+    (isHistoryInvalid = 1): the UBF input tensor 'ubf_in' [Hn][Wn][5] and its output 'ubf_out' [Hn/2][Wn/2][11]. Bindings from the host code
+    (docs/metalfx-denoiser-passes.txt); history textures stay zero."""
+    Wn, Hn = (iw + 31) & ~31, (ih + 31) & ~31
+    hw, hh = (iw + 1) // 2, (ih + 1) // 2
+    g.texture('crr', 'R16G16B16A16_SFLOAT', iw, ih); g.texture('v3hist', 'R16G16B16A16_SFLOAT', iw, ih)   # v3hist: stand-in history
+    for n in ('fah', 'v3clamp', 'v3blend', 'v3fblend'):   # warp_history_high_resolution works at output size
+        g.texture(n, 'R16G16B16A16_SFLOAT', ow, oh)
+    g.texture('flowd', 'R16G16_SFLOAT', iw, ih)
+    for n in ('v3ema0', 'v3ema1', 'v3var0', 'v3var1'):
+        g.texture(n, 'R16_SFLOAT', hw, hh)
+    g.texture('v3temporal', 'R16_SFLOAT', iw, ih); g.texture('v3lwv', 'R16_SFLOAT', hw, hh)
+    g.texture('aabbmin', 'R16G16B16A16_SFLOAT', hw, hh); g.texture('aabbmax', 'R16G16B16A16_SFLOAT', hw, hh)
+    g.buffer('v3reset', 16); g.buffer('v3desc', 24)
+    g.buffer('ubf_in', Wn * Hn * 10)
+    g.run_k('brnetv3_build_tensors_low_resolution', {'bfnet1_enabled': True, 'full_resolution_flow': False, 'jittered_motion_vectors': False},
+            (8, 8, 1), (iw + 2, ih + 2, 1),
+            ['tex 0 denoised', 'tex 1 int_depth', 'tex 2 int_motion', 'tex 3 crr', 'tex 4 flowd', 'bytes 0 ' + struct.pack('<f', 1.0).hex(),
+             'buf 1 bparams', 'buf 2 preexp', 'buf 3 exp0|exp1'])
+    g.run_k('brnetv3_warp_history_high_resolution', {'bfnet1_enabled': True, 'stlanczos_enabled': False, 'new_overshoot_clamp': False},
+            (8, 8, 1), (ow, oh, 1),
+            ['tex 0 crr', 'tex 1 v3hist', 'tex 2 flowd', 'tex 3 fah', 'tex 4 v3blend', 'tex 5 v3fblend', 'tex 6 v3clamp', 'tex 7 denoised',
+             'buf 0 v3desc', 'buf 1 bparams', 'buf 2 exp0|exp1', 'buf 3 exp1|exp0', 'buf 4 v3reset', 'buf 5 preexp'])
+    g.run_k('brnetv3_lowres_signals', {'mid_bicubic_warp': False, 'half_res_input': False, 'quantized': False, 'is_tensor_layout_nchw': False,
+                                      'bfnet1_enabled': True, 'big_epsilon_and_default_scales_enabled': False, 'new_overshoot_clamp': False},
+            (8, 8, 1), (Wn, Hn, 1),
+            ['tex 0 crr', 'tex 1 fah', 'tex 2 flowd', 'tex 3 v3hist', 'tex 4 v3ema0|v3ema1', 'tex 5 v3var0|v3var1',
+             'tex 6 v3ema1|v3ema0', 'tex 7 v3var1|v3var0', 'tex 8 v3temporal', 'tex 9 v3lwv', 'tex 15 aabbmin', 'tex 16 aabbmax',
+             'tex 17 normals', 'tex 18 diffuse', 'tex 19 roughness', 'tex 20 specular',
+             'buf 0 v3desc', 'buf 1 bparams', 'buf 2 ubf_in', 'buf 3 exp0|exp1', 'buf 4 exp1|exp0', 'buf 5 v3reset',
+             'bytes 6 ' + struct.pack('<2H', Wn // 2, Hn // 2).hex()])
+    import denoise_nets as dn
+    dn.ubf_net(g, g.dat['ubf'], dn.ubf_head_blob(g.res), Hn, Wn, 'ubf_in', 'ubf_out', pre='ubf_')
 
 
 def mat(v):
@@ -210,7 +253,15 @@ def frame_buffers(cap, fid, t, sz, iw, ih, prev):
     refl = (cols(inv_vp) + cols(prev_vp) + cols(curr_vp) + struct.pack('<4f', *cam) +
             struct.pack('<4f', 1.0 / sz['W'], 1.0 / sz['H'], sz['W'] / ms[0], sz['H'] / ms[1]))
     out_params = struct.pack('<6fiHHB', 0, 0, 0, 0, 0, 0, 14, sz['th'], sz['tw'], 1 if t == 0 else 0).ljust(40, b'\0')
-    bufs = {'bparams': struct.pack('<6H', iw, ih, iw, ih, iw, ih).ljust(144, b'\0'), 'npix': struct.pack('<I', iw * ih),
+    ow, oh = (int(meta['output'][0]), int(meta['output'][1])) if 'output' in meta else (iw * 3, ih * 3)
+    Wn, Hn = (iw + 31) & ~31, (ih + 31) & ~31
+    # BRNetShaderParams (144 B): contentSize, maxInputSize, outputSize, five offsets (zero), jitter, motionScale, outputResMotionMultiplier,
+    # normalizeMotionScale, tensor strides (zero)
+    bsp = (struct.pack('<6H', iw, ih, iw, ih, ow, oh) + bytes(20) +
+           struct.pack('<8f', jitter[0], jitter[1], ms[0], ms[1], iw / ow, ih / oh, ms[0] / iw, ms[1] / ih)).ljust(144, b'\0')
+    # brnet_v3_build_tensors_t (24 B): motionScale * outputSize, jitter, tensor row bytes (5 halves), height, width
+    v3d = struct.pack('<ffffiHH', ms[0] * ow, ms[1] * oh, jitter[0], jitter[1], 10, Hn, Wn)
+    bufs = {'bparams': bsp, 'v3desc': v3d, 'v3reset': (b'\x01' if t == 0 else b'\x00').ljust(16, b'\0'), 'npix': struct.pack('<I', iw * ih),
             'dbf_params_out': out_params, 'rw_ms': struct.pack('<2f', *ms), 'rw_pj': struct.pack('<2f', *pj),
             'rw_cj': struct.pack('<2f', *jitter), 'dbf_params': dbf, 'refl_params': refl, 'preexp': struct.pack('<f', f('preexposure')),
             'reset': struct.pack('<B', 1 if t == 0 else 0).ljust(16, b'\0')}
@@ -236,7 +287,11 @@ def main():
     if a.gpu:
         m4r_air.set_gpu(a.gpu)
     g = Gen(a.resources, a.out)
-    sz = build(g, iw, ih, a.stage, a.runtime)
+    ow = oh = None
+    if a.capture:
+        o = dict(l.split(None, 1) for l in open(f'{a.capture}/rr-{a.first}.txt') if l.startswith('output'))
+        ow, oh = map(int, o['output'].split())
+    sz = build(g, iw, ih, a.stage, a.runtime, ow, oh)
     g.save()
     if a.capture:
         prev = None
