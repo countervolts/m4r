@@ -43,6 +43,10 @@ int main(int argc, char** argv) {
     auto m0 = meta(first);
     const uint32_t ow = uint32_t(m0["output"][0]), oh = uint32_t(m0["output"][1]), iw = uint32_t(m0["content"][0]), ih = uint32_t(m0["content"][1]);
     if (m4r_denoise_init(ctx, ow, oh, iw, ih) != 0) { std::fprintf(stderr, "m4r_denoise_init: %s\n", m4r_last_error(ctx)); return 1; }
+    // experiments: M4R_UPSCALE_ONLY=1 runs only MetalFX's upscaler (BBR) on the capture's colour (e.g. a colour already denoised
+    // elsewhere); M4R_ZERO_JITTER=1 tells it the colour has no jitter (an input that was already resolved onto the pixel grid)
+    const bool upscaleOnly = std::getenv("M4R_UPSCALE_ONLY") != nullptr, zeroJitter = std::getenv("M4R_ZERO_JITTER") != nullptr;
+    if (upscaleOnly && m4r_upscale_init(ctx, ow, oh, iw, ih) != 0) { std::fprintf(stderr, "m4r_upscale_init: %s\n", m4r_last_error(ctx)); return 1; }
     struct In { const char* file; VkFormat fmt; int bpp; };
     const In ins[] = {{"color", VK_FORMAT_R16G16B16A16_SFLOAT, 8}, {"depth", VK_FORMAT_R32_SFLOAT, 4}, {"motion", VK_FORMAT_R16G16B16A16_SFLOAT, 8},
                       {"normals", VK_FORMAT_R16G16B16A16_SFLOAT, 8}, {"diffuse_albedo", VK_FORMAT_R8G8B8A8_UNORM, 4}, {"specular_albedo", VK_FORMAT_R8G8B8A8_UNORM, 4}};
@@ -71,7 +75,17 @@ int main(int argc, char** argv) {
         d.depth_reversed = int(m["depth_reversed"][0]); d.hardware_depth = 1; d.roughness_in_normals_w = 1;
         d.flip_upscale_jitter = std::getenv("M4R_NO_FLIP") ? 0 : 1;
         VkCommandBuffer cb = vk.begin();
-        if (m4r_denoise(ctx, cb, &d) != 0) { std::fprintf(stderr, "m4r_denoise: %s\n", m4r_last_error(ctx)); rc = 1; break; }
+        if (zeroJitter) { d.jitter_x = 0.0f; d.jitter_y = 0.0f; }
+        if (upscaleOnly) {
+            m4r_upscale_desc u{};
+            u.color = d.color; u.depth = d.depth; u.motion = d.motion; u.output = d.output;
+            u.content_width = iw; u.content_height = ih;
+            const float fj = d.flip_upscale_jitter ? -1.0f : 1.0f;
+            u.jitter_x = fj * d.jitter_x; u.jitter_y = fj * d.jitter_y;
+            u.motion_scale_x = d.motion_scale_x; u.motion_scale_y = d.motion_scale_y;
+            u.pre_exposure = d.pre_exposure; u.reset = d.reset; u.depth_reversed = d.depth_reversed;
+            if (m4r_upscale(ctx, cb, &u) != 0) { std::fprintf(stderr, "m4r_upscale: %s\n", m4r_last_error(ctx)); rc = 1; break; }
+        } else if (m4r_denoise(ctx, cb, &d) != 0) { std::fprintf(stderr, "m4r_denoise: %s\n", m4r_last_error(ctx)); rc = 1; break; }
         if (!vk.submit(cb)) { std::fprintf(stderr, "submit: %s\n", vk.error.c_str()); rc = 1; break; }
         auto dump = [&](Texture& x, const char* name) {
             std::vector<uint8_t> b(size_t(x.width) * x.height * 8);
@@ -79,8 +93,11 @@ int main(int argc, char** argv) {
             char nm[256]; std::snprintf(nm, sizeof nm, "%s/%s-%02d.raw", out.c_str(), name, t);
             std::ofstream(nm, std::ios::binary).write(reinterpret_cast<char*>(b.data()), std::streamsize(b.size()));
         };
-        Texture den; vk.wrap(den, m4r_denoise_texture(ctx, "denoised"), VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih);
-        dump(den, "denoised"); dump(output, "output");
+        if (!upscaleOnly) {
+            Texture den; vk.wrap(den, m4r_denoise_texture(ctx, "denoised"), VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih);
+            dump(den, "denoised");
+        }
+        dump(output, "output");
         std::printf("frame %d done\n", t);
     }
     m4r_destroy(ctx);

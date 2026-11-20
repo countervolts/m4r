@@ -1,0 +1,42 @@
+// m4r: albedo detail (NOT MetalFX behaviour; on by default with the V3 path, M4R_NO_ALBEDO_DETAIL=1 = off, off with M4R_HYBRID).
+// MetalFX's V3 stage denoises cleanly but softens texture in motion. The game's albedo is noise-free, so MetalFX's BBR upscaler
+// (a second instance, its own history) upscales it sharply and stably; this pass puts that albedo's fine detail back on V3's image:
+// colour *= clamp(albedo / gaussian(albedo, sigma 1), 0.7, 1.4) on albedo luminance. Pixels with Cyberpunk's water/puddle
+// placeholder albedo (>= 1.5: diffuse and specular 1) carry no texture: they are left out of the blur and the ratio fades to 1
+// next to them, so reflections stay exactly V3's. RGBA16F buffers at output size.
+// args: 0 V3 output [H][W] f16vec4 (read and written in place), 1 BBR-upscaled albedo [H][W] f16vec4; consts 8 W, 9 H
+// SPDX-License-Identifier: GPL-3.0-only
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Px { f16vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
+layout(push_constant) uniform Push { Args a; } pc;
+const int R = 3;               // 7x7 gaussian, sigma 1
+const float LO = 0.7, HI = 1.4, PLACEHOLDER = 1.5;
+float lum(vec3 c) { return (c.r + c.g + c.b) * (1.0 / 3.0); }
+void main() {
+    Args a = pc.a;
+    const int W = int(a.c[0]), H = int(a.c[1]);
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= W || p.y >= H) return;
+    Px col = Px(a.slot[0]), alb = Px(a.slot[1]);
+    const int i = p.y * W + p.x;
+    const float ac = lum(vec3(alb.v[i].rgb));
+    if (!(ac < PLACEHOLDER)) return;
+    float num = 0.0, den = 0.0, wsum = 0.0;
+    for (int dy = -R; dy <= R; ++dy)
+        for (int dx = -R; dx <= R; ++dx) {
+            const ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), ivec2(W - 1, H - 1));
+            const float w = exp(-0.5 * float(dx * dx + dy * dy));
+            const float aq = lum(vec3(alb.v[q.y * W + q.x].rgb));
+            const float v = aq < PLACEHOLDER ? 1.0 : 0.0;
+            num += w * aq * v; den += w * v; wsum += w;
+        }
+    const float blur = num / max(den, 1e-3);
+    float ratio = clamp(ac / max(blur, 1e-3), LO, HI);
+    ratio = 1.0 + (ratio - 1.0) * clamp((den / wsum - 0.85) / 0.15, 0.0, 1.0);
+    const vec4 c = vec4(col.v[i]);
+    col.v[i] = f16vec4(vec4(c.rgb * ratio, c.a));
+}

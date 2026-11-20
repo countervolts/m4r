@@ -1,0 +1,21 @@
+// m4r: albedo for the albedo-detail pass (NOT MetalFX behaviour; see shaders/nn_albdetail.comp): diffuse + specular albedo of the
+// game (RGBA8 UNORM, copied to buffers) summed into RGBA16F, clamped to [0.02, 2] (2 = Cyberpunk's water/puddle placeholder, which
+// the detail pass leaves alone). args: 0 diffuse [H][W] uint (RGBA8), 1 specular, 2 out [H][W] f16vec4; consts 8 W, 9 H
+// SPDX-License-Identifier: GPL-3.0-only
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer Px { f16vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
+layout(push_constant) uniform Push { Args a; } pc;
+void main() {
+    Args a = pc.a;
+    const uint W = a.c[0], H = a.c[1];
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= W || p.y >= H) return;
+    const uint i = p.y * W + p.x;
+    const vec3 s = unpackUnorm4x8(U32(a.slot[0]).v[i]).rgb + unpackUnorm4x8(U32(a.slot[1]).v[i]).rgb;
+    Px(a.slot[2]).v[i] = f16vec4(vec4(clamp(s, vec3(0.02), vec3(2.0)), 1.0));
+}

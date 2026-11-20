@@ -265,3 +265,18 @@ rough-surface gradient energy V3 0.039 / 0.059 / 0.040, BBR 0.054 / 0.089 / 0.05
 BBR 330 / 2106 / 362, hybrid 2 / 57 / 0; frame-to-frame residual on moving shiny pixels equal to V3 (0.038 / 0.072 / 0.099; BBR
 0.093 / 0.169 / 0.210); brightness within 1%; no visible seam at puddle edges. Costs the BBR upscaler on top of V3 (~2 ms). If a game
 gives roughness as its own texture (not normals.w) the roughness buffer stays zero and the blend is V3 everywhere.
+
+**Albedo detail (default with V3 since 2026-11-20; `M4R_NO_ALBEDO_DETAIL=1` = off, off with `M4R_HYBRID`; not MetalFX).** V3
+denoises cleanly but softens texture in motion, and every way of pairing it with a sharper upscaler traded that for shimmer (the
+upscalers need the per-frame detail the denoiser averages away). Most of the softened detail is texture, which the game also gives
+noise-free as albedo, the input MetalFX's BBR upscaler is built for. So: V3 writes its image into its own texture; `nn_albsum` sums
+the game's diffuse + specular albedo (RGBA8) into RGBA16F; a second BBR instance (own history) upscales it; `nn_albdetail` multiplies
+V3's image by that albedo's local detail ratio, `clamp(a / gaussian_sigma1(a), 0.7, 1.4)` on luminance, with Cyberpunk's
+water/puddle placeholder albedo (diffuse and specular 1) excluded from the blur and the ratio faded to 1 next to it, so reflections
+stay V3's. Captures m / n / k (720p walk, 480p still, 720p pan), rough-surface gradient energy V3 0.040 / 0.078 / 0.059, BBR
+0.055 / 0.105 / 0.089, albedo detail 0.056 / 0.099 / 0.083; frame-to-frame change V3 0.027 / 0.037 / 0.027, BBR 0.043 / 0.066 / 0.047,
+albedo detail 0.029 / 0.041 / 0.031; shiny/puddle pixels unchanged. Costs the BBR upscaler (~2 ms at 1440p) plus copies.
+Things tried before it that did not help and why (2026-11-20): DLSS K (d4r) on the first-stage denoiser output (speckles, shimmer)
+or on V3 run at 1:1 (softest of all); V3 1:1 into BBR (same); repeated first-stage passes (<1% fewer speckles); RCAS sharpening
+(rejected); injecting reflection motion vectors for puddles (V3's lag did not follow them); physically plausible puddle albedo
+(the first stage then smears reflections and brightens them ~45%).

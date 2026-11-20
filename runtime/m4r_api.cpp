@@ -27,6 +27,13 @@ struct m4r_context {
     double dnPrevVp[16] = {};
     float dnPrevJitter[2] = {};
     double dnPrevCam[3] = {};
+    // albedo detail (m4r, not MetalFX; shaders/nn_albdetail.comp): a second BBR instance upscales the game's albedo; its output size
+    // texture, its own history and frame counters
+    bool dnAlbedo = false;
+    std::unique_ptr<Plan> albBbr[2];
+    uint32_t albSize[4] = {};
+    uint64_t albFrame[2] = {};
+    Texture albUp;
     bool exposureOneCleared = false;   // bbr[1]: plan for reversed depth, bbr[0]: forward depth (plans are specialised for it)
     uint32_t bbrSize[4] = {}, fgSize[4] = {};
     bool bbrInit = false;
@@ -297,9 +304,10 @@ M4R_API void m4r_destroy(m4r_context* c) {
     writeRrDumps(c, true);
     if (c->dumpDepth.buffer) { c->vk.destroyBuffer(c->dumpDepth); c->vk.destroyBuffer(c->dumpMotion); }
     c->bbr[0].reset(); c->bbr[1].reset(); c->fg.reset(); c->dn.reset();
+    c->albBbr[0].reset(); c->albBbr[1].reset();
     for (auto& [img, t] : c->wrapped) c->vk.destroyTexture(t);
     if (c->exposureOne.image) c->vk.destroyTexture(c->exposureOne);
-    for (Texture* t : {&c->frames[0], &c->frames[1], &c->generated})
+    for (Texture* t : {&c->frames[0], &c->frames[1], &c->generated, &c->albUp})
         if (t->image) c->vk.destroyTexture(*t);
     c->rt.destroy();
     c->vk.destroyBuffer(c->vk.records);
@@ -444,7 +452,7 @@ static void captureOut(m4r_context* c, VkCommandBuffer cb, int slot, VkImage ima
 
 M4R_API int m4r_denoise_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t iw, uint32_t ih) {
     if (c->dn && c->dnSize[0] == iw && c->dnSize[1] == ih && c->dnOut[0] == ow && c->dnOut[1] == oh)
-        return c->dnV3 && !c->dnHybrid ? 0 : m4r_upscale_init(c, ow, oh, iw, ih);
+        return c->dnV3 && !c->dnHybrid && !c->dnAlbedo ? 0 : m4r_upscale_init(c, ow, oh, iw, ih);
     char name[96];
     // preferred: the plan with MetalFX's own upscaling network (dn3-<out>-<in>); M4R_NO_V3=1 keeps the older denoiser + BBR upscaler
     if (!std::getenv("M4R_NO_V3")) {
@@ -453,13 +461,20 @@ M4R_API int m4r_denoise_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t 
         if (p3->load(c->dir + name)) {
             c->dn = std::move(p3);
             c->dnSize[0] = iw; c->dnSize[1] = ih; c->dnOut[0] = ow; c->dnOut[1] = oh;
-            c->dnFrame = 0; c->dnV3 = true; c->dnHybrid = false;
+            c->dnFrame = 0; c->dnV3 = true; c->dnHybrid = false; c->dnAlbedo = false;
             if (!c->exposureOne.image && !c->vk.createTexture(c->exposureOne, VK_FORMAT_R32_SFLOAT, 1, 1)) { c->error = "exposure texture"; return 1; }
             // hybrid (m4r, not MetalFX; opt-in M4R_HYBRID=<strength>): also the BBR upscaler; without its plan pass or the BBR plan,
             // V3 alone
             if (std::getenv("M4R_HYBRID") && std::atof(std::getenv("M4R_HYBRID")) > 0.0 && c->dn->firstOnly("hybrid") < c->dn->passes()) {
                 const std::string keep = c->error;
                 if (m4r_upscale_init(c, ow, oh, iw, ih) == 0) c->dnHybrid = true;
+                else c->error = keep;
+            }
+            // albedo detail (m4r, not MetalFX; default on, M4R_NO_ALBEDO_DETAIL=1 = off; not with the hybrid): needs the BBR plan
+            if (!c->dnHybrid && !std::getenv("M4R_NO_ALBEDO_DETAIL") && c->dn->firstOnly("albsum") < c->dn->passes() &&
+                c->dn->firstOnly("albdetail") < c->dn->passes()) {
+                const std::string keep = c->error;
+                if (m4r_upscale_init(c, ow, oh, iw, ih) == 0) c->dnAlbedo = true;
                 else c->error = keep;
             }
             return 0;
@@ -472,6 +487,90 @@ M4R_API int m4r_denoise_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t 
     c->dn = std::move(p);
     c->dnSize[0] = iw; c->dnSize[1] = ih; c->dnOut[0] = ow; c->dnOut[1] = oh;
     c->dnFrame = 0; c->dnV3 = false;
+    return 0;
+}
+
+static int recordBbr(m4r_context* c, VkCommandBuffer cb, Plan& p, uint64_t& frame, const m4r_upscale_desc* d, uint32_t cw, uint32_t ch);
+
+// Albedo detail (m4r, not MetalFX; shaders/nn_albsum.comp, nn_albdetail.comp): after the V3 plan wrote its image into its own
+// 'v3out', a second BBR instance upscales the game's (noise-free) albedo, and nn_albdetail multiplies V3's image by that albedo's
+// fine detail. Needs RGBA8 albedos and an RGBA16F output of V3's size; otherwise V3's image is copied out unchanged.
+static int albedoDetail(m4r_context* c, VkCommandBuffer cb, Plan& p, const m4r_denoise_desc* d) {
+    const uint32_t iw = c->dnSize[0], ih = c->dnSize[1];
+    Texture *v3 = p.texture("v3out"), *alb = p.texture("ad_alb");
+    Buffer *bd = p.buffer("ad_dif"), *bs = p.buffer("ad_spe"), *bsum = p.buffer("ad_sum"), *hv = p.buffer("hy_v3"), *hb = p.buffer("hy_bbr");
+    const Texture* out = c->wrap(d->output);
+    if (!v3 || !alb || !bd || !bs || !bsum || !hv || !hb || !out) { c->error = "albedo detail: plan or output missing"; return 1; }
+    const bool ok8 = d->diffuse_albedo.format == VK_FORMAT_R8G8B8A8_UNORM && d->specular_albedo.format == VK_FORMAT_R8G8B8A8_UNORM;
+    const bool okOut = out->format == VK_FORMAT_R16G16B16A16_SFLOAT && out->width == v3->width && out->height == v3->height;
+    // the albedo upscaler: the BBR plan of the main upscaler's size, a second instance (own history)
+    if (ok8 && okOut && (std::memcmp(c->albSize, c->bbrSize, sizeof c->albSize) != 0 || (!c->albBbr[0] && !c->albBbr[1]))) {
+        for (int rev = 0; rev < 2; ++rev) {
+            auto q = std::make_unique<Plan>(c->rt);
+            c->albBbr[rev] = q->load(c->dir + "/" + sizeName("bbr", c->bbrSize) + (rev ? "" : "-fwd")) ? std::move(q) : nullptr;
+            c->albFrame[rev] = 0;
+        }
+        std::memcpy(c->albSize, c->bbrSize, sizeof c->albSize);
+    }
+    const int rev = d->depth_reversed ? 1 : 0;
+    LayoutGuard g{cb};
+    for (const m4r_image* im : {&d->diffuse_albedo, &d->specular_albedo, &d->output, &d->depth, &d->motion}) g.add(*im);
+    g.begin();
+    VkImageCopy whole{};
+    whole.srcSubresource = whole.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    whole.extent = {v3->width, v3->height, 1};
+    if (!(ok8 && okOut && c->albBbr[rev])) {   // no albedo detail possible: V3's image as it is
+        if (okOut) vkCmdCopyImage(cb, v3->image, VK_IMAGE_LAYOUT_GENERAL, out->image, VK_IMAGE_LAYOUT_GENERAL, 1, &whole);
+        c->vk.barrier(cb);
+        g.end();
+        if (!okOut) { c->error = "albedo detail: the output is not RGBA16F of V3's size"; return 1; }
+        return 0;
+    }
+    if (!c->albUp.image || c->albUp.width != v3->width || c->albUp.height != v3->height) {
+        c->vk.destroyTexture(c->albUp);
+        if (!c->vk.createTexture(c->albUp, VK_FORMAT_R16G16B16A16_SFLOAT, v3->width, v3->height)) { g.end(); c->error = "albedo detail texture"; return 1; }
+        c->vk.toGeneral(cb, c->albUp);
+    }
+    VkBufferImageCopy lo{};
+    lo.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    lo.imageExtent = {iw, ih, 1};
+    vkCmdCopyImageToBuffer(cb, c->wrap(d->diffuse_albedo)->image, VK_IMAGE_LAYOUT_GENERAL, bd->buffer, 1, &lo);
+    vkCmdCopyImageToBuffer(cb, c->wrap(d->specular_albedo)->image, VK_IMAGE_LAYOUT_GENERAL, bs->buffer, 1, &lo);
+    c->vk.barrier(cb);
+    p.setFlag("albsum", true);
+    bool ok = p.record(cb, p.firstOnly("albsum"), 1);
+    p.setFlag("albsum", false);
+    c->vk.barrier(cb);
+    vkCmdCopyBufferToImage(cb, bsum->buffer, alb->image, VK_IMAGE_LAYOUT_GENERAL, 1, &lo);
+    c->vk.barrier(cb);
+    m4r_upscale_desc u{};
+    u.color = ownedImage(*alb); u.depth = d->depth; u.motion = d->motion; u.output = ownedImage(c->albUp);
+    u.depth.layout = u.motion.layout = VK_IMAGE_LAYOUT_GENERAL;   // the guard above put them in GENERAL
+    u.content_width = iw; u.content_height = ih;
+    const float fj = d->flip_upscale_jitter ? -1.0f : 1.0f;
+    u.jitter_x = fj * d->jitter_x; u.jitter_y = fj * d->jitter_y;
+    u.motion_scale_x = d->motion_scale_x; u.motion_scale_y = d->motion_scale_y;
+    u.pre_exposure = 1.0f; u.reset = d->reset; u.depth_reversed = d->depth_reversed;
+    int r = ok ? recordBbr(c, cb, *c->albBbr[rev], c->albFrame[rev], &u, iw, ih) : 1;
+    VkBufferImageCopy hi{};
+    hi.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    hi.imageExtent = {v3->width, v3->height, 1};
+    if (r == 0) {
+        vkCmdCopyImageToBuffer(cb, v3->image, VK_IMAGE_LAYOUT_GENERAL, hv->buffer, 1, &hi);
+        vkCmdCopyImageToBuffer(cb, c->albUp.image, VK_IMAGE_LAYOUT_GENERAL, hb->buffer, 1, &hi);
+        c->vk.barrier(cb);
+        p.setFlag("albdetail", true);
+        ok = p.record(cb, p.firstOnly("albdetail"), 1);
+        p.setFlag("albdetail", false);
+        c->vk.barrier(cb);
+        if (ok) vkCmdCopyBufferToImage(cb, hv->buffer, out->image, VK_IMAGE_LAYOUT_GENERAL, 1, &hi);
+        else r = 1;
+    }
+    if (r != 0) vkCmdCopyImage(cb, v3->image, VK_IMAGE_LAYOUT_GENERAL, out->image, VK_IMAGE_LAYOUT_GENERAL, 1, &whole);   // V3 as it is
+    c->vk.barrier(cb);
+    if (g_rrCurrent) captureOut(c, cb, 1, out->image, out->width, out->height, out->format);
+    g.end();
+    if (!ok) c->error = p.error;
     return 0;
 }
 
@@ -500,7 +599,7 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     LayoutGuard g{cb};
     for (const m4r_image* im : {&d->color, &d->depth, &d->motion, &d->normals, &d->diffuse_albedo, &d->specular_albedo, &d->roughness})
         g.add(*im);
-    if (c->dnV3 && !c->dnHybrid) g.add(d->output);
+    if (c->dnV3 && !c->dnHybrid && !c->dnAlbedo) g.add(d->output);
     g.begin();
     if (!c->exposureOneCleared) {
         c->vk.toGeneral(cb, c->exposureOne);
@@ -571,7 +670,7 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
         p.bindBuffer("mc_gate", c->rt.transient(gate, sizeof gate));
         p.setFlag("mircap", lagFix != nullptr && gate[0] > 0.0f && p.buffer("rough_raw") != nullptr && d->roughness_in_normals_w && !rough);
         c->dnPrevCam[0] = cam[0]; c->dnPrevCam[1] = cam[1]; c->dnPrevCam[2] = cam[2];
-        if (!c->dnHybrid) p.bindTexture("v3out", c->wrap(d->output));   // hybrid: V3 writes the plan's own v3out
+        if (!c->dnHybrid && !c->dnAlbedo) p.bindTexture("v3out", c->wrap(d->output));   // hybrid / albedo detail: V3 writes the plan's own v3out
     }
     p.setParity(int(c->dnFrame & 1));
     // MetalFX's auto exposure (no exposure texture) scales the denoised colour by the exposure; that is only right once the stage after
@@ -643,6 +742,7 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     Texture* den = p.texture("denoised");
     if (!den) { c->error = "denoiser plan has no 'denoised' texture"; return 1; }
     captureOut(c, cb, 0, den->image, den->width, den->height, den->format);
+    if (c->dnV3 && c->dnAlbedo) return albedoDetail(c, cb, p, d);
     if (c->dnV3 && !c->dnHybrid) {   // the plan wrote the final image into the game's output texture
         if (g_rrCurrent) {
             LayoutGuard og{cb};
@@ -705,6 +805,8 @@ M4R_API VkImage m4r_denoise_texture(m4r_context* c, const char* name) {
     return t ? t->image : VK_NULL_HANDLE;
 }
 
+static int recordBbr(m4r_context* c, VkCommandBuffer cb, Plan& p, uint64_t& frame, const m4r_upscale_desc* d, uint32_t cw, uint32_t ch);
+
 M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_desc* d) {
     if (!c->bbrInit) { c->error = "m4r_upscale_init not called"; return 1; }
     // The size a game renders can differ from the one the feature was created with (Ghost of Tsushima creates DLSS at the
@@ -729,8 +831,13 @@ M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_de
     }
     const int rev = d->depth_reversed ? 1 : 0;
     if (!c->bbr[rev]) { c->error = std::string("no plan for ") + (rev ? "reversed" : "forward") + " depth (prepare it with --reversed-depth " + (rev ? "1" : "0") + ")"; return 1; }
-    Plan& p = *c->bbr[rev];
-    uint64_t& frame = c->bbrFrame[rev];
+    dumpUpscale(c, cb, d, cw, ch);
+    ++c->upCalls;
+    return recordBbr(c, cb, *c->bbr[rev], c->bbrFrame[rev], d, cw, ch);
+}
+
+// Records one frame of a BBR plan (MetalFX's upscaler) for content size cw x ch; frame is that plan instance's frame counter.
+static int recordBbr(m4r_context* c, VkCommandBuffer cb, Plan& p, uint64_t& frame, const m4r_upscale_desc* d, uint32_t cw, uint32_t ch) {
     const Texture *color = c->wrap(d->color), *depth = c->wrap(d->depth), *motion = c->wrap(d->motion), *out = c->wrap(d->output);
     if (!color || !depth || !motion || !out) { c->error = "missing input or output image"; return 1; }
     const Texture* exposure = d->exposure.image ? c->wrap(d->exposure) : &c->exposureOne;
@@ -740,8 +847,6 @@ M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_de
         VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(cb, c->exposureOne.image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &r);
     }
-    dumpUpscale(c, cb, d, cw, ch);
-    ++c->upCalls;
     p.bindTexture("color", color); p.bindTexture("depth", depth); p.bindTexture("motion", motion);
     p.bindTexture("exposure", exposure); p.bindTexture("output", out);
     const uint32_t* s = c->bbrSize;
@@ -825,7 +930,7 @@ M4R_API int m4r_framegen_capture(m4r_context* c, VkCommandBuffer cb, const m4r_f
     if (!bb.image || !d->depth.image || !d->motion.image) { c->error = "missing backbuffer, depth or motion vectors"; return -1; }
     if (m4r_interpolate_init(c, bb.width, bb.height, d->depth.width, d->depth.height) != 0) return -1;
     if (c->generated.width != bb.width || c->generated.height != bb.height) {
-        for (Texture* t : {&c->frames[0], &c->frames[1], &c->generated}) {
+        for (Texture* t : {&c->frames[0], &c->frames[1], &c->generated, &c->albUp}) {
             if (auto w = c->wrapped.find(t->image); t->image && w != c->wrapped.end()) {
                 c->vk.destroyTexture(w->second);
                 c->wrapped.erase(w);

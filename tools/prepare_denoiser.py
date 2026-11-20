@@ -303,6 +303,17 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False, runtime=False):
         g.glsl('nn_hybrid', os.path.join(ROOT, 'shaders', 'nn_hybrid.comp'))
         g.run('nn_hybrid', ow, oh, ['hy_v3', 'hy_bbr', 'rough_raw', 'hy_par'], [ow, oh, iw, ih])
         g.lines.append('  only hybrid')
+        # m4r's albedo detail (not MetalFX; shaders/nn_albsum.comp, nn_albdetail.comp): m4r copies the game's diffuse/specular albedo
+        # into ad_dif/ad_spe, nn_albsum sums them into ad_sum, m4r copies that into ad_alb and upscales it with a second BBR instance,
+        # then copies v3out and that albedo into hy_v3/hy_bbr, nn_albdetail writes the result into hy_v3 and m4r copies it to the output
+        g.buffer('ad_dif', iw * ih * 4); g.buffer('ad_spe', iw * ih * 4); g.buffer('ad_sum', iw * ih * 8)
+        g.texture('ad_alb', 'R16G16B16A16_SFLOAT', iw, ih)
+        g.glsl('nn_albsum', os.path.join(ROOT, 'shaders', 'nn_albsum.comp'))
+        g.run('nn_albsum', iw, ih, ['ad_dif', 'ad_spe', 'ad_sum'], [iw, ih])
+        g.lines.append('  only albsum')
+        g.glsl('nn_albdetail', os.path.join(ROOT, 'shaders', 'nn_albdetail.comp'))
+        g.run('nn_albdetail', ow, oh, ['hy_v3', 'hy_bbr'], [ow, oh])
+        g.lines.append('  only albdetail')
 
 
 def mat(v):
