@@ -513,6 +513,9 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     p.bindBuffer("reset", c->rt.transient(resetb, sizeof resetb));
     p.bindBuffer("rw_ms", c->rt.transient(ms, 8)); p.bindBuffer("rw_pj", c->rt.transient(pj, 8)); p.bindBuffer("rw_cj", c->rt.transient(jit, 8));
     p.setParity(int(c->dnFrame & 1));
+    // MetalFX's auto exposure (no exposure texture) scales the denoised colour by the exposure; that is only right once the stage after
+    // the denoiser (UBFNet / V3) is MetalFX's own, so it is opt-in for now
+    p.setFlag("autoexp", !d->exposure.image && std::getenv("M4R_AUTOEXPOSURE") != nullptr);
 
     bool ok = p.record(cb, 0, 0);   // textures: first-use clear
     size_t first = 0;

@@ -97,6 +97,7 @@ int main(int argc, char** argv) {
                 std::ifstream fl(dir + nm + "/flags.txt");
                 std::string f;
                 while (fl >> f) plan.setFlag(f, true);
+                plan.setFlag("autoexp", std::getenv("M4R_AUTOEXPOSURE") != nullptr);
             }
             plan.setParity(t);
             const auto t0 = std::chrono::steady_clock::now();

@@ -73,9 +73,9 @@ class Gen:
         for i, c in enumerate(consts):
             self.lines.append(f'  bytes {8 + i} {int(c).to_bytes(4, "little").hex()}')
 
-    def run_k(self, fn, consts, tg, grid, binds, only=None):
+    def run_k(self, fn, consts, tg, grid, binds, only=None, groups=False):
         k = self.kernel(fn, consts, tg)
-        self.lines.append(f'pass {k} threads {grid[0]} {grid[1]} {grid[2]}')
+        self.lines.append(f'pass {k} {"groups" if groups else "threads"} {grid[0]} {grid[1]} {grid[2]}')
         if only:
             self.lines.append('  only ' + only)
         for b in binds:
@@ -106,9 +106,17 @@ def build(g, iw, ih, stage, runtime=False):
         g.texture('roughness', 'R16_SFLOAT', iw, ih); g.texture('spechit', 'R32_SFLOAT', 1, 1)
         g.glsl('nn_rough', os.path.join(ROOT, 'shaders', 'nn_rough.comp'))
         g.run('nn_rough', iw, ih, ['nrm_raw', 'rough_raw'], [iw, ih])
-    # DPreProcessing: exposure (BRNet_v3_Filter::encodeExposureCalcForDenoiser, exposure texture path)
+    # DPreProcessing: BRNet_v3_Filter::encodeExposureCalcForDenoiser. With an exposure texture: exposure_texture_to_buffer; without one
+    # (DLSS AutoExposure) MetalFX's auto exposure over the content area: luma_log_sum_denoiser (one group of 1024) and
+    # luma_log_sum_to_exposure_denoiser (one group of 1024). The runtime picks the path per frame (flag autoexp).
+    g.buffer('dlum', 8192); g.buffer('dexcl', 8192); g.buffer('bparams', 144); g.buffer('npix', 16)
+    g.run_k('luma_log_sum_denoiser', {}, (1024, 1, 1), (1, 1, 1),
+            ['tex 0 color', 'buf 0 dlum', 'buf 1 bparams', 'buf 2 preexp', 'buf 3 dexcl'], only='autoexp', groups=True)
+    g.run_k('luma_log_sum_to_exposure_denoiser', {}, (1024, 1, 1), (1, 1, 1),
+            ['buf 0 dlum', 'buf 1 npix', 'buf 2 exp0|exp1', 'buf 3 exp1|exp0', 'buf 4 hinv', 'buf 5 reset', 'buf 6 dexcl'],
+            only='autoexp', groups=True)
     g.run_k('exposure_texture_to_buffer', {}, (32, 1, 1), (1, 1, 1),
-          ['tex 0 exposure', 'buf 0 exp0|exp1', 'buf 1 exp1|exp0', 'buf 2 hinv', 'buf 3 reset'])
+            ['tex 0 exposure', 'buf 0 exp0|exp1', 'buf 1 exp1|exp0', 'buf 2 hinv', 'buf 3 reset'], only='!autoexp')
     # BFNet_v1_Filter::encodePre: dbfnetv1_lowres_signals
     g.run_k('dbfnetv1_lowres_signals', {'is_tensor_layout_nchw': False, 'spec_hit_dist_enabled': False, 'new_overshoot_clamp': False},
           (8, 8, 1), (tw, th, 1),
@@ -196,7 +204,8 @@ def frame_buffers(cap, fid, t, sz, iw, ih, prev):
     refl = (cols(inv_vp) + cols(prev_vp) + cols(curr_vp) + struct.pack('<4f', *cam) +
             struct.pack('<4f', 1.0 / sz['W'], 1.0 / sz['H'], sz['W'] / ms[0], sz['H'] / ms[1]))
     out_params = struct.pack('<6fiHHB', 0, 0, 0, 0, 0, 0, 14, sz['th'], sz['tw'], 1 if t == 0 else 0).ljust(40, b'\0')
-    bufs = {'dbf_params_out': out_params, 'rw_ms': struct.pack('<2f', *ms), 'rw_pj': struct.pack('<2f', *pj),
+    bufs = {'bparams': struct.pack('<6H', iw, ih, iw, ih, iw, ih).ljust(144, b'\0'), 'npix': struct.pack('<I', iw * ih),
+            'dbf_params_out': out_params, 'rw_ms': struct.pack('<2f', *ms), 'rw_pj': struct.pack('<2f', *pj),
             'rw_cj': struct.pack('<2f', *jitter), 'dbf_params': dbf, 'refl_params': refl, 'preexp': struct.pack('<f', f('preexposure')),
             'reset': struct.pack('<B', 1 if t == 0 else 0).ljust(16, b'\0')}
     return bufs, {'vp': curr_vp, 'jitter': jitter}
@@ -230,7 +239,7 @@ def main():
             bufs, prev = frame_buffers(a.capture, a.first + t, t, sz, iw, ih, prev)
             for n, b in bufs.items():
                 open(f'{d}/{n}.bin', 'wb').write(b)
-            open(f'{d}/flags.txt', 'w').write('')
+            open(f'{d}/flags.txt', 'w').write('autoexp\n' if os.environ.get('M4R_AUTOEXPOSURE') else '')
     json.dump(sz, open(a.out + '/sizes.json', 'w'))
     print('plan', a.out, sz)
 
