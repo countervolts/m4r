@@ -242,7 +242,7 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
              'buf 1 bparams', 'buf 2 preexp', 'buf 3 exp0|exp1'])
     g.run_k('brnetv3_warp_history_high_resolution', {'bfnet1_enabled': True, 'stlanczos_enabled': False, 'new_overshoot_clamp': False},
             (8, 8, 1), (ow, oh, 1),
-            ['tex 0 crr', 'tex 1 v3hist', 'tex 2 flowd', 'tex 3 fah', 'tex 4 v3blend', 'tex 5 v3fblend', 'tex 6 v3clamp', 'tex 7 denoised',
+            ['tex 0 crr', 'tex 1 v3hist', 'tex 2 ' + ('v3zero' if os.environ.get('M4R_ZERO_FLOW_WARP') else 'flowd'), 'tex 3 fah', 'tex 4 v3blend', 'tex 5 v3fblend', 'tex 6 v3clamp', 'tex 7 denoised',
              'buf 0 v3desc', 'buf 1 bparams', 'buf 2 exp0|exp1', 'buf 3 exp1|exp0', 'buf 4 ' + ('v3resetA' if os.environ.get('M4R_RESET_WARP') else 'hinv'), 'buf 5 preexp'])
     g.run_k('brnetv3_lowres_signals', {'mid_bicubic_warp': False, 'half_res_input': False, 'quantized': False, 'is_tensor_layout_nchw': False,
                                       'bfnet1_enabled': True, 'big_epsilon_and_default_scales_enabled': False, 'new_overshoot_clamp': False},
@@ -271,9 +271,9 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
              'exposure_viz_enabled': False, 'big_epsilon_and_default_scales_enabled': False, 'stlanczos_enabled': False,
              'new_overshoot_clamp': False}, (8, 8, 1), (ow, oh, 1),
             ['tex 0 crr', 'tex 1 fah', 'tex 3 v3out', 'tex 4 v3hist', 'tex 5 ' + ('v3zero' if os.environ.get('M4R_ZERO_FLOWDIFF') else 'flowdiff'), 'tex 6 ' + ('v3zero' if os.environ.get('M4R_ZERO_LWV') else 'v3lwv'), 'tex 7 flowd', 'tex 10 v3clamp',
-             'tex 11 ' + ('v3zero' if os.environ.get('M4R_ZERO_SPATIAL') else 'v3spatial'), 'tex 12 ' + ('v3zero' if os.environ.get('M4R_ZERO_TEMPORAL') else 'v3const' if os.environ.get('M4R_CONST_TEMPORAL') else 'v3temporal2'),
+             'tex 11 ' + ('v3zero' if os.environ.get('M4R_ZERO_SPATIAL') else 'v3const' if os.environ.get('M4R_CONST_SPATIAL') else 'v3spatial'), 'tex 12 ' + ('v3zero' if os.environ.get('M4R_ZERO_TEMPORAL') else 'v3const' if os.environ.get('M4R_CONST_TEMPORAL') else 'v3temporal2'),
              'tex 13 aabbmin', 'tex 14 aabbmax', 'tex 15 v3se1|v3se0', 'tex 16 v3sq1|v3sq0',
-             'tex 19 v3fblend', 'tex 20 v3blend', 'buf 0 bparams', 'bytes 1 ' + struct.pack('<2f', iw / ow, ih / oh).hex(),
+             'tex 19 v3fblend', 'tex 20 v3blend', 'buf 0 bparams', 'bytes 1 ' + (struct.pack('<2f', ow / iw, oh / ih) if os.environ.get('M4R_CPF') == 'inv' else struct.pack('<2f', 1.0, 1.0) if os.environ.get('M4R_CPF') == 'one' else struct.pack('<2f', iw / ow, ih / oh)).hex(),
              'buf 2 ' + ('v3resetA' if os.environ.get('M4R_RESET_ANISO') else 'hinv'), 'buf 3 preexp', 'buf 4 exp0|exp1'])
 
 
@@ -308,10 +308,12 @@ def frame_buffers(cap, fid, t, sz, iw, ih, prev):
     Wn, Hn, Wt, Ht = v3_sizes(ow, oh)
     # BRNetShaderParams (144 B): contentSize, maxInputSize, outputSize, five offsets (zero), jitter, motionScale, outputResMotionMultiplier,
     # normalizeMotionScale, tensor strides (zero)
+    jb = (-jitter[0], -jitter[1]) if os.environ.get('M4R_FLIP_JITTER_BP') else jitter
+    jd = (-jitter[0], -jitter[1]) if os.environ.get('M4R_FLIP_JITTER_DESC') else jitter
     bsp = (struct.pack('<6H', iw, ih, iw, ih, ow, oh) + bytes(20) +
-           struct.pack('<8f', jitter[0], jitter[1], ms[0], ms[1], iw / ow, ih / oh, ms[0] / iw, ms[1] / ih)).ljust(144, b'\0')
+           struct.pack('<8f', jb[0], jb[1], ms[0], ms[1], iw / ow, ih / oh, ms[0] / iw, ms[1] / ih)).ljust(144, b'\0')
     # brnet_v3_build_tensors_t (24 B): motionScale * outputSize, jitter, tensor row bytes (5 halves), height, width
-    v3d = struct.pack('<ffffiHH', ms[0] * ow, ms[1] * oh, jitter[0], jitter[1], 10, Hn, Wn)
+    v3d = struct.pack('<ffffiHH', ms[0] * ow, ms[1] * oh, jd[0], jd[1], 10, Hn, Wn)
     bufs = {'bparams': bsp, 'v3desc': v3d, 'v3bd': struct.pack('<iHH', 22, Ht, Wt), 'v3resetA': b'\x01'.ljust(16, b'\0'), 'v3reset': (b'\x01' if (t == 0 or os.environ.get('M4R_V3_RESET')) else b'\x00').ljust(16, b'\0'), 'npix': struct.pack('<I', iw * ih),
             'dbf_params_out': out_params, 'rw_ms': struct.pack('<2f', *ms), 'rw_pj': struct.pack('<2f', *pj),
             'rw_cj': struct.pack('<2f', *jitter), 'dbf_params': dbf, 'refl_params': refl, 'preexp': struct.pack('<f', f('preexposure')),
