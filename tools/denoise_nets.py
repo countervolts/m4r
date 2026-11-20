@@ -185,10 +185,10 @@ def dbf_net(p, dat, H, W, in_name='dbf_in', out_name='dbf_out'):
         buf(dst, h, w, P[i][4]); conv_pass(p, dat, P[i], i, src, dst, h, w, relu=relu)
     def pool(src, dst, h, w, c):
         buf(dst, h // 2, w // 2, c)
-        p.glsl('nn_pool', sh + '/nn_pool.comp'); p.run('nn_pool', w // 2, h // 2, [src, dst], [w // 2, h // 2, c])
+        p.glsl('nn_pool', sh + '/nn_pool.comp'); p.run('nn_pool', (w // 2) * c // 4, h // 2, [src, dst], [w // 2, h // 2, c])
     def up(src, skip, dst, h, w, c):
         buf(dst, h, w, c)
-        p.glsl('nn_upadd', sh + '/nn_upadd.comp'); p.run('nn_upadd', w, h, [src, skip, dst], [w, h, c])
+        p.glsl('nn_upadd', sh + '/nn_upadd.comp'); p.run('nn_upadd', w * c // 4, h, [src, skip, dst], [w, h, c])
     conv(0, in_name, 't0', H, W); conv(1, 't0', 's0', H, W)
     pool('s0', 'p0', H, W, 32)
     h1, w1 = H // 2, W // 2

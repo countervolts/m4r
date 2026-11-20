@@ -26,7 +26,7 @@ class Gen:
         os.makedirs(out + '/k', exist_ok=True); os.makedirs(out + '/blobs', exist_ok=True)
         self.mtl = open(res + '/default.metallib', 'rb').read()
         self.lib = metallib.parse(self.mtl)
-        self.lines = []; self.kernels = {}; self.src = {}; self.wmma = bool(os.environ.get('M4R_WMMA'))   # WMMA convs: opt-in until verified
+        self.lines = []; self.kernels = {}; self.src = {}; self.wmma = not os.environ.get('M4R_NO_WMMA')   # WMMA convs (shaders/nn_conv_wmma.cl); M4R_NO_WMMA=1: plain GLSL convs
         self.dat = {n: open(f'{res}/emit_{n}net_v3_2_constants.dat', 'rb').read() for n in ('dbf', 'ubf')}
 
     def source(self, fn):
