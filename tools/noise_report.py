@@ -26,7 +26,7 @@ def rel(x, m):
     return np.sqrt((hp ** 2)[m].mean()) / max(mu[m].mean(), 1e-6)
 
 
-up = lambda m: np.kron(m.astype(np.uint8), np.ones((oh // H + 1, ow // W + 1), np.uint8))[:oh, :ow].astype(bool)
+up = lambda m: m[(np.arange(oh) * H // oh)[:, None], (np.arange(ow) * W // ow)[None, :]]   # nearest: output pixel -> render pixel
 print('capture %s frame %d: %dx%d -> %dx%d, mean |motion| %.1f px' % (cap, first + idx, W, H, ow, oh, sp.mean()))
 bands = (('all', np.ones_like(rough, bool)), ('mirror r<0.08', rough < 0.08), ('glossy 0.08-0.2', (rough >= 0.08) & (rough < 0.2)),
          ('rest r>=0.2', rough >= 0.2))

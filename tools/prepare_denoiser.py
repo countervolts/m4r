@@ -197,14 +197,23 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
             (8, 8, 1), (W, H, 1),
             ['tex 0 warp_color', 'tex 1 color', 'tex 4 shin', 'tex 5 denoised', 'tex 6 specular', 'tex 7 diffuse', 'tex 8 roughness',
              'tex 9 dbf_tw', 'buf 10 exp0|exp1', 'buf 11 preexp'])
+    if runtime:
+        # m4r's own passes on the denoised colour (not MetalFX): m4r copies 'denoised' out to buffers, runs these, copies den_cl back.
+        # The interim firefly clamp (only despeckle, den_raw -> den_cl) on the BBR path only (V3 removes fireflies itself); the
+        # glossy-in-motion smoothing (only glossy, shaders/nn_glossy.comp: three a-trous steps den_cl -> den_g -> den_raw -> den_cl) on
+        # both, before V3 reads the denoised colour. m4r also copies int_depth / int_motion into gl_depth / gl_motion first.
+        g.buffer('den_raw', iw * ih * 8); g.buffer('den_cl', iw * ih * 8)
+        if stage < 'F':
+            g.glsl('nn_despeckle', os.path.join(ROOT, 'shaders', 'nn_despeckle.comp'))
+            g.run('nn_despeckle', iw, ih, ['den_raw', 'den_cl'], [iw, ih])
+            g.lines.append('  only despeckle')
+        g.buffer('gl_depth', iw * ih * 4); g.buffer('gl_motion', iw * ih * 4); g.buffer('den_g', iw * ih * 8)
+        g.glsl('nn_glossy', os.path.join(ROOT, 'shaders', 'nn_glossy.comp'))
+        for step, a, b in ((1, 'den_cl', 'den_g'), (2, 'den_g', 'den_raw'), (4, 'den_raw', 'den_cl')):
+            g.run('nn_glossy', iw, ih, [a, b, 'nrm_raw', 'gl_depth', 'gl_motion', 'rw_ms'], [iw, ih, step])
+            g.lines.append('  only glossy')
     if stage >= 'E':
         v3_ubf(g, iw, ih, W, H, ow, oh, full=stage >= 'F')
-    if runtime and stage < 'F':
-        # last pass: interim firefly clamp on the denoised colour (m4r copies 'denoised' to den_raw first and den_cl back afterwards)
-        g.buffer('den_raw', iw * ih * 8); g.buffer('den_cl', iw * ih * 8)
-        g.glsl('nn_despeckle', os.path.join(ROOT, 'shaders', 'nn_despeckle.comp'))
-        g.run('nn_despeckle', iw, ih, ['den_raw', 'den_cl'], [iw, ih])
-        g.lines.append('  only despeckle')
     return dict(W=W, H=H, tw=tw, th=th)
 
 
@@ -217,23 +226,26 @@ def v3_sizes(ow, oh):
 def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
     """BRNet_v3_Filter::encodePreForDenoise (build_tensors_low_resolution, warp_history_high_resolution, lowres_signals), the UBFNet
     pass and, with full, encodePost (the two output conversions and the anisotropic gaussian filter that writes 'v3out' and the history).
-    Bindings from the host code (docs/metalfx-denoiser-passes.txt, fn_BRN_*.txt); the sample-statistics textures stay zero as in the
-    denoise path (update_sample_statistics is not called there). The network works at half the output size (as BBR's spatial network
-    works at a quarter and its temporal one at half): spatial parameters at Wt x Ht, temporal ones at Wn x Hn."""
+    Bindings from the host code (docs/metalfx-denoiser-passes.txt, fn_BRN_*.txt). The network input is half the output size padded
+    to 32 (Wn x Hn); the textures around it are unpadded: output/2 (temporal, ema/var, aabb, sample statistics) and output/4 (spatial)."""
     Wn, Hn, Wt, Ht = v3_sizes(ow, oh)
+    # textures at network resolution are output/2 and the spatial one output/4, NOT the 32-aligned tensor size: the filter and
+    # lowres_signals address them with normalised output coordinates (BRNet_v3_Filter constructor: W/2 x H/2); only the tensor is padded.
+    # (With the tensor size the recurrent ema/var/temporal state drifted by 736/720 per frame: dark bands and ghosts at the bottom.)
+    Wh, Hh, Wq, Hq = ow // 2, oh // 2, ow // 4, oh // 4
     F = 'R16G16B16A16_SFLOAT'
     g.texture('crr', F, iw, ih)
     g.texture('v3hist', F, ow, oh)                                      # the previous output (written by the filter below)
     for n in ('fah', 'v3clamp', 'v3blend', 'v3fblend'):                 # output size
         g.texture(n, F, ow, oh)
     for n in ('v3ema0', 'v3ema1', 'v3var0', 'v3var1', 'v3lwv'):         # network-input size
-        g.texture(n, 'R16_SFLOAT', Wn, Hn)
-    g.texture('v3temporal2', F, Wn, Hn); g.texture('aabbmin', F, Wn, Hn); g.texture('aabbmax', F, Wn, Hn)
-    g.texture('v3spatial', F, Wt, Ht)
+        g.texture(n, 'R16_SFLOAT', Wh, Hh)
+    g.texture('v3temporal2', F, Wh, Hh); g.texture('aabbmin', F, Wh, Hh); g.texture('aabbmax', F, Wh, Hh)
+    g.texture('v3spatial', F, Wq, Hq)
     for n in ('v3se0', 'v3se1', 'v3sq0', 'v3sq1'):                      # sample statistics (BRNet +0xe0/+0xf0, ping-pong)
-        g.texture(n, 'R16_SFLOAT', Wn, Hn)
+        g.texture(n, 'R16_SFLOAT', Wh, Hh)
     for n in ('v3cnt0', 'v3cnt1'):
-        g.texture(n, 'R16_UINT', Wn, Hn)
+        g.texture(n, 'R16_UINT', Wh, Hh)
     g.texture('v3zero', F, 16, 16); g.texture('v3const', F, 16, 16)
     g.buffer('v3reset', 16); g.buffer('v3resetA', 16); g.buffer('v3desc', 24); g.buffer('v3bd', 16, struct.pack('<iHH', 22, Ht, Wt).ljust(16, b'\0')); g.buffer('ubf_in', Wn * Hn * 10)
     g.run_k('brnetv3_build_tensors_low_resolution', {'bfnet1_enabled': True, 'full_resolution_flow': False, 'jittered_motion_vectors': False},
@@ -246,7 +258,7 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
              'buf 0 v3desc', 'buf 1 bparams', 'buf 2 exp0|exp1', 'buf 3 exp1|exp0', 'buf 4 ' + ('v3resetA' if os.environ.get('M4R_RESET_WARP') else 'hinv'), 'buf 5 preexp'])
     g.run_k('brnetv3_lowres_signals', {'mid_bicubic_warp': False, 'half_res_input': False, 'quantized': False, 'is_tensor_layout_nchw': False,
                                       'bfnet1_enabled': True, 'big_epsilon_and_default_scales_enabled': False, 'new_overshoot_clamp': False},
-            (8, 8, 1), (Wn, Hn, 1),
+            (8, 8, 1), (Wh, Hh, 1),
             ['tex 0 crr', 'tex 1 fah', 'tex 2 flowd', 'tex 3 v3hist', 'tex 4 v3ema0|v3ema1', 'tex 5 v3var0|v3var1',
              'tex 6 v3ema1|v3ema0', 'tex 7 v3var1|v3var0', 'tex 8 ' + ('v3zero' if os.environ.get('M4R_NO_TEMPORAL_FB') else 'v3temporal2'), 'tex 9 v3lwv', 'tex 15 aabbmin', 'tex 16 aabbmax',
              'tex 17 normals', 'tex 18 diffuse', 'tex 19 roughness', 'tex 20 specular',
@@ -254,7 +266,7 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
              'bytes 6 ' + struct.pack('<2H', ow // 2, oh // 2).hex()])
     # BRNet_v3_Filter::encodeMid: update_sample_statistics (per-pixel running mean / mean of squares of the colour, used by the filter's
     # history clamp); in/out ping-pong, the filter reads the updated ones
-    g.run_k('brnetv3_update_sample_statistics', {}, (8, 8, 1), (Wn, Hn, 1),
+    g.run_k('brnetv3_update_sample_statistics', {}, (8, 8, 1), (Wh, Hh, 1),
             ['tex 0 flowd', 'tex 1 flowdiff', 'tex 2 v3se0|v3se1', 'tex 3 v3sq0|v3sq1', 'tex 4 v3se1|v3se0', 'tex 5 v3sq1|v3sq0',
              'tex 6 v3cnt0|v3cnt1', 'tex 8 v3cnt1|v3cnt0', 'tex 10 crr', 'buf 1 bparams', 'buf 3 hinv'])
     import denoise_nets as dn
@@ -263,8 +275,8 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
     if not full:
         return
     fc = {'quantized': False, 'is_tensor_layout_nchw': False, 'bfnet1_enabled': True}
-    g.run_k('brnetv3_output_spatial_lr', fc, (8, 8, 1), (Wt, Ht, 1), ['tex 0 v3spatial', 'buf 0 ubf_out', 'buf 1 v3bd'])
-    g.run_k('brnetv3_output_temporal', fc, (8, 8, 1), (Wn, Hn, 1), ['tex 0 v3temporal2', 'buf 0 ubf_out', 'buf 1 v3bd'])
+    g.run_k('brnetv3_output_spatial_lr', fc, (8, 8, 1), (Wq, Hq, 1), ['tex 0 v3spatial', 'buf 0 ubf_out', 'buf 1 v3bd'])
+    g.run_k('brnetv3_output_temporal', fc, (8, 8, 1), (Wh, Hh, 1), ['tex 0 v3temporal2', 'buf 0 ubf_out', 'buf 1 v3bd'])
     g.texture('v3out', F, ow, oh)
     g.run_k('brnetv3_anisotropic_gaussian_filter',
             {'quantized': False, 'reactive_mask_enabled': False, 'bfnet1_enabled': True, 'line_locking_enabled': False,

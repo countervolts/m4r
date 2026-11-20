@@ -25,6 +25,14 @@ public:
     // passes marked `only FLAG` (or `only !FLAG`) in the plan run only while the flag is set (clear); flags start clear
     void setFlag(const std::string& name, bool on) { flags_[name] = on; }
     size_t passes() const { return passes_.size(); }
+    // the flag of `only FLAG` on pass i (empty if none or `only !FLAG`)
+    const std::string& onlyFlag(size_t i) const { static const std::string none; return i < passes_.size() && !passes_[i].onlyNot ? passes_[i].only : none; }
+    // index of the first pass marked `only FLAG`, passes() if there is none
+    size_t firstOnly(const std::string& flag) const {
+        for (size_t i = 0; i < passes_.size(); ++i)
+            if (passes_[i].only == flag && !passes_[i].onlyNot) return i;
+        return passes_.size();
+    }
     const std::string& passLabel(size_t i) const { return passes_[i].label; }
     const std::map<std::string, Buffer>& buffers() const { return buffers_; }
     const std::map<std::string, Texture>& textures() const { return textures_; }

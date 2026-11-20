@@ -200,3 +200,31 @@ The `BRNet_v3_Filter` constructor sets 9..0x1a from its own flags (same extracti
 5. A reference output. There is none, so correctness could only be judged by eye or against a capture from a Mac.
 
 `tools/mpsgraph.py` reads the package graphs, `tools/host_trace.py` the per-dispatch bindings (see their docstrings).
+
+## The port in m4r: V3 stage sizes, and m4r's own passes (2026-11-20)
+
+**V3 texture sizes.** The `BRNet_v3_Filter` textures at network resolution (temporal, the ema/variance pairs, aabbMin/Max,
+largeWindowVarianceRatio, sample statistics and counters) are `outputSize / 2`, and the spatial one is `outputSize / 4`, NOT the
+32-aligned UBFNet tensor size (only the tensor is padded; `brnet_v3_build_tensors_t` / `brnet_v3_buff_desc_t` describe it).
+`brnetv3_anisotropic_gaussian_filter` samples all of them at `(gid + 0.5) / outputSize`, and `brnetv3_lowres_signals` computes its uv
+from `bytes[6] = outputSize / 2`. With tensor-sized textures (1280x736 for 1440p) the filter read the network outputs 736/720 too far
+down, and the recurrent ema/variance/temporal state drifted by that ratio every frame: a growing dark band above the gun with a still
+camera and a doubled scope/gun in motion (what parked V3 in game). With the sizes fixed, V3 on the in-game captures: no halo, no ghost
+after the first frames, no fireflies or puddle glitter, high-frequency noise 30-55% below the BBR path on static scenes and lower
+frame-to-frame flicker in motion; brightness equal to the BBR path; `run_denoise_api` bit-identical to the offline harness.
+
+**m4r's own passes (NOT MetalFX behaviour).** Between the denoiser and the upscaling stage (BBR or V3) the runtime plan has a block of
+GLSL passes on buffer copies of the denoised colour:
+- `nn_despeckle` (BBR path only; `M4R_NO_DESPECKLE=1` turns it off): caps a pixel at 1.5x its third-brightest neighbour.
+- `nn_glossy` (both paths; `M4R_NO_GLOSSY_SMOOTH=1` turns it off): three a-trous steps (5x5 B-spline taps at distance 1, 2, 4)
+  weighted by normal, depth and roughness similarity and by log-luminance distance to the 3x3 geometric mean, blended in only for
+  low-roughness pixels (full below 0.15, none above 0.30) that move more than 1 px (full at 3 px). Why: `reproject_warp` drops the
+  history of glossy pixels that move (weight `1 - clamp(|ms * flow| - 256 * rough * prevRough, 0, 1)`), by design, so moving
+  reflections leave the denoiser with one frame of samples. Static pixels and rough surfaces pass through bit-exactly. Capture d
+  (pan, 9 px/frame), final 1440p frame, high-pass rms of log luma on moving mirror pixels: BBR path 0.118 -> 0.029, V3 0.104 -> 0.051;
+  frame-to-frame residual on moving mirror pixels: V3 0.047 -> 0.026 (BBR path 0.061). Cost at 853x480: at most 0.28 ms (every pixel
+  gated in), plus three image copies.
+
+Measuring noise: `tools/noise_report.py` (fixed 2026-11-20: its output-resolution band masks were scaled by `oh // H + 1`, i.e.
+misaligned; the final-frame columns before that are wrong). Relative rms is dominated by a few emissive highlights (car lights) in the
+glossy bands; log-luma high-pass on 5x5-eroded masks is more telling.

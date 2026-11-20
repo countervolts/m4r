@@ -3,6 +3,7 @@
 #include "plan.h"
 #include "params.h"
 #include "m4r.h"
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdarg>
@@ -570,23 +571,41 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
         c->vk.barrier(cb);
         first = 1;
     }
-    // interim firefly clamp (last pass of the plan): copy the denoised colour out, clamp, copy it back
+    // m4r's own passes on the denoised colour, a block of `only despeckle` / `only glossy` passes right after MetalFX's denoiser (before
+    // the V3 stage, if the plan has one), run on buffer copies: the interim firefly clamp (den_raw -> den_cl) and the glossy-in-motion
+    // smoothing (den_cl -> ... -> den_cl; needs the normals copy with roughness in w and buffer copies of int_depth / int_motion).
+    // Neither is MetalFX behaviour; M4R_NO_DESPECKLE=1 / M4R_NO_GLOSSY_SMOOTH=1 turn them off.
     static const bool noDespeckle = std::getenv("M4R_NO_DESPECKLE") != nullptr;
-    Buffer *dRaw = p.buffer("den_raw"), *dCl = p.buffer("den_cl");
-    Texture* denTex = p.texture("denoised");
-    const bool despeckle = !noDespeckle && dRaw && dCl && denTex && p.passes() > first + 1;
-    p.setFlag("despeckle", despeckle);
-    ok = ok && p.record(cb, first, despeckle ? p.passes() - 1 - first : size_t(-1));
+    static const bool noGlossy = std::getenv("M4R_NO_GLOSSY_SMOOTH") != nullptr;
+    Buffer *dRaw = p.buffer("den_raw"), *dCl = p.buffer("den_cl"), *glD = p.buffer("gl_depth"), *glM = p.buffer("gl_motion");
+    Texture *denTex = p.texture("denoised"), *iDepth = p.texture("int_depth"), *iMotion = p.texture("int_motion");
+    const size_t lo = std::min(p.firstOnly("despeckle"), p.firstOnly("glossy"));
+    size_t hi = lo;
+    while (hi < p.passes() && (p.onlyFlag(hi) == "despeckle" || p.onlyFlag(hi) == "glossy")) ++hi;
+    const bool despeckle = !noDespeckle && dRaw && dCl && denTex && p.firstOnly("despeckle") < p.passes();
+    const bool glossy = !noGlossy && dRaw && dCl && denTex && glD && glM && iDepth && iMotion && first == 1 &&
+                        p.firstOnly("glossy") < p.passes();
+    p.setFlag("despeckle", despeckle); p.setFlag("glossy", glossy);
+    ok = ok && p.record(cb, first, lo > first ? lo - first : 0);
     c->vk.barrier(cb);
-    if (despeckle && ok) {
+    if ((despeckle || glossy) && ok) {
         VkBufferImageCopy cp{};
         cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         cp.imageExtent = {iw, ih, 1};
-        vkCmdCopyImageToBuffer(cb, denTex->image, VK_IMAGE_LAYOUT_GENERAL, dRaw->buffer, 1, &cp);
+        // without the clamp the smoothing starts from den_cl
+        vkCmdCopyImageToBuffer(cb, denTex->image, VK_IMAGE_LAYOUT_GENERAL, despeckle ? dRaw->buffer : dCl->buffer, 1, &cp);
+        if (glossy) {
+            vkCmdCopyImageToBuffer(cb, iDepth->image, VK_IMAGE_LAYOUT_GENERAL, glD->buffer, 1, &cp);
+            vkCmdCopyImageToBuffer(cb, iMotion->image, VK_IMAGE_LAYOUT_GENERAL, glM->buffer, 1, &cp);
+        }
         c->vk.barrier(cb);
-        ok = p.record(cb, p.passes() - 1, 1);
+        ok = p.record(cb, lo, hi - lo);
         c->vk.barrier(cb);
         vkCmdCopyBufferToImage(cb, dCl->buffer, denTex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        c->vk.barrier(cb);
+    }
+    if (ok && hi < p.passes()) {   // the rest of the plan (the V3 stage)
+        ok = p.record(cb, hi);
         c->vk.barrier(cb);
     }
     g.end();
