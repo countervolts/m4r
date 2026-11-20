@@ -77,10 +77,15 @@ int main(int argc, char** argv) {
         VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(vk.physical, &props);
         std::vector<double> ptotal(plan.passes(), 0.0);
         for (int t = 0; t < frames; ++t) {
-            const std::string id = std::to_string(first + t);
+            const int loopN = std::getenv("M4R_LOOP") ? std::atoi(std::getenv("M4R_LOOP")) : 0;   // loop a short capture to reach steady state
+            const std::string id = std::to_string(first + (loopN ? t % loopN : t));
             for (size_t i = 0; i < tex.size(); ++i) {
                 auto d = readAll(cap + "/rr-" + id + "-" + ins[i].file + ".raw");
                 if (d.size() != size_t(rw) * rh * ins[i].bpp) { std::fprintf(stderr, "frame %s: %s size %zu\n", id.c_str(), ins[i].file, d.size()); rc = 1; goto done; }
+                if (std::string(ins[i].name) == "spechit" && std::getenv("M4R_SPECHIT")) {   // experiment: constant specular hit distance
+                    const float v = std::strtof(std::getenv("M4R_SPECHIT"), nullptr);
+                    for (size_t o = 0; o + 4 <= d.size(); o += 4) std::memcpy(d.data() + o, &v, 4);
+                }
                 vk.upload(tex[i], d.data(), d.size());
                 if (std::string(ins[i].name) == "normals") {   // roughness is the normals' alpha
                     std::vector<uint16_t> r(size_t(rw) * rh);

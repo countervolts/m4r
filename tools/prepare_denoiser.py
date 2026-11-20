@@ -353,7 +353,7 @@ def main():
         prev = None
         for t in range(a.frames):
             d = f'{a.out}/frames/{t:02d}'; os.makedirs(d, exist_ok=True)
-            bufs, prev = frame_buffers(a.capture, a.first + t, t, sz, iw, ih, prev)
+            bufs, prev = frame_buffers(a.capture, a.first + (t % int(os.environ['M4R_LOOP']) if os.environ.get('M4R_LOOP') else t), t, sz, iw, ih, prev)
             for n, b in bufs.items():
                 open(f'{d}/{n}.bin', 'wb').write(b)
             open(f'{d}/flags.txt', 'w').write('autoexp\n' if os.environ.get('M4R_AUTOEXPOSURE') else '')
