@@ -3,6 +3,8 @@
 #include "plan.h"
 #include "params.h"
 #include "m4r.h"
+#include <array>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -15,7 +17,12 @@ struct m4r_context {
     Context vk;
     Runtime rt{vk};
     std::string dir, error;
-    std::unique_ptr<Plan> bbr[2], fg;   // bbr[1]: plan for reversed depth, bbr[0]: forward depth (plans are specialised for it)
+    std::unique_ptr<Plan> bbr[2], fg, dn;   // dn: the denoiser plan (render size)
+    uint32_t dnSize[2] = {};
+    uint64_t dnFrame = 0;
+    double dnPrevVp[16] = {};
+    float dnPrevJitter[2] = {};
+    bool exposureOneCleared = false;   // bbr[1]: plan for reversed depth, bbr[0]: forward depth (plans are specialised for it)
     uint32_t bbrSize[4] = {}, fgSize[4] = {};
     bool bbrInit = false;
     std::map<uint64_t, bool> bbrNoPlan;   // content sizes without a plan of their own (looked up once)
@@ -274,7 +281,7 @@ M4R_API void m4r_destroy(m4r_context* c) {
     writeUpDumps(c, true);
     writeRrDumps(c, true);
     if (c->dumpDepth.buffer) { c->vk.destroyBuffer(c->dumpDepth); c->vk.destroyBuffer(c->dumpMotion); }
-    c->bbr[0].reset(); c->bbr[1].reset(); c->fg.reset();
+    c->bbr[0].reset(); c->bbr[1].reset(); c->fg.reset(); c->dn.reset();
     for (auto& [img, t] : c->wrapped) c->vk.destroyTexture(t);
     if (c->exposureOne.image) c->vk.destroyTexture(c->exposureOne);
     for (Texture* t : {&c->frames[0], &c->frames[1], &c->generated})
@@ -370,6 +377,155 @@ M4R_API int m4r_denoise_capture(m4r_context* c, VkCommandBuffer cb, const m4r_de
     u.meta = meta;
     g_rrDumps.push_back(std::move(u));
     return 0;
+}
+
+// ---- MetalFX denoiser ----------------------------------------------------------------------------------------------------
+using M4 = std::array<double, 16>;   // row-major
+static M4 mul(const M4& a, const M4& b) {
+    M4 r{};
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) for (int k = 0; k < 4; ++k) r[i * 4 + j] += a[i * 4 + k] * b[k * 4 + j];
+    return r;
+}
+static M4 transposed(const M4& a) { M4 r; for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) r[i * 4 + j] = a[j * 4 + i]; return r; }
+static M4 inverse(const M4& m) {   // Gauss-Jordan with partial pivoting; singular input gives the identity
+    double a[4][8];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) { a[i][j] = m[i * 4 + j]; a[i][4 + j] = i == j; }
+    for (int c = 0; c < 4; ++c) {
+        int p = c;
+        for (int r = c + 1; r < 4; ++r) if (std::fabs(a[r][c]) > std::fabs(a[p][c])) p = r;
+        if (std::fabs(a[p][c]) < 1e-300) return M4{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        if (p != c) for (int j = 0; j < 8; ++j) std::swap(a[p][j], a[c][j]);
+        const double d = a[c][c];
+        for (int j = 0; j < 8; ++j) a[c][j] /= d;
+        for (int r = 0; r < 4; ++r) if (r != c) { const double f = a[r][c]; for (int j = 0; j < 8; ++j) a[r][j] -= f * a[c][j]; }
+    }
+    M4 r; for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) r[i * 4 + j] = a[i][4 + j];
+    return r;
+}
+static void putColumnMajor(uint8_t* dst, const M4& m) {
+    for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) { const float f = float(m[r * 4 + c]); std::memcpy(dst + (c * 4 + r) * 4, &f, 4); }
+}
+
+M4R_API int m4r_denoise_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t iw, uint32_t ih) {
+    if (c->dn && c->dnSize[0] == iw && c->dnSize[1] == ih) return m4r_upscale_init(c, ow, oh, iw, ih);
+    auto p = std::make_unique<Plan>(c->rt);
+    char name[64];
+    std::snprintf(name, sizeof name, "/dn-%ux%u", iw, ih);
+    if (!p->load(c->dir + name)) { c->error = p->error; return 1; }
+    if (m4r_upscale_init(c, ow, oh, iw, ih) != 0) return 1;
+    c->dn = std::move(p);
+    c->dnSize[0] = iw; c->dnSize[1] = ih;
+    c->dnFrame = 0;
+    return 0;
+}
+
+M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_desc* d) {
+    if (!c->dn) { c->error = "m4r_denoise_init not called"; return 1; }
+    const uint32_t iw = c->dnSize[0], ih = c->dnSize[1];
+    if (d->content_width != iw || d->content_height != ih) {
+        char b[160];
+        std::snprintf(b, sizeof b, "denoiser plan is for %ux%u, the game renders %ux%u", iw, ih, d->content_width, d->content_height);
+        c->error = b;
+        return 1;
+    }
+    Plan& p = *c->dn;
+    const Texture *color = c->wrap(d->color), *depth = c->wrap(d->depth), *motion = c->wrap(d->motion), *normals = c->wrap(d->normals),
+                  *diffuse = c->wrap(d->diffuse_albedo), *specular = c->wrap(d->specular_albedo);
+    if (!color || !depth || !motion || !normals || !diffuse || !specular || !d->output.image) {
+        c->error = "Ray Reconstruction: missing color, depth, motion vectors, normals, albedo or output";
+        return 1;
+    }
+    const Texture* rough = d->roughness.image ? c->wrap(d->roughness) : nullptr;
+    if (!d->roughness_in_normals_w && !rough) { c->error = "Ray Reconstruction: no roughness"; return 1; }
+    const Texture* exposure = d->exposure.image ? c->wrap(d->exposure) : &c->exposureOne;
+    LayoutGuard g{cb};
+    for (const m4r_image* im : {&d->color, &d->depth, &d->motion, &d->normals, &d->diffuse_albedo, &d->specular_albedo, &d->roughness, &d->exposure})
+        g.add(*im);
+    g.begin();
+    if (!d->exposure.image && !c->exposureOneCleared) {
+        c->vk.toGeneral(cb, c->exposureOne);
+        VkClearColorValue one{{1.0f, 1.0f, 1.0f, 1.0f}};
+        VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, c->exposureOne.image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &r);
+        c->exposureOneCleared = true;
+    }
+    p.bindTexture("color", color); p.bindTexture("depth", depth); p.bindTexture("motion", motion); p.bindTexture("normals", normals);
+    p.bindTexture("diffuse", diffuse); p.bindTexture("specular", specular); p.bindTexture("exposure", exposure);
+    if (rough) p.bindTexture("roughness", rough);
+
+    // Per-frame parameters (BRNetShaderParams-style structs of MetalFX's BFNet filter, docs/metalfx-denoiser.md)
+    const uint32_t W = (iw + 7) & ~7u, H = (ih + 7) & ~7u, tw = ((iw + 15) >> 1) & ~7u, th = ((ih + 15) >> 1) & ~7u;
+    const bool reset = d->reset || c->dnFrame == 0;
+    M4 w2v, v2c;
+    for (int i = 0; i < 16; ++i) { w2v[i] = d->world_to_view[i]; v2c[i] = d->view_to_clip[i]; }
+    const M4 Wc = transposed(w2v), Pc = transposed(v2c);   // NGX: row-major, row vectors; MetalFX: column vectors
+    const M4 curr = mul(Pc, Wc), invVp = inverse(curr), invW = inverse(Wc);
+    M4 prev = curr;
+    if (!reset) std::memcpy(prev.data(), c->dnPrevVp, sizeof c->dnPrevVp);
+    const float ms[2] = {d->motion_scale_x, d->motion_scale_y}, jit[2] = {d->jitter_x, d->jitter_y};
+    const float pj[2] = {reset ? 0.0f : c->dnPrevJitter[0], reset ? 0.0f : c->dnPrevJitter[1]};
+    uint8_t dbf[40] = {}, dbfOut[40] = {}, refl[224] = {}, resetb[16] = {};
+    auto dbfParams = [&](uint8_t* b, bool in) {   // dbfnet_v1_build_tensors_t
+        if (in) { std::memcpy(b, ms, 8); std::memcpy(b + 8, pj, 8); std::memcpy(b + 16, jit, 8); }
+        const int32_t rowBytes = in ? 26 : 14;
+        const uint16_t hh = uint16_t(th), ww = uint16_t(tw);
+        std::memcpy(b + 24, &rowBytes, 4); std::memcpy(b + 28, &hh, 2); std::memcpy(b + 30, &ww, 2); b[32] = reset;
+    };
+    dbfParams(dbf, true); dbfParams(dbfOut, false);
+    putColumnMajor(refl, invVp); putColumnMajor(refl + 64, prev); putColumnMajor(refl + 128, curr);
+    const float cam[4] = {float(invW[3]), float(invW[7]), float(invW[11]), float(invW[15])};
+    const float rp[4] = {1.0f / W, 1.0f / H, W / ms[0], H / ms[1]};
+    std::memcpy(refl + 192, cam, 16); std::memcpy(refl + 208, rp, 16);
+    resetb[0] = reset;
+    const float pre = d->pre_exposure > 0 ? d->pre_exposure : 1.0f;
+    p.bindBuffer("dbf_params", c->rt.transient(dbf, sizeof dbf)); p.bindBuffer("dbf_params_out", c->rt.transient(dbfOut, sizeof dbfOut));
+    p.bindBuffer("refl_params", c->rt.transient(refl, sizeof refl)); p.bindBuffer("preexp", c->rt.transient(&pre, 4));
+    p.bindBuffer("reset", c->rt.transient(resetb, sizeof resetb));
+    p.bindBuffer("rw_ms", c->rt.transient(ms, 8)); p.bindBuffer("rw_pj", c->rt.transient(pj, 8)); p.bindBuffer("rw_cj", c->rt.transient(jit, 8));
+    p.setParity(int(c->dnFrame & 1));
+
+    bool ok = p.record(cb, 0, 0);   // textures: first-use clear
+    size_t first = 0;
+    if (d->roughness_in_normals_w && !rough) {   // roughness = normals.w (pass 0 of the plan)
+        Buffer *nrm = p.buffer("nrm_raw"), *rr = p.buffer("rough_raw");
+        Texture* rt = p.texture("roughness");
+        if (!nrm || !rr || !rt) { c->error = "denoiser plan lacks the roughness extraction (prepare_denoiser.py --runtime)"; return 1; }
+        VkBufferImageCopy cp{};
+        cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        cp.imageExtent = {iw, ih, 1};
+        c->vk.barrier(cb);
+        vkCmdCopyImageToBuffer(cb, normals->image, VK_IMAGE_LAYOUT_GENERAL, nrm->buffer, 1, &cp);
+        c->vk.barrier(cb);
+        ok = ok && p.record(cb, 0, 1);
+        c->vk.barrier(cb);
+        vkCmdCopyBufferToImage(cb, rr->buffer, rt->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        c->vk.barrier(cb);
+        first = 1;
+    }
+    ok = ok && p.record(cb, first);
+    c->vk.barrier(cb);
+    g.end();
+    if (!ok) { c->error = p.error; return 1; }
+    std::memcpy(c->dnPrevVp, curr.data(), sizeof c->dnPrevVp);
+    c->dnPrevJitter[0] = jit[0]; c->dnPrevJitter[1] = jit[1];
+    ++c->dnFrame;
+
+    // upscaling: MetalFX's own upscaler on the denoised colour
+    Texture* den = p.texture("denoised");
+    if (!den) { c->error = "denoiser plan has no 'denoised' texture"; return 1; }
+    m4r_upscale_desc u{};
+    u.color = ownedImage(*den); u.depth = d->depth; u.motion = d->motion; u.exposure = d->exposure; u.output = d->output;
+    u.content_width = iw; u.content_height = ih;
+    const float fj = d->flip_upscale_jitter ? -1.0f : 1.0f;
+    u.jitter_x = fj * d->jitter_x; u.jitter_y = fj * d->jitter_y;
+    u.motion_scale_x = d->motion_scale_x; u.motion_scale_y = d->motion_scale_y;
+    u.pre_exposure = d->pre_exposure; u.reset = d->reset; u.depth_reversed = d->depth_reversed;
+    return m4r_upscale(c, cb, &u);
+}
+
+M4R_API VkImage m4r_denoise_texture(m4r_context* c, const char* name) {
+    Texture* t = c->dn ? c->dn->texture(name) : nullptr;
+    return t ? t->image : VK_NULL_HANDLE;
 }
 
 M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_desc* d) {

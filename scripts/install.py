@@ -5,6 +5,7 @@
     m4r/plans/bbr-<display>-<render>        upscaler plan, reversed depth (what most engines use)
     m4r/plans/bbr-<display>-<render>-fwd    upscaler plan, forward depth
     m4r/plans/fg-<display>-<render>         frame generation plan
+    m4r/plans/dn-<render>                   denoiser plan (Ray Reconstruction), one per render size
 
 A plan exists per display and render resolution pair. The render size of each quality mode is worked out the way OptiScaler
 does it ((unsigned)(display / ratio) with 3.0, 2.0, 1.7, 1.5, 1.3 and 1.0 for ultra performance, performance, balanced,
@@ -14,7 +15,7 @@ Plans contain Apple's translated kernels and weights made from your copy: keep t
 
 usage: install.py --resources <MetalFX Resources dir> --binary <MetalFX binary> (--game <dir with OptiScaler's dxgi.dll> | --plans <dir>)
                   [--display 1920x1080 ...] [--modes quality,balanced,performance,ultra,dlaa,ultra-quality]
-                  [--input WxH ...] [--no-align8] [--depth reversed|forward|both] [--no-fg] [--m4r-dll path] [--jobs N] [--force]
+                  [--input WxH ...] [--no-align8] [--depth reversed|forward|both] [--no-fg] [--no-denoiser] [--m4r-dll path] [--jobs N] [--force]
 SPDX-License-Identifier: GPL-3.0-only
 """
 import argparse, concurrent.futures, os, shutil, subprocess, sys
@@ -66,6 +67,7 @@ def main():
     ap.add_argument('--no-align8', dest='align8', action='store_false', help='no plans for mode sizes rounded up to a multiple of 8')
     ap.add_argument('--depth', choices=('reversed', 'forward', 'both'), default='both', help='depth conventions of the upscaler plans')
     ap.add_argument('--no-fg', action='store_true', help='no frame generation plans')
+    ap.add_argument('--no-denoiser', action='store_true', help='no denoiser plans (Ray Reconstruction games)')
     ap.add_argument('--line-locking', action='store_true', help="upscaler plans with MetalFX's line locking (about 0.06 ms)")
     ap.add_argument('--m4r-dll', default=os.path.join(ROOT, 'build-win', 'm4r.dll'))
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) // 2))
@@ -132,6 +134,9 @@ def main():
             jobs.append((f'bbr-{tag}{suffix}', [sys.executable, '-I', os.path.join(ROOT, 'tools', 'prepare_bbr.py'), *common,
                                                 '--binary', a.binary, '--reversed-depth', str(rev)]
                          + (['--line-locking'] if a.line_locking else [])))
+        if not a.no_denoiser and (disp, inp) == next(x for x in pairs if x[1] == inp):   # the denoiser only depends on the render size
+            jobs.append((f'dn-{inp[0]}x{inp[1]}', [sys.executable, '-I', os.path.join(ROOT, 'tools', 'prepare_denoiser.py'), '--resources',
+                                                  a.resources, '--input', f'{inp[0]}x{inp[1]}', '--stage', 'D', '--runtime', '--gpu', a.gpu]))
         if not a.no_fg:
             jobs.append((f'fg-{tag}', [sys.executable, '-I', os.path.join(ROOT, 'tools', 'prepare_fg.py'), *common]))
 

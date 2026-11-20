@@ -51,6 +51,8 @@ add_executable(run_bbr tests/run_bbr.cpp)
 target_link_libraries(run_bbr m4r_runtime)
 add_executable(run_denoise tests/run_denoise.cpp)
 target_link_libraries(run_denoise m4r_runtime)
+add_executable(run_denoise_api tests/run_denoise_api.cpp)
+target_link_libraries(run_denoise_api m4r_runtime)
 
 add_executable(run_fg tests/run_fg.cpp)
 target_link_libraries(run_fg m4r_runtime)

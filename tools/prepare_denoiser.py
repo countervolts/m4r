@@ -84,10 +84,10 @@ class Gen:
     def save(self):
         decl = [l for l in self.lines if l.split(' ', 1)[0] in ('buffer', 'texture', 'kernel', 'glsl')]
         rest = [l for l in self.lines if l.split(' ', 1)[0] not in ('buffer', 'texture', 'kernel', 'glsl')]
-        open(self.out + '/plan.txt', 'w').write('\n'.join(decl + rest) + '\n')
+        open(self.out + '/plan.txt', 'w').write('\n'.join([f'gpu {m4r_air.GPU}'] + decl + rest) + '\n')
 
 
-def build(g, iw, ih, stage):
+def build(g, iw, ih, stage, runtime=False):
     W, H = (iw + 7) & ~7, (ih + 7) & ~7          # BFNet size: render size rounded up to 8
     tw, th = ((iw + 15) >> 1) & ~7, ((ih + 15) >> 1) & ~7   # DBF tensor (half resolution)
     ROW = 26                                       # NHWC, 13 half channels per pixel
@@ -99,6 +99,13 @@ def build(g, iw, ih, stage):
     # BFNet +0xa8: the previous frame's colour (texPrevInputFrame) and the first a-trous iteration's output (history_tex): one texture
     g.texture('hist', 'R16G16B16A16_SFLOAT', W, H)
     g.texture('mm0', 'R8_UNORM', W, H); g.texture('mm1', 'R8_UNORM', W, H)
+    if runtime:
+        # the game's normals carry roughness in alpha (pass 0): m4r copies the normals to nrm_raw, this pass extracts alpha into
+        # rough_raw, m4r copies that into the roughness texture; specular hit distance is not read (spec_hit_dist_enabled false)
+        g.buffer('nrm_raw', iw * ih * 8); g.buffer('rough_raw', iw * ih * 2)
+        g.texture('roughness', 'R16_SFLOAT', iw, ih); g.texture('spechit', 'R32_SFLOAT', 1, 1)
+        g.glsl('nn_rough', os.path.join(ROOT, 'shaders', 'nn_rough.comp'))
+        g.run('nn_rough', iw, ih, ['nrm_raw', 'rough_raw'], [iw, ih])
     # DPreProcessing: exposure (BRNet_v3_Filter::encodeExposureCalcForDenoiser, exposure texture path)
     g.run_k('exposure_texture_to_buffer', {}, (32, 1, 1), (1, 1, 1),
           ['tex 0 exposure', 'buf 0 exp0|exp1', 'buf 1 exp1|exp0', 'buf 2 hinv', 'buf 3 reset'])
@@ -181,6 +188,8 @@ def frame_buffers(cap, fid, t, sz, iw, ih, prev):
     prev_vp = prev['vp'] if prev else curr_vp
     ms = (f('mvscale', 0), f('mvscale', 1))
     jitter = (f('jitter', 0), f('jitter', 1))
+    if os.environ.get('M4R_FLIP_JITTER'):
+        jitter = (-jitter[0], -jitter[1])
     # the effect negates nothing here: MetalFX takes the NGX jitter as given by the integration (OptiScaler passes it through)
     pj = prev['jitter'] if prev else (0.0, 0.0)
     dbf = struct.pack('<6fiHHB', ms[0], ms[1], pj[0], pj[1], jitter[0], jitter[1], 26, sz['th'], sz['tw'], 1 if t == 0 else 0).ljust(40, b'\0')
@@ -195,22 +204,33 @@ def frame_buffers(cap, fid, t, sz, iw, ih, prev):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--resources', required=True); ap.add_argument('--capture', required=True)
-    ap.add_argument('--first', type=int, required=True); ap.add_argument('--frames', type=int, default=1)
+    ap.add_argument('--resources', required=True)
+    ap.add_argument('--capture', help='M4R_DUMP_RR capture dir: gives the size and the per-frame buffers (offline harness)')
+    ap.add_argument('--first', type=int); ap.add_argument('--frames', type=int, default=1)
+    ap.add_argument('--input', help='render size WxH (instead of --capture)')
     ap.add_argument('--out', required=True); ap.add_argument('--stage', default='C')
+    ap.add_argument('--runtime', action='store_true', help='plan for m4r_denoise (roughness taken from the normals, own spec-hit stub)')
+    ap.add_argument('--gpu', help='target GPU (as prepare_bbr.py)')
+    ap.add_argument('--force', action='store_true')
     a = ap.parse_args()
-    meta = dict(l.split(None, 1) for l in open(f'{a.capture}/rr-{a.first}.txt') if l.startswith(('content', 'output')))
-    iw, ih = map(int, meta['content'].split())
+    if a.input:
+        iw, ih = map(int, a.input.lower().split('x'))
+    else:
+        meta = dict(l.split(None, 1) for l in open(f'{a.capture}/rr-{a.first}.txt') if l.startswith(('content', 'output')))
+        iw, ih = map(int, meta['content'].split())
+    if a.gpu:
+        m4r_air.set_gpu(a.gpu)
     g = Gen(a.resources, a.out)
-    sz = build(g, iw, ih, a.stage)
+    sz = build(g, iw, ih, a.stage, a.runtime)
     g.save()
-    prev = None
-    for t in range(a.frames):
-        d = f'{a.out}/frames/{t:02d}'; os.makedirs(d, exist_ok=True)
-        bufs, prev = frame_buffers(a.capture, a.first + t, t, sz, iw, ih, prev)
-        for n, b in bufs.items():
-            open(f'{d}/{n}.bin', 'wb').write(b)
-        open(f'{d}/flags.txt', 'w').write('')
+    if a.capture:
+        prev = None
+        for t in range(a.frames):
+            d = f'{a.out}/frames/{t:02d}'; os.makedirs(d, exist_ok=True)
+            bufs, prev = frame_buffers(a.capture, a.first + t, t, sz, iw, ih, prev)
+            for n, b in bufs.items():
+                open(f'{d}/{n}.bin', 'wb').write(b)
+            open(f'{d}/flags.txt', 'w').write('')
     json.dump(sz, open(a.out + '/sizes.json', 'w'))
     print('plan', a.out, sz)
 

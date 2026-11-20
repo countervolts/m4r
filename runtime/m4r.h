@@ -57,6 +57,7 @@ typedef struct m4r_denoise_desc {
     uint32_t content_width, content_height;
     float jitter_x, jitter_y, motion_scale_x, motion_scale_y, pre_exposure;
     int reset, depth_reversed, hardware_depth, roughness_in_normals_w, motion_low_res, specular_hit_in_w;
+    int flip_upscale_jitter;   /* the jitter is given in DLSS's convention; the upscaling step wants MetalFX's (opposite sign) */
 } m4r_denoise_desc;
 
 /* Frame generation at present time. The finished frame (backbuffer, display size) and this frame's render-size depth
@@ -79,6 +80,13 @@ M4R_API int m4r_upscale(m4r_context* ctx, VkCommandBuffer cb, const m4r_upscale_
 /* M4R_DUMP_RR=<dir> (+ M4R_DUMP_RR_COUNT, default 6 frames): creating the file <dir>/trigger starts a capture; writes the raw texels of the Ray Reconstruction inputs and the
  * frame's parameters (rr-NN-<name>.raw, rr-NN.txt) for offline work on the denoiser. Does nothing when unset. 0 = ok. */
 M4R_API int m4r_denoise_capture(m4r_context* ctx, VkCommandBuffer cb, const m4r_denoise_desc* desc);
+/* MetalFX's temporal denoiser followed by the MetalFX upscaler: the denoiser (DBFNet guidance + reprojection + a-trous filter, plan
+ * <data dir>/dn-<in w>x<in h> from tools/prepare_denoiser.py --runtime) runs at render size, its result goes through the upscaler plan
+ * (m4r_upscale_init sizes). Not implemented yet: the denoiser's own upscaling network (UBFNet) and V3 temporal stage. 0 = ok. */
+M4R_API int m4r_denoise_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);
+M4R_API int m4r_denoise(m4r_context* ctx, VkCommandBuffer cb, const m4r_denoise_desc* desc);
+/* debugging: the image of a texture of the denoiser plan (e.g. "denoised"), VK_NULL_HANDLE if there is none */
+M4R_API VkImage m4r_denoise_texture(m4r_context* ctx, const char* name);
 M4R_API int m4r_interpolate_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);
 M4R_API int m4r_interpolate(m4r_context* ctx, VkCommandBuffer cb, const m4r_interpolate_desc* desc);
 /* Returns 1 when the generated frame was written to desc->backbuffer: present it, then call m4r_framegen_restore with

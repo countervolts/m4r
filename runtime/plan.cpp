@@ -166,7 +166,7 @@ bool Plan::record(VkCommandBuffer cb, size_t first, size_t count) {
     // reads or writes, or whose input it overwrites; within a level passes are independent and run without barriers between
     // them (one barrier per level). Every dependency is kept, so the results equal the plan's order. Kernels without a
     // manifest (GLSL passes) count as writing everything they bind. M4R_ALL_BARRIERS=1: plan order, a barrier before each pass.
-    const size_t last = std::min(passes_.size(), first + count);
+    const size_t last = first >= passes_.size() ? passes_.size() : (count > passes_.size() - first ? passes_.size() : first + count);
     std::vector<std::vector<std::pair<std::string, bool>>> uses(last - first);   // resource, written
     for (size_t pi = first; pi < last; ++pi) {
         Pass& p = passes_[pi];

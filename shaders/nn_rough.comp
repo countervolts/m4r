@@ -1,0 +1,18 @@
+// m4r: takes the 4th half (alpha) of every RGBA16F texel of a raw image copy. Ray Reconstruction games that put roughness in the
+// normals' alpha channel use this to make the separate roughness image the denoiser kernels expect.
+// args: 0 input [H][W][4] half, 1 output [H][W] half; consts 8 W, 9 H
+// SPDX-License-Identifier: GPL-3.0-only
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer Half { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
+layout(push_constant) uniform Push { Args a; } pc;
+void main() {
+    Args a = pc.a;
+    const uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= a.c[0] || p.y >= a.c[1]) return;
+    const uint i = p.y * a.c[0] + p.x;
+    Half(a.slot[1]).v[i] = Half(a.slot[0]).v[i * 4u + 3u];
+}

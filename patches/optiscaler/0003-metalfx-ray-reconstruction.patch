@@ -1,5 +1,5 @@
 diff --git a/OptiScaler.ini b/OptiScaler.ini
-index 54b3b44..00055da 100644
+index 54b3b44..5e02d8b 100644
 --- a/OptiScaler.ini
 +++ b/OptiScaler.ini
 @@ -1344,6 +1344,12 @@ FlipJitter=auto
@@ -7,26 +7,14 @@ index 54b3b44..00055da 100644
  FGPacing=auto
  
 +; Answers a game's DLSS Ray Reconstruction request (NGX feature 13) with m4r on GPUs that are not DLSS capable. Needs
-+; m4r\m4r.dll and an upscaler plan for the sizes in use. Currently upscales the noisy colour and logs the Ray
-+; Reconstruction inputs; the MetalFX denoiser itself is not wired yet.
++; m4r\m4r.dll, an upscaler plan and a denoiser plan (m4r\plans\dn-WxH) for the sizes in use. Runs MetalFX's temporal
++; denoiser at render size, then the MetalFX upscaler; without a denoiser plan it only upscales the noisy colour.
 +; true or false - Default (auto) is false
 +Denoiser=auto
 +
  ; -------------------------------------------------------
  [Log]
  ; -------------------------------------------------------
-diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
-index 09c7252..3720918 100644
---- a/OptiScaler/Config.h
-+++ b/OptiScaler/Config.h
-@@ -263,6 +263,7 @@ class Config
- 
-     // MetalFX (m4r)
-     CustomOptional<bool> MetalFXFlipJitter { false };
-+    CustomOptional<bool> MetalFXDenoiser { false }; // answer NGX feature 13 (Ray Reconstruction) with m4r
-     CustomOptional<bool> MetalFXFGPacing { true }; // hold the real frame back by half a frame after the generated one
- 
-     // Logging
 diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
 index 6969a99..1a35932 100644
 --- a/OptiScaler/Config.cpp
@@ -47,19 +35,18 @@ index 6969a99..1a35932 100644
      }
  
      // OptiFG
-diff --git a/OptiScaler/OptiScaler.vcxproj b/OptiScaler/OptiScaler.vcxproj
-index 4c02eab..887cc8b 100644
---- a/OptiScaler/OptiScaler.vcxproj
-+++ b/OptiScaler/OptiScaler.vcxproj
-@@ -823,6 +823,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
-     <ClCompile Include="upscalers\xess\XeSSFeature_Dx11on12.cpp" />
-     <ClCompile Include="upscalers\xess\XeSSFeature_Dx12.cpp" />
-     <ClCompile Include="upscalers\metalfx\MetalFXFeature_Dx12.cpp" />
-+    <ClCompile Include="upscalers\metalfx\MetalFXDenoiserFeature_Dx12.cpp" />
-+    <ClInclude Include="upscalers\metalfx\MetalFXDenoiserFeature_Dx12.h" />
-     <ClInclude Include="upscalers\xess\XeSSFeature_Dx12.h" />
-     <ClCompile Include="scanner\rtti.cpp" />
-     <ClCompile Include="scanner\scanner.cpp" />
+diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
+index 09c7252..3720918 100644
+--- a/OptiScaler/Config.h
++++ b/OptiScaler/Config.h
+@@ -263,6 +263,7 @@ class Config
+ 
+     // MetalFX (m4r)
+     CustomOptional<bool> MetalFXFlipJitter { false };
++    CustomOptional<bool> MetalFXDenoiser { false }; // answer NGX feature 13 (Ray Reconstruction) with m4r
+     CustomOptional<bool> MetalFXFGPacing { true }; // hold the real frame back by half a frame after the generated one
+ 
+     // Logging
 diff --git a/OptiScaler/NVNGX_Parameter.cpp b/OptiScaler/NVNGX_Parameter.cpp
 index 910886e..dc45d6c 100644
 --- a/OptiScaler/NVNGX_Parameter.cpp
@@ -77,6 +64,37 @@ index 910886e..dc45d6c 100644
      }
  
      if ((api == API::DX12 || api == API::Vulkan) && (State::Instance().activeFgInput == FGInput::DLSSG ||
+diff --git a/OptiScaler/OptiScaler.vcxproj b/OptiScaler/OptiScaler.vcxproj
+index 4c02eab..887cc8b 100644
+--- a/OptiScaler/OptiScaler.vcxproj
++++ b/OptiScaler/OptiScaler.vcxproj
+@@ -823,6 +823,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
+     <ClCompile Include="upscalers\xess\XeSSFeature_Dx11on12.cpp" />
+     <ClCompile Include="upscalers\xess\XeSSFeature_Dx12.cpp" />
+     <ClCompile Include="upscalers\metalfx\MetalFXFeature_Dx12.cpp" />
++    <ClCompile Include="upscalers\metalfx\MetalFXDenoiserFeature_Dx12.cpp" />
++    <ClInclude Include="upscalers\metalfx\MetalFXDenoiserFeature_Dx12.h" />
+     <ClInclude Include="upscalers\xess\XeSSFeature_Dx12.h" />
+     <ClCompile Include="scanner\rtti.cpp" />
+     <ClCompile Include="scanner\scanner.cpp" />
+diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+index 682ac48..fc3e8f8 100644
+--- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
++++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
+@@ -906,7 +906,12 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
+     const bool isFG = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
+     const bool dlssgAdjacent = Nvngx_FG::isDx12Available() || State::Instance().activeFgInput == FGInput::DLSSG;
+ 
+-    if (isUpscaling || (isFG && dlssgAdjacent))
++    // Ray Reconstruction answered by m4r ([MetalFX] Denoiser): Streamline asks for feature 13 before it offers the option
++    const bool isRR = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_RayReconstruction &&
++                      Config::Instance()->MetalFXDenoiser.value_or_default() &&
++                      !IdentifyGpu::getPrimaryGpu().dlssCapable;
++
++    if (isUpscaling || isRR || (isFG && dlssgAdjacent))
+     {
+         if (OutSupported == nullptr)
+         {
 diff --git a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
 index 408173c..fb3e6a9 100644
 --- a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
@@ -103,134 +121,46 @@ index 408173c..fb3e6a9 100644
          else
          {
              *feature = std::make_unique<FSR2FeatureDx12_212>(handleId, parameters);
-diff --git a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
-index 682ac48..fc3e8f8 100644
---- a/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
-+++ b/OptiScaler/inputs/NVNGX_DLSS_Dx12.cpp
-@@ -906,7 +906,12 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
-     const bool isFG = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
-     const bool dlssgAdjacent = Nvngx_FG::isDx12Available() || State::Instance().activeFgInput == FGInput::DLSSG;
- 
--    if (isUpscaling || (isFG && dlssgAdjacent))
-+    // Ray Reconstruction answered by m4r ([MetalFX] Denoiser): Streamline asks for feature 13 before it offers the option
-+    const bool isRR = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_RayReconstruction &&
-+                      Config::Instance()->MetalFXDenoiser.value_or_default() &&
-+                      !IdentifyGpu::getPrimaryGpu().dlssCapable;
-+
-+    if (isUpscaling || isRR || (isFG && dlssgAdjacent))
-     {
-         if (OutSupported == nullptr)
-         {
 diff --git a/OptiScaler/upscalers/metalfx/M4R_Proxy.h b/OptiScaler/upscalers/metalfx/M4R_Proxy.h
-index e86ccb8..3b99615 100644
+index e86ccb8..0a51187 100644
 --- a/OptiScaler/upscalers/metalfx/M4R_Proxy.h
 +++ b/OptiScaler/upscalers/metalfx/M4R_Proxy.h
-@@ -17,6 +17,7 @@ class M4RProxy
+@@ -17,6 +17,9 @@ class M4RProxy
      using PFN_last_error = decltype(&m4r_last_error);
      using PFN_framegen_capture = decltype(&m4r_framegen_capture);
      using PFN_framegen_restore = decltype(&m4r_framegen_restore);
 +    using PFN_denoise_capture = decltype(&m4r_denoise_capture);
++    using PFN_denoise_init = decltype(&m4r_denoise_init);
++    using PFN_denoise = decltype(&m4r_denoise);
  
      struct Table
      {
-@@ -30,6 +31,7 @@ class M4RProxy
+@@ -30,6 +33,9 @@ class M4RProxy
          PFN_last_error lastError = nullptr;
          PFN_framegen_capture framegenCapture = nullptr;
          PFN_framegen_restore framegenRestore = nullptr;
 +        PFN_denoise_capture denoiseCapture = nullptr;
++        PFN_denoise_init denoiseInit = nullptr;
++        PFN_denoise denoise = nullptr;
      };
  
      static std::filesystem::path Dir() { return Util::DllPath().parent_path() / L"m4r"; }
-@@ -60,6 +62,7 @@ class M4RProxy
+@@ -60,6 +66,9 @@ class M4RProxy
          t.lastError = (PFN_last_error) GetProcAddress(t.module, "m4r_last_error");
          t.framegenCapture = (PFN_framegen_capture) GetProcAddress(t.module, "m4r_framegen_capture");
          t.framegenRestore = (PFN_framegen_restore) GetProcAddress(t.module, "m4r_framegen_restore");
 +        t.denoiseCapture = (PFN_denoise_capture) GetProcAddress(t.module, "m4r_denoise_capture");
++        t.denoiseInit = (PFN_denoise_init) GetProcAddress(t.module, "m4r_denoise_init");
++        t.denoise = (PFN_denoise) GetProcAddress(t.module, "m4r_denoise");
          if (!t.create || !t.upscale || !t.lastError)
          {
              LOG_ERROR("MetalFX: m4r.dll is missing exports");
-diff --git a/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h b/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h
-index 089d8c2..69eb3d0 100644
---- a/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h
-+++ b/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h
-@@ -6,11 +6,13 @@
- 
- class MetalFXFeatureDx12 : public IFeature_Dx12
- {
--  private:
-+  protected:
-     m4r_context* _ctx = nullptr;
-     ID3D12DXVKInteropDevice1* _interop = nullptr;
-     m4r_image Image(ID3D12Resource* res, D3D12_RESOURCE_STATES state);
- 
-+  private:
-+
-   public:
-     feature_version Version() override { return feature_version { 1, 0, 0 }; }
-     Upscaler GetUpscalerType() const final { return Upscaler::MetalFX; }
-diff --git a/OptiScaler/upscalers/metalfx/m4r.h b/OptiScaler/upscalers/metalfx/m4r.h
-index 8930aa6..857de63 100644
---- a/OptiScaler/upscalers/metalfx/m4r.h
-+++ b/OptiScaler/upscalers/metalfx/m4r.h
-@@ -48,6 +48,17 @@ typedef struct m4r_interpolate_desc {
-     int depth_reversed, reset;
- } m4r_interpolate_desc;
- 
-+/* Ray Reconstruction (NGX feature 13) inputs, as the game gives them. Matrices are row-major float[16], row-vector convention
-+ * (v' = v * M) as NGX uses them. Images that the game does not provide are VK_NULL_HANDLE. */
-+typedef struct m4r_denoise_desc {
-+    m4r_image color, depth, motion, diffuse_albedo, specular_albedo, normals, roughness, specular_hit, diffuse_hit,
-+              color_before_particles, exposure, output;
-+    float world_to_view[16], view_to_clip[16];
-+    uint32_t content_width, content_height;
-+    float jitter_x, jitter_y, motion_scale_x, motion_scale_y, pre_exposure;
-+    int reset, depth_reversed, hardware_depth, roughness_in_normals_w, motion_low_res, specular_hit_in_w;
-+} m4r_denoise_desc;
-+
- /* Frame generation at present time. The finished frame (backbuffer, display size) and this frame's render-size depth
-  * and motion vectors go in; m4r keeps a copy of the frame and, once it has the previous one, writes the MetalFX
-  * in-between frame into the backbuffer. */
-@@ -65,6 +76,9 @@ M4R_API void m4r_destroy(m4r_context* ctx);
- /* 0 on success; a non-zero return means the configuration is not prepared or not supported (see m4r_last_error) */
- M4R_API int m4r_upscale_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t max_in_w, uint32_t max_in_h);
- M4R_API int m4r_upscale(m4r_context* ctx, VkCommandBuffer cb, const m4r_upscale_desc* desc);
-+/* M4R_DUMP_RR=<dir> (+ M4R_DUMP_RR_COUNT, default 6 frames): creating the file <dir>/trigger starts a capture; writes the raw texels of the Ray Reconstruction inputs and the
-+ * frame's parameters (rr-NN-<name>.raw, rr-NN.txt) for offline work on the denoiser. Does nothing when unset. 0 = ok. */
-+M4R_API int m4r_denoise_capture(m4r_context* ctx, VkCommandBuffer cb, const m4r_denoise_desc* desc);
- M4R_API int m4r_interpolate_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);
- M4R_API int m4r_interpolate(m4r_context* ctx, VkCommandBuffer cb, const m4r_interpolate_desc* desc);
- /* Returns 1 when the generated frame was written to desc->backbuffer: present it, then call m4r_framegen_restore with
-diff --git a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
-new file mode 100644
-index 0000000..2b420ac
---- /dev/null
-+++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
-@@ -0,0 +1,19 @@
-+#pragma once
-+// NGX feature 13 (DLSS Ray Reconstruction) answered by m4r on GPUs without DLSS. First stage: logs the Ray Reconstruction
-+// inputs the game provides and upscales the noisy colour with the MetalFX upscaler; the MetalFX denoiser is not wired yet.
-+// SPDX-License-Identifier: GPL-3.0-only
-+#include "MetalFXFeature_Dx12.h"
-+
-+class MetalFXDenoiserFeatureDx12 : public MetalFXFeatureDx12
-+{
-+  public:
-+    MetalFXDenoiserFeatureDx12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters)
-+        : IFeature(InHandleId, InParameters), MetalFXFeatureDx12(InHandleId, InParameters)
-+    {
-+    }
-+
-+    bool EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
-+
-+  private:
-+    void Capture(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* p);
-+};
 diff --git a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
 new file mode 100644
-index 0000000..7d48a6c
+index 0000000..bd22aed
 --- /dev/null
 +++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,188 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include <pch.h>
 +#include "MetalFXDenoiserFeature_Dx12.h"
@@ -274,18 +204,12 @@ index 0000000..7d48a6c
 +}
 +} // namespace
 +
-+// M4R_DUMP_RR=<dir>: dumps the Ray Reconstruction inputs of a few frames (see m4r.h) for offline work on the denoiser
-+void MetalFXDenoiserFeatureDx12::Capture(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* p)
++// The Ray Reconstruction inputs as m4r_denoise_desc (m4r.h); false when the game gives too little
++bool MetalFXDenoiserFeatureDx12::FillDesc(NVSDK_NGX_Parameter* p, m4r_denoise_desc& d_)
 +{
-+    auto& m4r = M4RProxy::Get();
-+    if (m4r.denoiseCapture == nullptr || _ctx == nullptr || _interop == nullptr)
-+        return;
-+    static const bool enabled = GetEnvironmentVariableA("M4R_DUMP_RR", nullptr, 0) != 0;
-+    if (!enabled)
-+        return;
 +    const auto srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 +    auto img = [&](const char* key) { return Image(Res(p, key), srv); };
-+    m4r_denoise_desc d {};
++    m4r_denoise_desc& d = d_;
 +    d.color = img("Color");
 +    d.depth = img("Depth");
 +    d.motion = img("MotionVectors");
@@ -323,11 +247,47 @@ index 0000000..7d48a6c
 +    d.roughness_in_normals_w = roughnessMode == 1;
 +    d.depth_reversed = DepthInverted() ? 1 : 0;
 +    d.motion_low_res = LowResMV() ? 1 : 0;
++    d.flip_upscale_jitter = Config::Instance()->MetalFXFlipJitter.value_or(false) ? 1 : 0;
++    return true;
++}
++
++// M4R_DUMP_RR=<dir>: dumps the Ray Reconstruction inputs of a few frames (see m4r.h) for offline work on the denoiser
++void MetalFXDenoiserFeatureDx12::Capture(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* p)
++{
++    auto& m4r = M4RProxy::Get();
++    if (m4r.denoiseCapture == nullptr || _ctx == nullptr || _interop == nullptr)
++        return;
++    static const bool enabled = GetEnvironmentVariableA("M4R_DUMP_RR", nullptr, 0) != 0;
++    if (!enabled)
++        return;
++    m4r_denoise_desc d {};
++    FillDesc(p, d);
 +    VkCommandBuffer cb = VK_NULL_HANDLE;
 +    if (FAILED(_interop->BeginVkCommandBufferInterop(cmd, &cb)) || cb == VK_NULL_HANDLE)
 +        return;
 +    m4r.denoiseCapture(_ctx, cb, &d);
 +    _interop->EndVkCommandBufferInterop(cmd);
++}
++
++bool MetalFXDenoiserFeatureDx12::InitInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters)
++{
++    if (!MetalFXFeatureDx12::InitInternal(InCommandList, InParameters))
++        return false;
++    auto& m4r = M4RProxy::Get();
++    if (m4r.denoiseInit == nullptr || m4r.denoise == nullptr || GetEnvironmentVariableA("M4R_NO_DENOISE", nullptr, 0) != 0)
++    {
++        LOG_WARN("MetalFX Ray Reconstruction: the denoiser is off, upscaling only");
++        return true;
++    }
++    if (m4r.denoiseInit(_ctx, DisplayWidth(), DisplayHeight(), RenderWidth(), RenderHeight()) != 0)
++    {
++        LOG_ERROR("MetalFX denoiser: {} (prepare it with m4r's install script for {}x{}); upscaling only",
++                  m4r.lastError(_ctx), RenderWidth(), RenderHeight());
++        return true;
++    }
++    _denoise = true;
++    LOG_INFO("MetalFX denoiser: ready, {}x{}", RenderWidth(), RenderHeight());
++    return true;
 +}
 +
 +bool MetalFXDenoiserFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* InCommandList,
@@ -366,5 +326,113 @@ index 0000000..7d48a6c
 +                 world != nullptr, proj != nullptr);
 +    }
 +    Capture(InCommandList, InParameters);
++    if (_denoise)
++    {
++        m4r_denoise_desc d {};
++        if (FillDesc(InParameters, d))
++        {
++            VkCommandBuffer cb = VK_NULL_HANDLE;
++            if (SUCCEEDED(_interop->BeginVkCommandBufferInterop(InCommandList, &cb)) && cb != VK_NULL_HANDLE)
++            {
++                auto& m4r = M4RProxy::Get();
++                const int r = m4r.denoise(_ctx, cb, &d);
++                _interop->EndVkCommandBufferInterop(InCommandList);
++                if (r == 0)
++                {
++                    _frameCount++;
++                    return true;
++                }
++                LOG_ERROR("MetalFX denoiser: {}", m4r.lastError(_ctx));
++            }
++        }
++        _denoise = false; // do not retry every frame: upscale the noisy colour
++    }
 +    return MetalFXFeatureDx12::EvaluateInternal(InCommandList, InParameters);
 +}
+diff --git a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
+new file mode 100644
+index 0000000..c2918a0
+--- /dev/null
++++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
+@@ -0,0 +1,22 @@
++#pragma once
++// NGX feature 13 (DLSS Ray Reconstruction) answered by m4r on GPUs without DLSS: MetalFX's temporal denoiser (render size), then
++// the MetalFX upscaler. Without a denoiser plan (m4r\\plans\\dn-WxH) or with M4R_NO_DENOISE set it only upscales the noisy colour.
++// SPDX-License-Identifier: GPL-3.0-only
++#include "MetalFXFeature_Dx12.h"
++
++class MetalFXDenoiserFeatureDx12 : public MetalFXFeatureDx12
++{
++  public:
++    MetalFXDenoiserFeatureDx12(unsigned int InHandleId, NVSDK_NGX_Parameter* InParameters)
++        : IFeature(InHandleId, InParameters), MetalFXFeatureDx12(InHandleId, InParameters)
++    {
++    }
++
++    bool InitInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
++    bool EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
++
++  private:
++    bool FillDesc(NVSDK_NGX_Parameter* p, m4r_denoise_desc& d);
++    void Capture(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* p);
++    bool _denoise = false;   // the denoiser plan is loaded
++};
+diff --git a/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h b/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h
+index 089d8c2..69eb3d0 100644
+--- a/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h
++++ b/OptiScaler/upscalers/metalfx/MetalFXFeature_Dx12.h
+@@ -6,11 +6,13 @@
+ 
+ class MetalFXFeatureDx12 : public IFeature_Dx12
+ {
+-  private:
++  protected:
+     m4r_context* _ctx = nullptr;
+     ID3D12DXVKInteropDevice1* _interop = nullptr;
+     m4r_image Image(ID3D12Resource* res, D3D12_RESOURCE_STATES state);
+ 
++  private:
++
+   public:
+     feature_version Version() override { return feature_version { 1, 0, 0 }; }
+     Upscaler GetUpscalerType() const final { return Upscaler::MetalFX; }
+diff --git a/OptiScaler/upscalers/metalfx/m4r.h b/OptiScaler/upscalers/metalfx/m4r.h
+index 8930aa6..7038002 100644
+--- a/OptiScaler/upscalers/metalfx/m4r.h
++++ b/OptiScaler/upscalers/metalfx/m4r.h
+@@ -48,6 +48,18 @@ typedef struct m4r_interpolate_desc {
+     int depth_reversed, reset;
+ } m4r_interpolate_desc;
+ 
++/* Ray Reconstruction (NGX feature 13) inputs, as the game gives them. Matrices are row-major float[16], row-vector convention
++ * (v' = v * M) as NGX uses them. Images that the game does not provide are VK_NULL_HANDLE. */
++typedef struct m4r_denoise_desc {
++    m4r_image color, depth, motion, diffuse_albedo, specular_albedo, normals, roughness, specular_hit, diffuse_hit,
++              color_before_particles, exposure, output;
++    float world_to_view[16], view_to_clip[16];
++    uint32_t content_width, content_height;
++    float jitter_x, jitter_y, motion_scale_x, motion_scale_y, pre_exposure;
++    int reset, depth_reversed, hardware_depth, roughness_in_normals_w, motion_low_res, specular_hit_in_w;
++    int flip_upscale_jitter;   /* the jitter is given in DLSS's convention; the upscaling step wants MetalFX's (opposite sign) */
++} m4r_denoise_desc;
++
+ /* Frame generation at present time. The finished frame (backbuffer, display size) and this frame's render-size depth
+  * and motion vectors go in; m4r keeps a copy of the frame and, once it has the previous one, writes the MetalFX
+  * in-between frame into the backbuffer. */
+@@ -65,6 +77,16 @@ M4R_API void m4r_destroy(m4r_context* ctx);
+ /* 0 on success; a non-zero return means the configuration is not prepared or not supported (see m4r_last_error) */
+ M4R_API int m4r_upscale_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t max_in_w, uint32_t max_in_h);
+ M4R_API int m4r_upscale(m4r_context* ctx, VkCommandBuffer cb, const m4r_upscale_desc* desc);
++/* M4R_DUMP_RR=<dir> (+ M4R_DUMP_RR_COUNT, default 6 frames): creating the file <dir>/trigger starts a capture; writes the raw texels of the Ray Reconstruction inputs and the
++ * frame's parameters (rr-NN-<name>.raw, rr-NN.txt) for offline work on the denoiser. Does nothing when unset. 0 = ok. */
++M4R_API int m4r_denoise_capture(m4r_context* ctx, VkCommandBuffer cb, const m4r_denoise_desc* desc);
++/* MetalFX's temporal denoiser followed by the MetalFX upscaler: the denoiser (DBFNet guidance + reprojection + a-trous filter, plan
++ * <data dir>/dn-<in w>x<in h> from tools/prepare_denoiser.py --runtime) runs at render size, its result goes through the upscaler plan
++ * (m4r_upscale_init sizes). Not implemented yet: the denoiser's own upscaling network (UBFNet) and V3 temporal stage. 0 = ok. */
++M4R_API int m4r_denoise_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);
++M4R_API int m4r_denoise(m4r_context* ctx, VkCommandBuffer cb, const m4r_denoise_desc* desc);
++/* debugging: the image of a texture of the denoiser plan (e.g. "denoised"), VK_NULL_HANDLE if there is none */
++M4R_API VkImage m4r_denoise_texture(m4r_context* ctx, const char* name);
+ M4R_API int m4r_interpolate_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);
+ M4R_API int m4r_interpolate(m4r_context* ctx, VkCommandBuffer cb, const m4r_interpolate_desc* desc);
+ /* Returns 1 when the generated frame was written to desc->backbuffer: present it, then call m4r_framegen_restore with
