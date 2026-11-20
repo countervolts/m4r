@@ -215,7 +215,7 @@ frame-to-frame flicker in motion; brightness equal to the BBR path; `run_denoise
 
 **m4r's own passes (NOT MetalFX behaviour).** Between the denoiser and the upscaling stage (BBR or V3) the runtime plan has a block of
 GLSL passes on buffer copies of the denoised colour:
-- `nn_despeckle` (BBR path only; `M4R_NO_DESPECKLE=1` turns it off): caps a pixel at 1.5x its third-brightest neighbour.
+- `nn_despeckle` (both paths since 2026-11-20; before V3 it cut the grain V3 leaves on puddles by 26% on capture m without losing detail; `M4R_NO_DESPECKLE=1` turns it off): caps a pixel at 1.5x its third-brightest neighbour.
 - `nn_glossy` (both paths; OPT-IN since the first in-game test, `M4R_GLOSSY_SMOOTH=1`: it flattened moving reflections into plastic-looking patches and erased grout lines inside them): three a-trous steps (5x5 B-spline taps at distance 1, 2, 4)
   weighted by normal, depth and roughness similarity and by log-luminance distance to the 3x3 geometric mean, blended in only for
   low-roughness pixels (full below 0.15, none above 0.30) that move more than 1 px (full at 3 px). Why: `reproject_warp` drops the

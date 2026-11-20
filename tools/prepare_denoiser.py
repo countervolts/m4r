@@ -199,11 +199,12 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
              'tex 9 dbf_tw', 'buf 10 exp0|exp1', 'buf 11 preexp'])
     if runtime:
         # m4r's own passes on the denoised colour (not MetalFX): m4r copies 'denoised' out to buffers, runs these, copies den_cl back.
-        # The interim firefly clamp (only despeckle, den_raw -> den_cl) on the BBR path only (V3 removes fireflies itself); the
+        # The interim firefly clamp (only despeckle, den_raw -> den_cl) on both paths (before V3 it cuts the puddle grain V3 leaves,
+        # capture m: -26%; M4R_PLAN_NO_V3_DESPECKLE=1 at plan time leaves it out of V3 plans); the
         # glossy-in-motion smoothing (only glossy, shaders/nn_glossy.comp: three a-trous steps den_cl -> den_g -> den_raw -> den_cl) on
         # both, before V3 reads the denoised colour. m4r also copies int_depth / int_motion into gl_depth / gl_motion first.
         g.buffer('den_raw', iw * ih * 8); g.buffer('den_cl', iw * ih * 8)
-        if stage < 'F':
+        if stage < 'F' or not os.environ.get('M4R_PLAN_NO_V3_DESPECKLE'):
             g.glsl('nn_despeckle', os.path.join(ROOT, 'shaders', 'nn_despeckle.comp'))
             g.run('nn_despeckle', iw, ih, ['den_raw', 'den_cl'], [iw, ih])
             g.lines.append('  only despeckle')
