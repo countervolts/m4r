@@ -199,7 +199,7 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
              'tex 9 dbf_tw', 'buf 10 exp0|exp1', 'buf 11 preexp'])
     if stage >= 'E':
         v3_ubf(g, iw, ih, W, H, ow, oh, full=stage >= 'F')
-    if runtime:
+    if runtime and stage < 'F':
         # last pass: interim firefly clamp on the denoised colour (m4r copies 'denoised' to den_raw first and den_cl back afterwards)
         g.buffer('den_raw', iw * ih * 8); g.buffer('den_cl', iw * ih * 8)
         g.glsl('nn_despeckle', os.path.join(ROOT, 'shaders', 'nn_despeckle.comp'))
@@ -235,7 +235,7 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
     for n in ('v3cnt0', 'v3cnt1'):
         g.texture(n, 'R16_UINT', Wn, Hn)
     g.texture('v3zero', F, 16, 16); g.texture('v3const', F, 16, 16)
-    g.buffer('v3reset', 16); g.buffer('v3resetA', 16); g.buffer('v3desc', 24); g.buffer('v3bd', 8); g.buffer('ubf_in', Wn * Hn * 10)
+    g.buffer('v3reset', 16); g.buffer('v3resetA', 16); g.buffer('v3desc', 24); g.buffer('v3bd', 16, struct.pack('<iHH', 22, Ht, Wt).ljust(16, b'\0')); g.buffer('ubf_in', Wn * Hn * 10)
     g.run_k('brnetv3_build_tensors_low_resolution', {'bfnet1_enabled': True, 'full_resolution_flow': False, 'jittered_motion_vectors': False},
             (8, 8, 1), (iw + 2, ih + 2, 1),
             ['tex 0 denoised', 'tex 1 int_depth', 'tex 2 int_motion', 'tex 3 crr', 'tex 4 flowd', 'bytes 0 ' + struct.pack('<f', 1.0).hex(),
@@ -325,6 +325,7 @@ def main():
     ap.add_argument('--capture', help='M4R_DUMP_RR capture dir: gives the size and the per-frame buffers (offline harness)')
     ap.add_argument('--first', type=int); ap.add_argument('--frames', type=int, default=1)
     ap.add_argument('--input', help='render size WxH (instead of --capture)')
+    ap.add_argument('--output', help='output size WxH (stage F; with --capture it is read from the capture)')
     ap.add_argument('--out', required=True); ap.add_argument('--stage', default='C')
     ap.add_argument('--runtime', action='store_true', help='plan for m4r_denoise (roughness taken from the normals, own spec-hit stub)')
     ap.add_argument('--gpu', help='target GPU (as prepare_bbr.py)')
@@ -339,6 +340,8 @@ def main():
         m4r_air.set_gpu(a.gpu)
     g = Gen(a.resources, a.out)
     ow = oh = None
+    if a.output:
+        ow, oh = map(int, a.output.lower().split('x'))
     if a.capture:
         o = dict(l.split(None, 1) for l in open(f'{a.capture}/rr-{a.first}.txt') if l.startswith('output'))
         ow, oh = map(int, o['output'].split())

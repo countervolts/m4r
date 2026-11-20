@@ -5,7 +5,8 @@
     m4r/plans/bbr-<display>-<render>        upscaler plan, reversed depth (what most engines use)
     m4r/plans/bbr-<display>-<render>-fwd    upscaler plan, forward depth
     m4r/plans/fg-<display>-<render>         frame generation plan
-    m4r/plans/dn-<render>                   denoiser plan (Ray Reconstruction), one per render size
+    m4r/plans/dn-<render>                   denoiser plan (Ray Reconstruction), followed by the upscaler
+    m4r/plans/dn3-<display>-<render>        Ray Reconstruction with MetalFX's own upscaling network (preferred when present)
 
 A plan exists per display and render resolution pair. The render size of each quality mode is worked out the way OptiScaler
 does it ((unsigned)(display / ratio) with 3.0, 2.0, 1.7, 1.5, 1.3 and 1.0 for ultra performance, performance, balanced,
@@ -137,6 +138,10 @@ def main():
         if not a.no_denoiser and (disp, inp) == next(x for x in pairs if x[1] == inp):   # the denoiser only depends on the render size
             jobs.append((f'dn-{inp[0]}x{inp[1]}', [sys.executable, '-I', os.path.join(ROOT, 'tools', 'prepare_denoiser.py'), '--resources',
                                                   a.resources, '--input', f'{inp[0]}x{inp[1]}', '--stage', 'D', '--runtime', '--gpu', a.gpu]))
+        if not a.no_denoiser:   # the V3 path (denoiser + UBFNet + V3 filter) writes the final image itself: one plan per display and render size
+            jobs.append((f'dn3-{tag}', [sys.executable, '-I', os.path.join(ROOT, 'tools', 'prepare_denoiser.py'), '--resources', a.resources,
+                                        '--input', f'{inp[0]}x{inp[1]}', '--output', f'{disp[0]}x{disp[1]}', '--stage', 'F', '--runtime',
+                                        '--gpu', a.gpu]))
         if not a.no_fg:
             jobs.append((f'fg-{tag}', [sys.executable, '-I', os.path.join(ROOT, 'tools', 'prepare_fg.py'), *common]))
 

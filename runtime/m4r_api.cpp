@@ -19,6 +19,8 @@ struct m4r_context {
     std::string dir, error;
     std::unique_ptr<Plan> bbr[2], fg, dn;   // dn: the denoiser plan (render size)
     uint32_t dnSize[2] = {};
+    bool dnV3 = false;   // the plan is the V3 one (dn3-*): it writes the final image, no separate upscaler
+    uint32_t dnOut[2] = {};
     uint64_t dnFrame = 0;
     double dnPrevVp[16] = {};
     float dnPrevJitter[2] = {};
@@ -438,15 +440,28 @@ static void captureOut(m4r_context* c, VkCommandBuffer cb, int slot, VkImage ima
 }
 
 M4R_API int m4r_denoise_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t iw, uint32_t ih) {
-    if (c->dn && c->dnSize[0] == iw && c->dnSize[1] == ih) return m4r_upscale_init(c, ow, oh, iw, ih);
+    if (c->dn && c->dnSize[0] == iw && c->dnSize[1] == ih && c->dnOut[0] == ow && c->dnOut[1] == oh)
+        return c->dnV3 ? 0 : m4r_upscale_init(c, ow, oh, iw, ih);
+    char name[96];
+    // preferred: the plan with MetalFX's own upscaling network (dn3-<out>-<in>); M4R_NO_V3=1 keeps the older denoiser + BBR upscaler
+    if (!std::getenv("M4R_NO_V3")) {
+        auto p3 = std::make_unique<Plan>(c->rt);
+        std::snprintf(name, sizeof name, "/dn3-%ux%u-%ux%u", ow, oh, iw, ih);
+        if (p3->load(c->dir + name)) {
+            c->dn = std::move(p3);
+            c->dnSize[0] = iw; c->dnSize[1] = ih; c->dnOut[0] = ow; c->dnOut[1] = oh;
+            c->dnFrame = 0; c->dnV3 = true;
+            if (!c->exposureOne.image && !c->vk.createTexture(c->exposureOne, VK_FORMAT_R32_SFLOAT, 1, 1)) { c->error = "exposure texture"; return 1; }
+            return 0;
+        }
+    }
     auto p = std::make_unique<Plan>(c->rt);
-    char name[64];
     std::snprintf(name, sizeof name, "/dn-%ux%u", iw, ih);
     if (!p->load(c->dir + name)) { c->error = p->error; return 1; }
     if (m4r_upscale_init(c, ow, oh, iw, ih) != 0) return 1;
     c->dn = std::move(p);
-    c->dnSize[0] = iw; c->dnSize[1] = ih;
-    c->dnFrame = 0;
+    c->dnSize[0] = iw; c->dnSize[1] = ih; c->dnOut[0] = ow; c->dnOut[1] = oh;
+    c->dnFrame = 0; c->dnV3 = false;
     return 0;
 }
 
@@ -475,6 +490,7 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     LayoutGuard g{cb};
     for (const m4r_image* im : {&d->color, &d->depth, &d->motion, &d->normals, &d->diffuse_albedo, &d->specular_albedo, &d->roughness})
         g.add(*im);
+    if (c->dnV3) g.add(d->output);
     g.begin();
     if (!c->exposureOneCleared) {
         c->vk.toGeneral(cb, c->exposureOne);
@@ -516,6 +532,21 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     p.bindBuffer("refl_params", c->rt.transient(refl, sizeof refl)); p.bindBuffer("preexp", c->rt.transient(&pre, 4));
     p.bindBuffer("reset", c->rt.transient(resetb, sizeof resetb));
     p.bindBuffer("rw_ms", c->rt.transient(ms, 8)); p.bindBuffer("rw_pj", c->rt.transient(pj, 8)); p.bindBuffer("rw_cj", c->rt.transient(jit, 8));
+    if (c->dnV3) {   // BRNet_v3_Filter's parameter blocks (docs/metalfx-denoiser.md): BRNetShaderParams and brnet_v3_build_tensors_t
+        const uint32_t ow = c->dnOut[0], oh = c->dnOut[1];
+        const uint32_t Wn = ((ow / 2 + 31) / 32) * 32, Hn = ((oh / 2 + 31) / 32) * 32;
+        uint8_t bsp[144] = {}, v3d[24] = {};
+        const uint16_t sz[6] = {uint16_t(iw), uint16_t(ih), uint16_t(iw), uint16_t(ih), uint16_t(ow), uint16_t(oh)};
+        std::memcpy(bsp, sz, sizeof sz);
+        const float fl[8] = {jit[0], jit[1], ms[0], ms[1], float(iw) / ow, float(ih) / oh, ms[0] / iw, ms[1] / ih};
+        std::memcpy(bsp + 32, fl, sizeof fl);
+        const float v3f[4] = {ms[0] * ow, ms[1] * oh, jit[0], jit[1]};
+        std::memcpy(v3d, v3f, sizeof v3f);
+        const int32_t rowBytes = 10; const uint16_t hh = uint16_t(Hn), ww = uint16_t(Wn);
+        std::memcpy(v3d + 16, &rowBytes, 4); std::memcpy(v3d + 20, &hh, 2); std::memcpy(v3d + 22, &ww, 2);
+        p.bindBuffer("bparams", c->rt.transient(bsp, sizeof bsp)); p.bindBuffer("v3desc", c->rt.transient(v3d, sizeof v3d));
+        p.bindTexture("v3out", c->wrap(d->output));
+    }
     p.setParity(int(c->dnFrame & 1));
     // MetalFX's auto exposure (no exposure texture) scales the denoised colour by the exposure; that is only right once the stage after
     // the denoiser (UBFNet / V3) is MetalFX's own, so it is opt-in for now
@@ -564,10 +595,20 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     c->dnPrevJitter[0] = jit[0]; c->dnPrevJitter[1] = jit[1];
     ++c->dnFrame;
 
-    // upscaling: MetalFX's own upscaler on the denoised colour
     Texture* den = p.texture("denoised");
     if (!den) { c->error = "denoiser plan has no 'denoised' texture"; return 1; }
     captureOut(c, cb, 0, den->image, den->width, den->height, den->format);
+    if (c->dnV3) {   // the plan wrote the final image into the game's output texture
+        if (g_rrCurrent) {
+            LayoutGuard og{cb};
+            og.add(d->output);
+            og.begin();
+            captureOut(c, cb, 1, d->output.image, d->output.width, d->output.height, d->output.format);
+            og.end();
+        }
+        return 0;
+    }
+    // upscaling: MetalFX's own upscaler on the denoised colour
     m4r_upscale_desc u{};
     u.color = ownedImage(*den); u.depth = d->depth; u.motion = d->motion; u.exposure = d->exposure; u.output = d->output;
     u.content_width = iw; u.content_height = ih;
