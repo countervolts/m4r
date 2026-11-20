@@ -118,23 +118,23 @@ def conv_pass(p, dat, L, idx, src, dst, Hin, Win, stride=1, relu=True):
     return Ho, Wo
 
 
-def dbf_plan(dat, out, H, W):
+def dbf_net(p, dat, H, W, in_name='dbf_in', out_name='dbf_out'):
+    """appends the DBFNet passes to plan generator p (needs buffer(name, size[, blob]), glsl(name, src), run(kernel, w, h, bufs, consts));
+    in_name is [H][W][13] f16 (NHWC), out_name [H][W][7]; H and W multiples of 8"""
     assert H % 8 == 0 and W % 8 == 0
-    p = Plan(out); sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'shaders')
-    sizes = {}
-    def buf(name, h, w, c):
-        p.buffer(name, h * w * c * 2); sizes[name] = (h, w, c)
-    buf('dbf_in', H, W, 13)
+    sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'shaders')
     P = DBF
+    def buf(name, h, w, c):
+        p.buffer(name, h * w * c * 2)
     def conv(i, src, dst, h, w, relu=True):
         buf(dst, h, w, P[i][4]); conv_pass(p, dat, P[i], i, src, dst, h, w, relu=relu)
-    def pool(src, dst, h, w, c):   # src is h x w
+    def pool(src, dst, h, w, c):
         buf(dst, h // 2, w // 2, c)
         p.glsl('nn_pool', sh + '/nn_pool.comp'); p.run('nn_pool', w // 2, h // 2, [src, dst], [w // 2, h // 2, c])
-    def up(src, skip, dst, h, w, c):   # output h x w
+    def up(src, skip, dst, h, w, c):
         buf(dst, h, w, c)
         p.glsl('nn_upadd', sh + '/nn_upadd.comp'); p.run('nn_upadd', w, h, [src, skip, dst], [w, h, c])
-    conv(0, 'dbf_in', 't0', H, W); conv(1, 't0', 's0', H, W)
+    conv(0, in_name, 't0', H, W); conv(1, 't0', 's0', H, W)
     pool('s0', 'p0', H, W, 32)
     h1, w1 = H // 2, W // 2
     conv(2, 'p0', 't1', h1, w1); conv(3, 't1', 's1', h1, w1)
@@ -147,7 +147,13 @@ def dbf_plan(dat, out, H, W):
     up('bott', 's2', 'u2', h2, w2, 64); conv(8, 'u2', 't4', h2, w2); conv(9, 't4', 'd2', h2, w2)
     up('d2', 's1', 'u1', h1, w1, 64); conv(10, 'u1', 't5', h1, w1); conv(11, 't5', 'd1', h1, w1)
     up('d1', 's0', 'u0', H, W, 32); conv(12, 'u0', 't6', H, W); conv(13, 't6', 't7', H, W)
-    buf('dbf_out', H, W, 7); conv_pass(p, dat, P[14], 14, 't7', 'dbf_out', H, W, relu=False)
+    buf(out_name, H, W, 7); conv_pass(p, dat, P[14], 14, 't7', out_name, H, W, relu=False)
+
+
+def dbf_plan(dat, out, H, W):
+    p = Plan(out)
+    p.buffer('dbf_in', H * W * 13 * 2)
+    dbf_net(p, dat, H, W)
     p.save()
 
 

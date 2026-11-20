@@ -49,6 +49,8 @@ add_executable(vkhip_parse tests/vkhip_parse.cpp)
 target_link_libraries(vkhip_parse m4r_runtime)
 add_executable(run_bbr tests/run_bbr.cpp)
 target_link_libraries(run_bbr m4r_runtime)
+add_executable(run_denoise tests/run_denoise.cpp)
+target_link_libraries(run_denoise m4r_runtime)
 
 add_executable(run_fg tests/run_fg.cpp)
 target_link_libraries(run_fg m4r_runtime)
