@@ -299,8 +299,9 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False, runtime=False):
         # m4r's hybrid output (not MetalFX; shaders/nn_hybrid.comp): after the run, m4r upscales 'denoised' with BBR into the game's
         # output, copies v3out and that output into these buffers, runs this pass (only hybrid) and copies hy_bbr back
         g.buffer('hy_v3', ow * oh * 8); g.buffer('hy_bbr', ow * oh * 8)
+        g.buffer('hy_par', 16)
         g.glsl('nn_hybrid', os.path.join(ROOT, 'shaders', 'nn_hybrid.comp'))
-        g.run('nn_hybrid', ow, oh, ['hy_v3', 'hy_bbr', 'rough_raw'], [ow, oh, iw, ih])
+        g.run('nn_hybrid', ow, oh, ['hy_v3', 'hy_bbr', 'rough_raw', 'hy_par'], [ow, oh, iw, ih])
         g.lines.append('  only hybrid')
 
 

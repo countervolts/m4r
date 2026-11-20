@@ -256,7 +256,9 @@ walking in Cyberpunk is 0.03-0.05 m/frame, turning or standing <= 0.001), so tur
 with the switch on). Capture m (walking): ghosted tile lines across reflections fade, puddle grain 0.074 -> 0.089 (cap 0.3) /
 0.119 (cap 0.01).
 
-**Hybrid v2 (the default since 2026-11-20; `M4R_NO_HYBRID=1` = V3 alone, `M4R_NO_V3=1` = BBR alone; not MetalFX).** Both upscalers
+**Hybrid v2 (opt-in `M4R_HYBRID=<strength 0..1>`; `M4R_NO_V3=1` = BBR alone; not MetalFX).** Briefly the default; in game it shimmered on
+rough surfaces: on a still capture (n) rough-surface frame-to-frame change V3 0.041, hybrid 0.060 (0.5: 0.048), BBR 0.068, while
+sharpness went 0.078 / 0.100 (0.5: 0.083) / 0.105; tighter clamps (3x3, no widening) traded the two the same way, so the user picks. Both upscalers
 run on the same denoised colour; `shaders/nn_hybrid.comp` takes BBR (clamped to V3's 5x5 range +25%) on rough surfaces and V3 on
 shiny ones, blended by roughness (3x3 render-pixel average; full V3 below 0.10, full BBR above 0.25). Captures j / k / m (720p):
 rough-surface gradient energy V3 0.039 / 0.059 / 0.040, BBR 0.054 / 0.089 / 0.055, hybrid 0.052 / 0.085 / 0.053; fireflies V3 0 / 16 / 0,

@@ -1,10 +1,12 @@
-// m4r: hybrid output v2 (NOT MetalFX behaviour; the default; M4R_NO_HYBRID=1 = V3 alone, M4R_NO_V3=1 = the BBR path alone).
+// m4r: hybrid output v2 (NOT MetalFX behaviour; opt-in M4R_HYBRID=<strength 0..1>, 1 = full; M4R_NO_V3=1 = the BBR path alone).
+// Off by default: in game BBR's extra sharpness on rough surfaces came with visible shimmer (sharpness and shimmer moved together
+// for every clamp variant tried), so the user picks the balance.
 // The game's frame is upscaled twice from the same denoised colour: by MetalFX's V3 stage (UBFNet + V3 filter: clean and calm on
 // reflections, softer on everything else in motion) and by MetalFX's BBR upscaler (sharper, but its reflections shimmer in motion).
 // Per output pixel: on rough surfaces BBR, clamped per channel to V3's 5x5 range widened by GROW (catches outliers V3 does not have);
 // on shiny surfaces V3; blended by roughness (3x3 average at render resolution, Cyberpunk's wet-floor roughness is patchy):
 // full V3 below R0, full BBR above R1. RGBA16F buffers at output size; alpha is BBR's.
-// args: 0 V3 output [H][W] f16vec4, 1 BBR output (read and written in place), 2 roughness [ih][iw] half
+// args: 0 V3 output [H][W] f16vec4, 1 BBR output (read and written in place), 2 roughness [ih][iw] half, 3 {float strength}
 // consts 8 W, 9 H, 10 iw, 11 ih
 // SPDX-License-Identifier: GPL-3.0-only
 #version 460
@@ -13,6 +15,7 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer Px { f16vec4 v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 2) buffer Half { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Par { float strength; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
 layout(push_constant) uniform Push { Args a; } pc;
 const int R = 2;            // 5x5
@@ -43,6 +46,6 @@ void main() {
             const ivec2 q = clamp(rp + ivec2(dx, dy), ivec2(0), ivec2(iw - 1, ih - 1));
             r += float(rough.v[q.y * iw + q.x]);
         }
-    const float wb = smoothstep(R0, R1, r * (1.0 / 9.0));
+    const float wb = smoothstep(R0, R1, r * (1.0 / 9.0)) * clamp(Par(a.slot[3]).strength, 0.0, 1.0);
     bb.v[i] = f16vec4(vec4(mix(vec3(v3.v[i].rgb), bc, wb), b.a));
 }
