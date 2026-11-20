@@ -95,9 +95,9 @@ def build(g, iw, ih, stage):
     g.buffer('exp0', 2, h16(1.0)); g.buffer('exp1', 2, h16(1.0)); g.buffer('hinv', 16); g.buffer('reset', 16); g.buffer('preexp', 16)
     g.buffer('dbf_params', 40); g.buffer('refl_params', 224)
     g.buffer('dbf_in', tw * th * ROW)
-    if stage >= 'C': pass
     g.texture('int_motion', 'R16G16_SFLOAT', iw, ih); g.texture('int_depth', 'R32_SFLOAT', iw, ih)
-    g.texture('prev_in', 'R16G16B16A16_SFLOAT', W, H)
+    # BFNet +0xa8: the previous frame's colour (texPrevInputFrame) and the first a-trous iteration's output (history_tex): one texture
+    g.texture('hist', 'R16G16B16A16_SFLOAT', W, H)
     g.texture('mm0', 'R8_UNORM', W, H); g.texture('mm1', 'R8_UNORM', W, H)
     # DPreProcessing: exposure (BRNet_v3_Filter::encodeExposureCalcForDenoiser, exposure texture path)
     g.run_k('exposure_texture_to_buffer', {}, (32, 1, 1), (1, 1, 1),
@@ -105,7 +105,7 @@ def build(g, iw, ih, stage):
     # BFNet_v1_Filter::encodePre: dbfnetv1_lowres_signals
     g.run_k('dbfnetv1_lowres_signals', {'is_tensor_layout_nchw': False, 'spec_hit_dist_enabled': False, 'new_overshoot_clamp': False},
           (8, 8, 1), (tw, th, 1),
-          ['tex 0 normals', 'tex 1 motion', 'tex 2 depth', 'tex 3 int_motion', 'tex 4 int_depth', 'tex 5 color', 'tex 6 prev_in',
+          ['tex 0 normals', 'tex 1 motion', 'tex 2 depth', 'tex 3 int_motion', 'tex 4 int_depth', 'tex 5 color', 'tex 6 hist',
            'tex 7 specular', 'tex 8 diffuse', 'tex 9 roughness', 'tex 10 spechit', 'tex 11 mm0|mm1', 'tex 12 mm1|mm0',
            'buf 0 dbf_params', 'buf 5 refl_params', 'buf 1 dbf_in', 'buf 3 exp0|exp1', 'buf 4 preexp'])
     if stage < 'C':
@@ -116,7 +116,7 @@ def build(g, iw, ih, stage):
         return dict(W=W, H=H, tw=tw, th=th)
     hw, hh = W // 2, H // 2
     # intermediates of BFNet_v1_Filter (member offsets in docs/metalfx-denoiser-passes.txt)
-    for n in ('warp_color', 'warp_prev', 'nr0', 'nr1', 'hist'):
+    for n in ('warp_color', 'warp_prev', 'nr0', 'nr1'):
         g.texture(n, 'R16G16B16A16_SFLOAT', W, H)
     g.texture('shin', 'R8_UNORM', W, H); g.texture('mmr', 'R8_UNORM', W, H)
     for n in ('fc0', 'fc1', 'dy0', 'dy1'):
@@ -178,17 +178,14 @@ def frame_buffers(cap, fid, t, sz, iw, ih, prev):
     inv_vp = np.linalg.inv(curr_vp)
     cam = np.linalg.inv(Wc)[:, 3]
     cols = lambda M: M.astype('<f4').flatten(order='F').tobytes()      # column-major bytes
-    prev_vp = prev if prev is not None else curr_vp
+    prev_vp = prev['vp'] if prev else curr_vp
     ms = (f('mvscale', 0), f('mvscale', 1))
     jitter = (f('jitter', 0), f('jitter', 1))
     # the effect negates nothing here: MetalFX takes the NGX jitter as given by the integration (OptiScaler passes it through)
-    dbf = struct.pack('<6fiHHB7x', ms[0], ms[1], prev['jitter'][0] if prev else 0.0, prev['jitter'][1] if prev else 0.0,
-                      jitter[0], jitter[1], 26, sz['th'], sz['tw'], 1 if t == 0 else 0) if False else None
     pj = prev['jitter'] if prev else (0.0, 0.0)
     dbf = struct.pack('<6fiHHB', ms[0], ms[1], pj[0], pj[1], jitter[0], jitter[1], 26, sz['th'], sz['tw'], 1 if t == 0 else 0).ljust(40, b'\0')
-    refl = (cols(inv_vp) + cols(prev_vp['vp'] if prev else curr_vp) + cols(curr_vp) + struct.pack('<4f', *cam) +
+    refl = (cols(inv_vp) + cols(prev_vp) + cols(curr_vp) + struct.pack('<4f', *cam) +
             struct.pack('<4f', 1.0 / sz['W'], 1.0 / sz['H'], sz['W'] / ms[0], sz['H'] / ms[1]))
-    pj = prev['jitter'] if prev else (0.0, 0.0)
     out_params = struct.pack('<6fiHHB', 0, 0, 0, 0, 0, 0, 14, sz['th'], sz['tw'], 1 if t == 0 else 0).ljust(40, b'\0')
     bufs = {'dbf_params_out': out_params, 'rw_ms': struct.pack('<2f', *ms), 'rw_pj': struct.pack('<2f', *pj),
             'rw_cj': struct.pack('<2f', *jitter), 'dbf_params': dbf, 'refl_params': refl, 'preexp': struct.pack('<f', f('preexposure')),
@@ -211,7 +208,6 @@ def main():
     for t in range(a.frames):
         d = f'{a.out}/frames/{t:02d}'; os.makedirs(d, exist_ok=True)
         bufs, prev = frame_buffers(a.capture, a.first + t, t, sz, iw, ih, prev)
-        prev = dict(prev, jitter=prev['jitter'])
         for n, b in bufs.items():
             open(f'{d}/{n}.bin', 'wb').write(b)
         open(f'{d}/flags.txt', 'w').write('')

@@ -179,11 +179,29 @@ def ffract(b, s):
 
 
 def fpow(b, s):
-    # Metal pow/powr with fast math: exp2(y * log2(x))
+    # Metal pow/powr with fast math: exp2(y * log2(x)). pow (not powr) accepts a negative x with an integer y
+    # (reproject_warp squares a signed difference with fast_pow(d, 2)), so the sign is split off and restored for odd y.
     t = s.ret
-    l = intr(b, t, f'llvm.log2.{ivsuffix(t)}', [(t, '%a0')])
+    sfx = ivsuffix(t)
+    pr = s.name.endswith('powr.' + t) or '.powr.' in s.name
+    base = '%a0' if pr else intr(b, t, f'llvm.fabs.{sfx}', [(t, '%a0')])
+    l = intr(b, t, f'llvm.log2.{sfx}', [(t, base)])
     m = b.v(f'fmul {FAST} {t} {l}, %a1')
-    return intr(b, t, f'llvm.exp2.{ivsuffix(t)}', [(t, m)])
+    e = intr(b, t, f'llvm.exp2.{sfx}', [(t, m)])
+    if pr:
+        return e
+    n, el = vec(t)
+    it = f'<{n} x i1>' if n > 1 else 'i1'
+    fl = intr(b, t, f'llvm.floor.{sfx}', [(t, '%a1')])
+    isint = b.v(f'fcmp oeq {t} %a1, {fl}')
+    h = b.v(f'fmul {FAST} {t} %a1, {splat(t, "0.5")}')
+    hf = intr(b, t, f'llvm.floor.{sfx}', [(t, h)])
+    odd = b.v(f'fcmp one {t} {h}, {hf}')
+    neg = b.v(f'fcmp olt {t} %a0, {splat(t, "0.0")}')
+    c = b.v(f'and {it} {neg}, {isint}')
+    c = b.v(f'and {it} {c}, {odd}')
+    ne = b.v(f'fneg {t} {e}')
+    return b.v(f'select {it} {c}, {t} {ne}, {t} {e}')
 
 
 def frsqrt(b, s):
