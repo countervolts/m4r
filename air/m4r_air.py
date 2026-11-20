@@ -547,6 +547,20 @@ def translate(text, kernel, constants, tg, wave='auto', widen=False):
             lines[li] = re.sub(r'@' + re.escape(g) + r'(?![\w.])',
                                f'addrspacecast (ptr addrspace(1) @{new} to ptr addrspace(2))', ln)
         text = '\n'.join(lines)
+        if ((int(w0) >> 9) & 3) == 2 or ((int(w0) >> 11) & 3) == 2:
+            # bicubic sampler (filter mode 2): its samples go to a Catmull-Rom lowering (intrinsics.sample_tex_bicubic); the host
+            # sampler is linear. M4R_LINEAR_BICUBIC=1 keeps plain linear filtering (the old approximation).
+            if not os.environ.get('M4R_LINEAR_BICUBIC'):
+                cast = f'addrspacecast (ptr addrspace(1) @{new} to ptr addrspace(2))'
+                names = set()
+                def ren(m):
+                    names.add(m.group(1)); return '@air.sample_texture_2d_bicubic' + m.group(1)
+                text = '\n'.join(re.sub(r'@air\.sample_texture_2d(\.[\w.]+)\(', lambda m: ren(m) + '(', ln) if cast in ln and 'call ' in ln else ln
+                                 for ln in text.split('\n'))
+                for sfx in names:
+                    dm = re.search(r'^declare [^\n]*@air\.sample_texture_2d' + re.escape(sfx) + r'\([^\n]*$', text, re.M)
+                    if dm and not re.search(r'^declare [^\n]*@air\.sample_texture_2d_bicubic' + re.escape(sfx) + r'\(', text, re.M):
+                        text = text[:dm.end()] + '\n' + dm.group(0).replace('@air.sample_texture_2d' + sfx, '@air.sample_texture_2d_bicubic' + sfx) + text[dm.end():]
 
     # 3. strip AIR named metadata (refers to old types); keep numbered nodes
     text = re.sub(r'^(!\d+) = !\{!"air\.sampler_state"[^\n]*$', r'\1 = !{}', text, flags=re.M)

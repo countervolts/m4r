@@ -562,6 +562,59 @@ def sample_tex(b, s):
     return b.v(f'insertvalue {s.ret} {r}, i8 1, 1')
 
 
+def sample_tex_bicubic(b, s):
+    """Sample with a bicubic sampler (MetalFX's V3 history warp; the only filter-mode-2 sampler, 2D, normalised coordinates, clamp to
+    edge). Apple's cubic kernel is not documented; m4r uses Catmull-Rom (the usual history-resampling kernel), built from 9 bilinear
+    taps of the same sampler (the runtime creates it as linear), accumulated in fp32."""
+    vt = struct_first(s.ret)
+    n, e = vec(vt)
+    d = desc(b, '%a0')
+    smp = sampler_desc(b, '%a1')
+    off = pack_offset(b, s.params[4], '%a4')
+    info = intr(b, '<4 x float>', 'llvm.amdgcn.image.getresinfo.2d.v4f32.i32',
+                [('i32', '15'), ('i32', '0'), ('<8 x i32>', d), ('i32', '0'), ('i32', '0')])
+    taps = {}
+    for ax in (0, 1):
+        sz = b.v(f'bitcast float {b.v(f"extractelement <4 x float> {info}, i32 {ax}")} to i32')
+        szf = b.v(f'uitofp i32 {sz} to float')
+        c = b.v(f'extractelement <2 x float> %a2, i32 {ax}')
+        p = b.v(f'fmul float {c}, {szf}')                                   # sample position in texels
+        t1 = b.v(f'fadd float {intr(b, "float", "llvm.floor.f32", [("float", b.v(f"fsub float {p}, 0.5"))])}, 0.5')
+        f = b.v(f'fsub float {p}, {t1}')
+        ff = b.v(f'fmul float {f}, {f}')
+        # w0 = f(-0.5 + f(1 - 0.5f)), w1 = 1 + f^2(-2.5 + 1.5f), w2 = f(0.5 + f(2 - 1.5f)), w3 = f^2(-0.5 + 0.5f)
+        w0 = b.v(f'fmul float {f}, {b.v(f"fadd float -0.5, {b.v(chr(32).join([f'fmul float {f},', b.v(f'fsub float 1.0, {b.v(f'fmul float 0.5, {f}')}')]))}")}')
+        w1 = b.v(f'fadd float 1.0, {b.v(f"fmul float {ff}, {b.v(f'fadd float -2.5, {b.v(f'fmul float 1.5, {f}')}')}")}')
+        w2 = b.v(f'fmul float {f}, {b.v(f"fadd float 0.5, {b.v(chr(32).join([f'fmul float {f},', b.v(f'fsub float 2.0, {b.v(f'fmul float 1.5, {f}')}')]))}")}')
+        w3 = b.v(f'fmul float {ff}, {b.v(f"fadd float -0.5, {b.v(f'fmul float 0.5, {f}')}")}')
+        w12 = b.v(f'fadd float {w1}, {w2}')
+        o12 = b.v(f'fdiv float {w2}, {w12}')
+        inv = b.v(f'fdiv float 1.0, {szf}')
+        pos = [b.v(f'fmul float {b.v(f"fsub float {t1}, 1.0")}, {inv}'),
+               b.v(f'fmul float {b.v(f"fadd float {t1}, {o12}")}, {inv}'),
+               b.v(f'fmul float {b.v(f"fadd float {t1}, 2.0")}, {inv}')]
+        taps[ax] = list(zip(pos, (w0, w12, w3)))
+    ft = f'<{n} x float>' if n > 1 else 'float'
+    acc = None
+    for py, wy in taps[1]:
+        for px, wx in taps[0]:
+            v = img_call(b, vt, 'llvm.amdgcn.image.sample.lz.o.2d.{s}.f32',
+                         [('i32', '15'), ('i32', off), ('float', px), ('float', py),
+                          ('<8 x i32>', d), ('<4 x i32>', smp), ('i1', 'false'), ('i32', '0'), ('i32', '0')])
+            if e == 'half':
+                v = b.v(f'fpext {vt} {v} to {ft}')
+            w = b.v(f'fmul float {wx}, {wy}')
+            if n > 1:
+                w = b.v(f'insertelement {ft} poison, float {w}, i32 0')
+                w = b.v(f'shufflevector {ft} {w}, {ft} poison, <{n} x i32> zeroinitializer')
+            t = b.v(f'fmul {ft} {v}, {w}')
+            acc = t if acc is None else b.v(f'fadd {ft} {acc}, {t}')
+    if e == 'half':
+        acc = b.v(f'fptrunc {ft} {acc} to {vt}')
+    r = b.v(f'insertvalue {s.ret} poison, {vt} {acc}, 0')
+    return b.v(f'insertvalue {s.ret} {r}, i8 1, 1')
+
+
 def gather_tex(b, s):
     vt = struct_first(s.ret)
     d = desc(b, '%a0')
@@ -748,6 +801,7 @@ TABLE = [
     (r'air\.simd_all$', simd_all),
     (r'air\.simd_is_first$', simd_is_first),
     (r'air\.read_texture_2d', read_tex),
+    (r'air\.sample_texture_2d_bicubic\.', sample_tex_bicubic),
     (r'air\.sample_texture_2d', sample_tex),
     (r'air\.gather_texture_2d', gather_tex),
     (r'air\.write_texture_2d', write_tex),

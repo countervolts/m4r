@@ -228,3 +228,10 @@ GLSL passes on buffer copies of the denoised colour:
 Measuring noise: `tools/noise_report.py` (fixed 2026-11-20: its output-resolution band masks were scaled by `oh // H + 1`, i.e.
 misaligned; the final-frame columns before that are wrong). Relative rms is dominated by a few emissive highlights (car lights) in the
 glossy bands; log-luma high-pass on 5x5-eroded masks is more telling.
+
+**Bicubic history warp (2026-11-20).** `brnetv3_warp_history_high_resolution` is the only kernel with a filter-mode-2 (bicubic)
+sampler. The translator now renames those sample calls to `air.sample_texture_2d_bicubic.*` and lowers them to Catmull-Rom built from
+9 linear taps (`air/intrinsics.py` `sample_tex_bicubic`; `M4R_LINEAR_BICUBIC=1` at plan-generation time restores plain linear).
+Apple's exact cubic kernel is undocumented: Catmull-Rom is m4r's choice. Capture j (1280x720 pan): rough-surface gradient energy
+0.038 -> 0.041 (BBR path 0.058), flicker and brightness unchanged, warp pass 0.14 -> 0.16 ms. V3 remains softer than BBR in motion;
+with a still camera it is about as sharp (capture h steady state: 0.051 vs 0.056).

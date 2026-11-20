@@ -33,9 +33,9 @@ bool decodeSamplerState(uint64_t w0, VkSamplerCreateInfo& ci, std::string& why) 
         why = "address mode"; return false;
     }
     const uint32_t mag = (w0 >> 9) & 3, min = (w0 >> 11) & 3, mip = (w0 >> 13) & 3;
-    // filter 2 = bicubic (MetalFX's V3 history warp): approximated by linear filtering until a bicubic sample is implemented
+    // filter 2 = bicubic (MetalFX's V3 history warp): the translator turns those samples into Catmull-Rom from 9 linear taps
+    // (air/intrinsics.py sample_tex_bicubic), so the Vulkan sampler is linear
     if (mag > 2 || min > 2) { why = "filter mode " + std::to_string(mag) + "/" + std::to_string(min); return false; }
-    if ((mag == 2 || min == 2) && !std::getenv("M4R_QUIET")) std::fprintf(stderr, "m4r: bicubic sampler approximated by linear\n");
     ci.magFilter = mag ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     ci.minFilter = min ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     ci.mipmapMode = mip == 2 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
