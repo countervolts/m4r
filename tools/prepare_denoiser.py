@@ -26,7 +26,7 @@ class Gen:
         os.makedirs(out + '/k', exist_ok=True); os.makedirs(out + '/blobs', exist_ok=True)
         self.mtl = open(res + '/default.metallib', 'rb').read()
         self.lib = metallib.parse(self.mtl)
-        self.lines = []; self.kernels = {}; self.src = {}; self.wmma = not os.environ.get('M4R_NO_WMMA')
+        self.lines = []; self.kernels = {}; self.src = {}; self.wmma = bool(os.environ.get('M4R_WMMA'))   # WMMA convs: opt-in until verified
         self.dat = {n: open(f'{res}/emit_{n}net_v3_2_constants.dat', 'rb').read() for n in ('dbf', 'ubf')}
 
     def source(self, fn):
@@ -174,6 +174,12 @@ def build(g, iw, ih, stage, runtime=False):
             (8, 8, 1), (W, H, 1),
             ['tex 0 warp_color', 'tex 1 color', 'tex 4 shin', 'tex 5 denoised', 'tex 6 specular', 'tex 7 diffuse', 'tex 8 roughness',
              'tex 9 dbf_tw', 'buf 10 exp0|exp1', 'buf 11 preexp'])
+    if runtime:
+        # last pass: interim firefly clamp on the denoised colour (m4r copies 'denoised' to den_raw first and den_cl back afterwards)
+        g.buffer('den_raw', iw * ih * 8); g.buffer('den_cl', iw * ih * 8)
+        g.glsl('nn_despeckle', os.path.join(ROOT, 'shaders', 'nn_despeckle.comp'))
+        g.run('nn_despeckle', iw, ih, ['den_raw', 'den_cl'], [iw, ih])
+        g.lines.append('  only despeckle')
     return dict(W=W, H=H, tw=tw, th=th)
 
 

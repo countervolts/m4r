@@ -467,12 +467,15 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     }
     const Texture* rough = d->roughness.image ? c->wrap(d->roughness) : nullptr;
     if (!d->roughness_in_normals_w && !rough) { c->error = "Ray Reconstruction: no roughness"; return 1; }
-    const Texture* exposure = d->exposure.image ? c->wrap(d->exposure) : &c->exposureOne;
+    // The denoiser's output is scaled by the exposure it was given (it feeds MetalFX's upscaling network in exposed units); the
+    // upscaler here wants the game's own colour range, so the denoiser always runs with exposure 1 (its auto-exposure passes stay off).
+    const Texture* exposure = &c->exposureOne;
+    p.setFlag("autoexp", false);
     LayoutGuard g{cb};
-    for (const m4r_image* im : {&d->color, &d->depth, &d->motion, &d->normals, &d->diffuse_albedo, &d->specular_albedo, &d->roughness, &d->exposure})
+    for (const m4r_image* im : {&d->color, &d->depth, &d->motion, &d->normals, &d->diffuse_albedo, &d->specular_albedo, &d->roughness})
         g.add(*im);
     g.begin();
-    if (!d->exposure.image && !c->exposureOneCleared) {
+    if (!c->exposureOneCleared) {
         c->vk.toGeneral(cb, c->exposureOne);
         VkClearColorValue one{{1.0f, 1.0f, 1.0f, 1.0f}};
         VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -535,8 +538,25 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
         c->vk.barrier(cb);
         first = 1;
     }
-    ok = ok && p.record(cb, first);
+    // interim firefly clamp (last pass of the plan): copy the denoised colour out, clamp, copy it back
+    static const bool noDespeckle = std::getenv("M4R_NO_DESPECKLE") != nullptr;
+    Buffer *dRaw = p.buffer("den_raw"), *dCl = p.buffer("den_cl");
+    Texture* denTex = p.texture("denoised");
+    const bool despeckle = !noDespeckle && dRaw && dCl && denTex && p.passes() > first + 1;
+    p.setFlag("despeckle", despeckle);
+    ok = ok && p.record(cb, first, despeckle ? p.passes() - 1 - first : size_t(-1));
     c->vk.barrier(cb);
+    if (despeckle && ok) {
+        VkBufferImageCopy cp{};
+        cp.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        cp.imageExtent = {iw, ih, 1};
+        vkCmdCopyImageToBuffer(cb, denTex->image, VK_IMAGE_LAYOUT_GENERAL, dRaw->buffer, 1, &cp);
+        c->vk.barrier(cb);
+        ok = p.record(cb, p.passes() - 1, 1);
+        c->vk.barrier(cb);
+        vkCmdCopyBufferToImage(cb, dCl->buffer, denTex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        c->vk.barrier(cb);
+    }
     g.end();
     if (!ok) { c->error = p.error; return 1; }
     std::memcpy(c->dnPrevVp, curr.data(), sizeof c->dnPrevVp);
