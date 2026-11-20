@@ -75,6 +75,10 @@ class Gen:
             self.lines.append(f'  bytes {8 + i} {int(c).to_bytes(4, "little").hex()}')
 
     def run_k(self, fn, consts, tg, grid, binds, only=None, groups=False):
+        for kv in filter(None, os.environ.get('M4R_FC', '').split(',')):   # experiments: M4R_FC=name=0|1,... overrides function constants
+            n, v = kv.split('=')
+            if n in consts:
+                consts = dict(consts, **{n: bool(int(v))})
         k = self.kernel(fn, consts, tg)
         self.lines.append(f'pass {k} {"groups" if groups else "threads"} {grid[0]} {grid[1]} {grid[2]}')
         if only:
@@ -225,8 +229,13 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
     for n in ('v3ema0', 'v3ema1', 'v3var0', 'v3var1', 'v3lwv'):         # network-input size
         g.texture(n, 'R16_SFLOAT', Wn, Hn)
     g.texture('v3temporal2', F, Wn, Hn); g.texture('aabbmin', F, Wn, Hn); g.texture('aabbmax', F, Wn, Hn)
-    g.texture('v3spatial', F, Wt, Ht); g.texture('v3sema', 'R16_SFLOAT', 16, 16)
-    g.buffer('v3reset', 16); g.buffer('v3desc', 24); g.buffer('v3bd', 8); g.buffer('ubf_in', Wn * Hn * 10)
+    g.texture('v3spatial', F, Wt, Ht)
+    for n in ('v3se0', 'v3se1', 'v3sq0', 'v3sq1'):                      # sample statistics (BRNet +0xe0/+0xf0, ping-pong)
+        g.texture(n, 'R16_SFLOAT', Wn, Hn)
+    for n in ('v3cnt0', 'v3cnt1'):
+        g.texture(n, 'R16_UINT', Wn, Hn)
+    g.texture('v3zero', F, 16, 16); g.texture('v3const', F, 16, 16)
+    g.buffer('v3reset', 16); g.buffer('v3resetA', 16); g.buffer('v3desc', 24); g.buffer('v3bd', 8); g.buffer('ubf_in', Wn * Hn * 10)
     g.run_k('brnetv3_build_tensors_low_resolution', {'bfnet1_enabled': True, 'full_resolution_flow': False, 'jittered_motion_vectors': False},
             (8, 8, 1), (iw + 2, ih + 2, 1),
             ['tex 0 denoised', 'tex 1 int_depth', 'tex 2 int_motion', 'tex 3 crr', 'tex 4 flowd', 'bytes 0 ' + struct.pack('<f', 1.0).hex(),
@@ -234,15 +243,20 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
     g.run_k('brnetv3_warp_history_high_resolution', {'bfnet1_enabled': True, 'stlanczos_enabled': False, 'new_overshoot_clamp': False},
             (8, 8, 1), (ow, oh, 1),
             ['tex 0 crr', 'tex 1 v3hist', 'tex 2 flowd', 'tex 3 fah', 'tex 4 v3blend', 'tex 5 v3fblend', 'tex 6 v3clamp', 'tex 7 denoised',
-             'buf 0 v3desc', 'buf 1 bparams', 'buf 2 exp0|exp1', 'buf 3 exp1|exp0', 'buf 4 v3reset', 'buf 5 preexp'])
+             'buf 0 v3desc', 'buf 1 bparams', 'buf 2 exp0|exp1', 'buf 3 exp1|exp0', 'buf 4 ' + ('v3resetA' if os.environ.get('M4R_RESET_WARP') else 'hinv'), 'buf 5 preexp'])
     g.run_k('brnetv3_lowres_signals', {'mid_bicubic_warp': False, 'half_res_input': False, 'quantized': False, 'is_tensor_layout_nchw': False,
                                       'bfnet1_enabled': True, 'big_epsilon_and_default_scales_enabled': False, 'new_overshoot_clamp': False},
             (8, 8, 1), (Wn, Hn, 1),
             ['tex 0 crr', 'tex 1 fah', 'tex 2 flowd', 'tex 3 v3hist', 'tex 4 v3ema0|v3ema1', 'tex 5 v3var0|v3var1',
-             'tex 6 v3ema1|v3ema0', 'tex 7 v3var1|v3var0', 'tex 8 v3temporal2', 'tex 9 v3lwv', 'tex 15 aabbmin', 'tex 16 aabbmax',
+             'tex 6 v3ema1|v3ema0', 'tex 7 v3var1|v3var0', 'tex 8 ' + ('v3zero' if os.environ.get('M4R_NO_TEMPORAL_FB') else 'v3temporal2'), 'tex 9 v3lwv', 'tex 15 aabbmin', 'tex 16 aabbmax',
              'tex 17 normals', 'tex 18 diffuse', 'tex 19 roughness', 'tex 20 specular',
-             'buf 0 v3desc', 'buf 1 bparams', 'buf 2 ubf_in', 'buf 3 exp0|exp1', 'buf 4 exp1|exp0', 'buf 5 v3reset',
+             'buf 0 v3desc', 'buf 1 bparams', 'buf 2 ubf_in', 'buf 3 exp0|exp1', 'buf 4 exp1|exp0', 'buf 5 ' + ('v3resetA' if os.environ.get('M4R_RESET_LOWRES') else 'hinv'),
              'bytes 6 ' + struct.pack('<2H', ow // 2, oh // 2).hex()])
+    # BRNet_v3_Filter::encodeMid: update_sample_statistics (per-pixel running mean / mean of squares of the colour, used by the filter's
+    # history clamp); in/out ping-pong, the filter reads the updated ones
+    g.run_k('brnetv3_update_sample_statistics', {}, (8, 8, 1), (Wn, Hn, 1),
+            ['tex 0 flowd', 'tex 1 flowdiff', 'tex 2 v3se0|v3se1', 'tex 3 v3sq0|v3sq1', 'tex 4 v3se1|v3se0', 'tex 5 v3sq1|v3sq0',
+             'tex 6 v3cnt0|v3cnt1', 'tex 8 v3cnt1|v3cnt0', 'tex 10 crr', 'buf 1 bparams', 'buf 3 hinv'])
     import denoise_nets as dn
     # sigmoid in the network: with bfnet1_enabled the conversion kernels copy the values (the fp16 + sigmoid branch is for bfnet1 off)
     dn.ubf_net(g, g.dat['ubf'], dn.ubf_head_blob(g.res), Hn, Wn, 'ubf_in', 'ubf_out', pre='ubf_', sigmoid=True)
@@ -256,10 +270,11 @@ def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
             {'quantized': False, 'reactive_mask_enabled': False, 'bfnet1_enabled': True, 'line_locking_enabled': False,
              'exposure_viz_enabled': False, 'big_epsilon_and_default_scales_enabled': False, 'stlanczos_enabled': False,
              'new_overshoot_clamp': False}, (8, 8, 1), (ow, oh, 1),
-            ['tex 0 crr', 'tex 1 fah', 'tex 3 v3out', 'tex 4 v3hist', 'tex 5 flowdiff', 'tex 6 v3lwv', 'tex 7 flowd', 'tex 10 v3clamp',
-             'tex 11 v3spatial', 'tex 12 v3temporal2', 'tex 13 aabbmin', 'tex 14 aabbmax', 'tex 15 v3sema', 'tex 16 v3sema',
+            ['tex 0 crr', 'tex 1 fah', 'tex 3 v3out', 'tex 4 v3hist', 'tex 5 ' + ('v3zero' if os.environ.get('M4R_ZERO_FLOWDIFF') else 'flowdiff'), 'tex 6 ' + ('v3zero' if os.environ.get('M4R_ZERO_LWV') else 'v3lwv'), 'tex 7 flowd', 'tex 10 v3clamp',
+             'tex 11 ' + ('v3zero' if os.environ.get('M4R_ZERO_SPATIAL') else 'v3spatial'), 'tex 12 ' + ('v3zero' if os.environ.get('M4R_ZERO_TEMPORAL') else 'v3const' if os.environ.get('M4R_CONST_TEMPORAL') else 'v3temporal2'),
+             'tex 13 aabbmin', 'tex 14 aabbmax', 'tex 15 v3se1|v3se0', 'tex 16 v3sq1|v3sq0',
              'tex 19 v3fblend', 'tex 20 v3blend', 'buf 0 bparams', 'bytes 1 ' + struct.pack('<2f', iw / ow, ih / oh).hex(),
-             'buf 2 v3reset', 'buf 3 preexp', 'buf 4 exp0|exp1'])
+             'buf 2 ' + ('v3resetA' if os.environ.get('M4R_RESET_ANISO') else 'hinv'), 'buf 3 preexp', 'buf 4 exp0|exp1'])
 
 
 def mat(v):
@@ -297,7 +312,7 @@ def frame_buffers(cap, fid, t, sz, iw, ih, prev):
            struct.pack('<8f', jitter[0], jitter[1], ms[0], ms[1], iw / ow, ih / oh, ms[0] / iw, ms[1] / ih)).ljust(144, b'\0')
     # brnet_v3_build_tensors_t (24 B): motionScale * outputSize, jitter, tensor row bytes (5 halves), height, width
     v3d = struct.pack('<ffffiHH', ms[0] * ow, ms[1] * oh, jitter[0], jitter[1], 10, Hn, Wn)
-    bufs = {'bparams': bsp, 'v3desc': v3d, 'v3bd': struct.pack('<iHH', 22, Ht, Wt), 'v3reset': (b'\x01' if t == 0 else b'\x00').ljust(16, b'\0'), 'npix': struct.pack('<I', iw * ih),
+    bufs = {'bparams': bsp, 'v3desc': v3d, 'v3bd': struct.pack('<iHH', 22, Ht, Wt), 'v3resetA': b'\x01'.ljust(16, b'\0'), 'v3reset': (b'\x01' if (t == 0 or os.environ.get('M4R_V3_RESET')) else b'\x00').ljust(16, b'\0'), 'npix': struct.pack('<I', iw * ih),
             'dbf_params_out': out_params, 'rw_ms': struct.pack('<2f', *ms), 'rw_pj': struct.pack('<2f', *pj),
             'rw_cj': struct.pack('<2f', *jitter), 'dbf_params': dbf, 'refl_params': refl, 'preexp': struct.pack('<f', f('preexposure')),
             'reset': struct.pack('<B', 1 if t == 0 else 0).ljust(16, b'\0')}

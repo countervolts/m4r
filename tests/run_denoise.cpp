@@ -131,6 +131,13 @@ int main(int argc, char** argv) {
                 vk.download(*dn, tmp.data(), tmp.size());
                 vk.upload(*plan.texture("v3hist"), tmp.data(), tmp.size());
             }
+            if (t == 0) if (Texture* c = plan.texture("v3const"); c && std::getenv("M4R_V3CONST")) {   // experiment: constant RGBA texture, M4R_V3CONST="r,g,b,a"
+                float v[4] = {0, 0, 0, 0};
+                std::sscanf(std::getenv("M4R_V3CONST"), "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]);
+                std::vector<uint16_t> px(size_t(c->width) * c->height * 4);
+                for (size_t i = 0; i < px.size(); ++i) px[i] = f2h(v[i & 3]);
+                vk.upload(*c, px.data(), px.size() * 2);
+            }
             std::printf("frame %d done %.2f ms\n", t, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
             if (const char* names = std::getenv("M4R_DUMP_TEX")) {
                 std::string all = names;
