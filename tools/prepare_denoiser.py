@@ -128,6 +128,20 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
           ['tex 0 normals', 'tex 1 motion', 'tex 2 depth', 'tex 3 int_motion', 'tex 4 int_depth', 'tex 5 color', 'tex 6 hist',
            'tex 7 specular', 'tex 8 diffuse', 'tex 9 roughness', 'tex 10 spechit', 'tex 11 mm0|mm1', 'tex 12 mm1|mm0',
            'buf 0 dbf_params', 'buf 5 refl_params', 'buf 1 dbf_in', 'buf 3 exp0|exp1', 'buf 4 preexp'])
+    # BRNet_v3_Filter::encodeMidForDenoise (DMidProcessing, before BFNet's reproject): dilate the flow, splat it, and compare: flowDiff
+    # (BFNet's flow_diff_tex) and the motion-reduced mirror mask (BFNet +0xe8, the bilateral's mirrorMask). Reversed depth skips the
+    # forward-z init; flow_splat_reverse_depth follows the depth convention. bytes(2) of flow_splat in the host code has no kernel argument.
+    rev = 1  # TODO runtime: both conventions (plans exist per convention like bbr's)
+    g.texture('flowd', 'R16G16_SFLOAT', iw, ih); g.texture('splat', 'R16G16_SFLOAT', iw, ih)
+    g.texture('flowdiff', 'R16_SFLOAT', W, H); g.texture('mmr', 'R8_UNORM', W, H)
+    g.buffer('splatbuf', iw * ih * 4)
+    g.run_k('dilateFlow', {'full_resolution_flow': False}, (8, 8, 1), (iw + 2, ih + 2, 1),
+            ['tex 0 int_depth', 'tex 1 int_motion', 'tex 2 flowd', 'bytes 0 ' + struct.pack('<f', 1.0 if rev else -1.0).hex(), 'buf 1 bparams'])
+    g.run_k('brnetv3_flow_splat', {'flow_splat_reverse_depth': bool(rev)}, (8, 8, 1), (iw, ih, 1),
+            ['tex 0 flowd', 'tex 1 int_depth', 'buf 0 splatbuf', 'buf 1 bparams'])
+    g.run_k('brnetv3_flow_splat_texture', {}, (8, 8, 1), (iw, ih, 1), ['tex 0 flowd', 'tex 1 splat', 'buf 0 splatbuf', 'buf 1 bparams'])
+    g.run_k('brnetv3_flow_diff_texture', {'bfnet1_enabled': True, 'spec_hit_dist_enabled': False}, (8, 8, 1), (iw, ih, 1),
+            ['tex 0 flowd', 'tex 1 splat', 'tex 2 flowdiff', 'tex 3 mm0|mm1', 'tex 4 mm1|mm0', 'tex 5 mmr', 'buf 1 bparams'])
     if stage < 'C':
         return dict(W=W, H=H, tw=tw, th=th)
     # DNet: DBFNet (cells E1-E4, D1-D3), NHWC, rowBytes 26 in / 14 out
@@ -138,14 +152,14 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
     # intermediates of BFNet_v1_Filter (member offsets in docs/metalfx-denoiser-passes.txt)
     for n in ('warp_color', 'warp_prev', 'nr0', 'nr1'):
         g.texture(n, 'R16G16B16A16_SFLOAT', W, H)
-    g.texture('shin', 'R8_UNORM', W, H); g.texture('mmr', 'R8_UNORM', W, H)
+    g.texture('shin', 'R8_UNORM', W, H)
     for n in ('fc0', 'fc1', 'dy0', 'dy1'):
         g.texture(n, 'R16_SFLOAT', W, H)
     for n in ('rm0', 'rm1'):
         g.texture(n, 'R16G16B16A16_SFLOAT', W, H)
     for n in ('bw0', 'bw1'):
         g.texture(n, 'R8_UNORM', W, H)
-    g.texture('spec_mvec', 'R16G16_SFLOAT', W, H); g.texture('flowdiff', 'R16_SFLOAT', W, H)
+    g.texture('spec_mvec', 'R16G16_SFLOAT', W, H)
     g.texture('boost', 'R16_SFLOAT', W // 8, H // 8)
     g.texture('dbf_feat', 'R16G16B16A16_SFLOAT', hw, hh); g.texture('dbf_noise', 'R16G16_SFLOAT', hw, hh)
     g.texture('dbf_tw', 'R16_SFLOAT', hw, hh)
@@ -199,7 +213,6 @@ def v3_ubf(g, iw, ih, W, H, ow, oh):
     g.texture('crr', 'R16G16B16A16_SFLOAT', iw, ih); g.texture('v3hist', 'R16G16B16A16_SFLOAT', iw, ih)   # v3hist: stand-in history
     for n in ('fah', 'v3clamp', 'v3blend', 'v3fblend'):   # warp_history_high_resolution works at output size
         g.texture(n, 'R16G16B16A16_SFLOAT', ow, oh)
-    g.texture('flowd', 'R16G16_SFLOAT', iw, ih)
     for n in ('v3ema0', 'v3ema1', 'v3var0', 'v3var1'):
         g.texture(n, 'R16_SFLOAT', hw, hh)
     g.texture('v3temporal', 'R16_SFLOAT', iw, ih); g.texture('v3lwv', 'R16_SFLOAT', hw, hh)
