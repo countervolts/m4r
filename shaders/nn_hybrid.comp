@@ -1,25 +1,30 @@
-// m4r: hybrid output (NOT MetalFX behaviour; opt-in: M4R_HYBRID=1; on a fast pan over reflections it kept BBR's shimmer, so it is not the default).
-// The game's frame is upscaled twice: by MetalFX's V3 stage (UBFNet + V3 filter: clean, no fireflies, softer in motion) and by
-// MetalFX's BBR upscaler on the same denoised colour (sharper, keeps the outliers the denoiser leaves). The result is BBR's pixel
-// clamped per channel to the range of V3's 5x5 neighbourhood, widened by GROW of that range: detail BBR and V3 agree on stays,
-// spikes V3 does not have (fireflies, puddle glitter) are pulled back. RGBA16F buffers at output size; alpha is BBR's.
-// args: 0 V3 output [H][W] f16vec4, 1 BBR output (read and written in place); consts 8 W, 9 H
+// m4r: hybrid output v2 (NOT MetalFX behaviour; the default; M4R_NO_HYBRID=1 = V3 alone, M4R_NO_V3=1 = the BBR path alone).
+// The game's frame is upscaled twice from the same denoised colour: by MetalFX's V3 stage (UBFNet + V3 filter: clean and calm on
+// reflections, softer on everything else in motion) and by MetalFX's BBR upscaler (sharper, but its reflections shimmer in motion).
+// Per output pixel: on rough surfaces BBR, clamped per channel to V3's 5x5 range widened by GROW (catches outliers V3 does not have);
+// on shiny surfaces V3; blended by roughness (3x3 average at render resolution, Cyberpunk's wet-floor roughness is patchy):
+// full V3 below R0, full BBR above R1. RGBA16F buffers at output size; alpha is BBR's.
+// args: 0 V3 output [H][W] f16vec4, 1 BBR output (read and written in place), 2 roughness [ih][iw] half
+// consts 8 W, 9 H, 10 iw, 11 ih
 // SPDX-License-Identifier: GPL-3.0-only
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(buffer_reference, std430, buffer_reference_align = 8) buffer Px { f16vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer Half { float16_t v[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Args { uint64_t slot[8]; uint c[8]; uint grid[4]; };
 layout(push_constant) uniform Push { Args a; } pc;
 const int R = 2;            // 5x5
 const float GROW = 0.25;
+const float R0 = 0.10, R1 = 0.25;
 void main() {
     Args a = pc.a;
-    const int W = int(a.c[0]), H = int(a.c[1]);
+    const int W = int(a.c[0]), H = int(a.c[1]), iw = int(a.c[2]), ih = int(a.c[3]);
     const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     if (p.x >= W || p.y >= H) return;
     Px v3 = Px(a.slot[0]), bb = Px(a.slot[1]);
+    Half rough = Half(a.slot[2]);
     vec3 lo = vec3(65504.0), hi = vec3(-65504.0);
     for (int dy = -R; dy <= R; ++dy)
         for (int dx = -R; dx <= R; ++dx) {
@@ -30,5 +35,14 @@ void main() {
     const vec3 m = (hi - lo) * GROW;
     const int i = p.y * W + p.x;
     const vec4 b = vec4(bb.v[i]);
-    bb.v[i] = f16vec4(vec4(clamp(b.rgb, lo - m, hi + m), b.a));
+    const vec3 bc = clamp(b.rgb, lo - m, hi + m);
+    const ivec2 rp = clamp(ivec2((vec2(p) + 0.5) * vec2(iw, ih) / vec2(W, H)), ivec2(0), ivec2(iw - 1, ih - 1));
+    float r = 0.0;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx) {
+            const ivec2 q = clamp(rp + ivec2(dx, dy), ivec2(0), ivec2(iw - 1, ih - 1));
+            r += float(rough.v[q.y * iw + q.x]);
+        }
+    const float wb = smoothstep(R0, R1, r * (1.0 / 9.0));
+    bb.v[i] = f16vec4(vec4(mix(vec3(v3.v[i].rgb), bc, wb), b.a));
 }

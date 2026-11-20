@@ -21,7 +21,7 @@ struct m4r_context {
     std::unique_ptr<Plan> bbr[2], fg, dn;   // dn: the denoiser plan (render size)
     uint32_t dnSize[2] = {};
     bool dnV3 = false;   // the plan is the V3 one (dn3-*): it writes the final image, no separate upscaler
-    bool dnHybrid = false;   // V3 plan + BBR upscaler, BBR clamped to V3 (m4r's hybrid, shaders/nn_hybrid.comp; opt-in M4R_HYBRID=1)
+    bool dnHybrid = false;   // V3 plan + BBR upscaler: BBR (clamped to V3) on rough surfaces, V3 on shiny ones (m4r, shaders/nn_hybrid.comp; default, M4R_NO_HYBRID=1 = V3 alone)
     uint32_t dnOut[2] = {};
     uint64_t dnFrame = 0;
     double dnPrevVp[16] = {};
@@ -455,8 +455,9 @@ M4R_API int m4r_denoise_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t 
             c->dnSize[0] = iw; c->dnSize[1] = ih; c->dnOut[0] = ow; c->dnOut[1] = oh;
             c->dnFrame = 0; c->dnV3 = true; c->dnHybrid = false;
             if (!c->exposureOne.image && !c->vk.createTexture(c->exposureOne, VK_FORMAT_R32_SFLOAT, 1, 1)) { c->error = "exposure texture"; return 1; }
-            // hybrid (m4r, not MetalFX, opt-in: M4R_HYBRID=1): also the BBR upscaler; without its plan pass, V3 alone
-            if (std::getenv("M4R_HYBRID") && c->dn->firstOnly("hybrid") < c->dn->passes()) {
+            // hybrid (m4r, not MetalFX; default since 2026-11-20, M4R_NO_HYBRID=1 = V3 alone): also the BBR upscaler; without its plan
+            // pass or the BBR plan, V3 alone
+            if (!std::getenv("M4R_NO_HYBRID") && c->dn->firstOnly("hybrid") < c->dn->passes()) {
                 const std::string keep = c->error;
                 if (m4r_upscale_init(c, ow, oh, iw, ih) == 0) c->dnHybrid = true;
                 else c->error = keep;

@@ -255,3 +255,11 @@ none above 0.2) by `mix(1, cap, gate)`, default cap 0.3, gate from the camera's 
 walking in Cyberpunk is 0.03-0.05 m/frame, turning or standing <= 0.001), so turning the camera is untouched (capture d bit-identical
 with the switch on). Capture m (walking): ghosted tile lines across reflections fade, puddle grain 0.074 -> 0.089 (cap 0.3) /
 0.119 (cap 0.01).
+
+**Hybrid v2 (the default since 2026-11-20; `M4R_NO_HYBRID=1` = V3 alone, `M4R_NO_V3=1` = BBR alone; not MetalFX).** Both upscalers
+run on the same denoised colour; `shaders/nn_hybrid.comp` takes BBR (clamped to V3's 5x5 range +25%) on rough surfaces and V3 on
+shiny ones, blended by roughness (3x3 render-pixel average; full V3 below 0.10, full BBR above 0.25). Captures j / k / m (720p):
+rough-surface gradient energy V3 0.039 / 0.059 / 0.040, BBR 0.054 / 0.089 / 0.055, hybrid 0.052 / 0.085 / 0.053; fireflies V3 0 / 16 / 0,
+BBR 330 / 2106 / 362, hybrid 2 / 57 / 0; frame-to-frame residual on moving shiny pixels equal to V3 (0.038 / 0.072 / 0.099; BBR
+0.093 / 0.169 / 0.210); brightness within 1%; no visible seam at puddle edges. Costs the BBR upscaler on top of V3 (~2 ms). If a game
+gives roughness as its own texture (not normals.w) the roughness buffer stays zero and the blend is V3 everywhere.
