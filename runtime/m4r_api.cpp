@@ -195,7 +195,11 @@ static void dumpUpscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_de
 struct RrDump {
     static const int N = 11;
     Buffer buf[N]; uint32_t w[N] = {}, h[N] = {}, bpp[N] = {}; uint64_t call = 0; std::string meta; bool written = false;
+    // what m4r made of the frame (written by m4r_denoise): the denoised colour at render size and the final output
+    Buffer outBuf[2]; uint32_t ow[2] = {}, oh[2] = {}, obpp[2] = {};
 };
+static RrDump* g_rrCurrent = nullptr;   // the capture of the call being recorded (set by m4r_denoise_capture), else null
+static const char* const kRrOutNames[2] = {"out_denoised", "out_output"};
 static std::vector<RrDump> g_rrDumps;
 static uint64_t g_rrCalls = 0;
 static const char* const kRrNames[RrDump::N] = {"color", "depth", "motion", "diffuse_albedo", "specular_albedo", "normals", "roughness",
@@ -213,6 +217,12 @@ static void writeRrDumps(m4r_context* c, bool all) {
             std::snprintf(nm, sizeof nm, "%s/rr-%02llu-%s.raw", dir, (unsigned long long) u.call, kRrNames[k]);
             if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(u.buf[k].map, 1, size_t(u.w[k]) * u.h[k] * u.bpp[k], f); std::fclose(f); }
             c->vk.destroyBuffer(u.buf[k]);
+        }
+        for (int k = 0; k < 2; ++k) {
+            if (!u.outBuf[k].buffer) continue;
+            std::snprintf(nm, sizeof nm, "%s/rr-%02llu-%s.raw", dir, (unsigned long long) u.call, kRrOutNames[k]);
+            if (FILE* f = std::fopen(nm, "wb")) { std::fwrite(u.outBuf[k].map, 1, size_t(u.ow[k]) * u.oh[k] * u.obpp[k], f); std::fclose(f); }
+            c->vk.destroyBuffer(u.outBuf[k]);
         }
         std::snprintf(nm, sizeof nm, "%s/rr-%02llu.txt", dir, (unsigned long long) u.call);
         if (FILE* f = std::fopen(nm, "w")) { std::fputs(u.meta.c_str(), f); std::fclose(f); }
@@ -318,6 +328,7 @@ M4R_API int m4r_upscale_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t 
 
 M4R_API int m4r_denoise_capture(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_desc* d) {
     const char* dir = std::getenv("M4R_DUMP_RR");
+    g_rrCurrent = nullptr;
     if (!dir) return 0;
     writeRrDumps(c, false);
     const char* st = std::getenv("M4R_DUMP_RR_START");
@@ -376,6 +387,7 @@ M4R_API int m4r_denoise_capture(m4r_context* c, VkCommandBuffer cb, const m4r_de
     }
     u.meta = meta;
     g_rrDumps.push_back(std::move(u));
+    g_rrCurrent = &g_rrDumps.back();
     return 0;
 }
 
@@ -404,6 +416,24 @@ static M4 inverse(const M4& m) {   // Gauss-Jordan with partial pivoting; singul
 }
 static void putColumnMajor(uint8_t* dst, const M4& m) {
     for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) { const float f = float(m[r * 4 + c]); std::memcpy(dst + (c * 4 + r) * 4, &f, 4); }
+}
+
+// copies a GENERAL-layout colour image into a host buffer of the current capture (slot 0 denoised, 1 output)
+static void captureOut(m4r_context* c, VkCommandBuffer cb, int slot, VkImage image, uint32_t w, uint32_t h, VkFormat fmt) {
+    RrDump* u = g_rrCurrent;
+    const uint32_t bpp = texelBytes(fmt);
+    if (!u || !bpp || !image) return;
+    if (!c->vk.createBuffer(u->outBuf[slot], size_t(w) * h * bpp, true)) return;
+    u->ow[slot] = w; u->oh[slot] = h; u->obpp[slot] = bpp;
+    char line[128];
+    std::snprintf(line, sizeof line, "%s format %d size %u %u bpp %u\n", kRrOutNames[slot], int(fmt), w, h, bpp);
+    u->meta += line;
+    VkBufferImageCopy r{};
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.imageExtent = {w, h, 1};
+    c->vk.barrier(cb);
+    vkCmdCopyImageToBuffer(cb, image, VK_IMAGE_LAYOUT_GENERAL, u->outBuf[slot].buffer, 1, &r);
+    c->vk.barrier(cb);
 }
 
 M4R_API int m4r_denoise_init(m4r_context* c, uint32_t ow, uint32_t oh, uint32_t iw, uint32_t ih) {
@@ -513,6 +543,7 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     // upscaling: MetalFX's own upscaler on the denoised colour
     Texture* den = p.texture("denoised");
     if (!den) { c->error = "denoiser plan has no 'denoised' texture"; return 1; }
+    captureOut(c, cb, 0, den->image, den->width, den->height, den->format);
     m4r_upscale_desc u{};
     u.color = ownedImage(*den); u.depth = d->depth; u.motion = d->motion; u.exposure = d->exposure; u.output = d->output;
     u.content_width = iw; u.content_height = ih;
@@ -520,7 +551,15 @@ M4R_API int m4r_denoise(m4r_context* c, VkCommandBuffer cb, const m4r_denoise_de
     u.jitter_x = fj * d->jitter_x; u.jitter_y = fj * d->jitter_y;
     u.motion_scale_x = d->motion_scale_x; u.motion_scale_y = d->motion_scale_y;
     u.pre_exposure = d->pre_exposure; u.reset = d->reset; u.depth_reversed = d->depth_reversed;
-    return m4r_upscale(c, cb, &u);
+    const int r = m4r_upscale(c, cb, &u);
+    if (r == 0 && g_rrCurrent) {   // the output (UAV state for the caller) as m4r left it
+        LayoutGuard og{cb};
+        og.add(d->output);
+        og.begin();
+        captureOut(c, cb, 1, d->output.image, d->output.width, d->output.height, d->output.format);
+        og.end();
+    }
+    return r;
 }
 
 M4R_API VkImage m4r_denoise_texture(m4r_context* c, const char* name) {

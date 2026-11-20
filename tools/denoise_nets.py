@@ -76,7 +76,7 @@ def dbf_ref(dat, x):
 class Plan:
     def __init__(self, out):
         self.out = out; self.lines = []; os.makedirs(out + '/blobs', exist_ok=True)
-        self.kernels = set(); self.n = 0
+        self.kernels = set(); self.n = 0; self.wmma = False
 
     def buffer(self, name, size, blob=None):
         if blob is not None:
@@ -106,8 +106,63 @@ class Plan:
         open(self.out + '/plan.txt', 'w').write('\n'.join(decl + rest) + '\n')
 
 
+def pack_wmma_weights(w, k, ci, co):
+    """HWIO fp16 [k][k][ci][co] -> [tap][cin block][cout block][16 cout][16 cin], zero padded to blocks of 16 (nn_conv_wmma.cl)"""
+    cib, cob = (ci + 15) // 16, (co + 15) // 16
+    out = np.zeros((k * k, cib * 16, cob * 16), np.float16)
+    out[:, :ci, :co] = w.reshape(k * k, ci, co)
+    out = out.reshape(k * k, cib, 16, cob, 16).transpose(0, 1, 3, 4, 2)    # tap, cib, cob, cout, cin
+    return np.ascontiguousarray(out).tobytes()
+
+
+def wmma_kernel(p, defs):
+    """builds nn_conv_wmma.cl for one layer (LLVM, clang -x cl) into <p.out>/k and declares it in the plan; returns the kernel name"""
+    import hashlib, tempfile
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+    sys.path.insert(0, root)
+    from air import m4r_air
+    src = os.path.join(root, 'shaders', 'nn_conv_wmma.cl')
+    key = hashlib.sha256((open(src).read() + repr(sorted(defs.items())) + m4r_air.GPU).encode()).hexdigest()[:12]
+    name = 'nn_conv_wmma-' + key
+    if ('k', name) in p.kernels:
+        return name
+    os.makedirs(p.out + '/k', exist_ok=True)
+    base = f'{p.out}/k/{name}'
+    if not os.path.exists(base + '.hsaco'):
+        with tempfile.TemporaryDirectory() as d:
+            ll = d + '/k.ll'
+            subprocess.run(['clang', '-x', 'cl', '-cl-std=CL2.0', '--target=amdgcn-amd-amdhsa', f'-mcpu={m4r_air.GPU}', '-nogpulib', '-O3',
+                            '-S', '-emit-llvm', src, '-o', ll] + [f'-D{k}={v}' for k, v in defs.items()], check=True)
+            text = open(ll).read()
+        m4r_air.compile_ir(text, base + '.hsaco')
+        man = {'kernel': 'nn_conv', 'threadgroup': [32, 1, 1], 'kernarg_size': 64, 'grid_offset': 32, 'samplers': [],
+               'args': [dict(kind='buffer', location=i, offset=8 * i, name=n, access='read' if i != 1 else 'write')
+                        for i, n in enumerate(('src', 'dst', 'weights', 'bias'))]}
+        m4r_air.write_manifest(man, base)
+    p.kernels.add(('k', name)) if isinstance(p.kernels, set) else p.kernels.__setitem__(('k', name), name)
+    p.lines.append(f'kernel {name} k/{name}')
+    return name
+
+
+def wmma_conv_pass(p, dat, L, idx, src, dst, H, W, relu, nt):
+    wo, bo, k, ci, co = L
+    w, b = layer(dat, L)
+    blob = pack_wmma_weights(w, k, ci, co)
+    p.buffer(f'w{idx}', len(blob), blob)
+    p.buffer(f'b{idx}', co * 2, dat[bo:bo + co * 2])
+    name = wmma_kernel(p, dict(W=W, H=H, CIN=ci, COUT=co, K=k, NT=nt, RELU=1 if relu else 0))
+    cob = (co + 15) // 16
+    p.lines.append(f'pass {name} threads {((W + 15) // 16) * 32} {H} {(cob + nt - 1) // nt}')
+    for i, bn in enumerate((src, dst, f'w{idx}', f'b{idx}')):
+        p.lines.append(f'  buf {i} {bn}')
+
+
 def conv_pass(p, dat, L, idx, src, dst, Hin, Win, stride=1, relu=True):
     wo, bo, k, ci, co = L
+    if getattr(p, 'wmma', False) and stride == 1:
+        nt = 1 if Hin * Win < 40000 else min(4, (co + 15) // 16)   # low resolution: spread the channel tiles over waves
+        wmma_conv_pass(p, dat, L, idx, src, dst, Hin, Win, relu, nt)
+        return Hin, Win
     pad = (k - 1) // 2 if stride == 1 else 2
     Ho, Wo = (Hin + 2 * pad - k) // stride + 1, (Win + 2 * pad - k) // stride + 1
     p.buffer(f'w{idx}', k * k * ci * co * 2, dat[wo:wo + k * k * ci * co * 2])
