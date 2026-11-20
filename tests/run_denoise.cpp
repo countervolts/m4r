@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
             if (!plan.record(cb)) { std::fprintf(stderr, "record: %s\n", plan.error.c_str()); rc = 1; break; }
             vk.barrier(cb);
             if (!vk.submit(cb)) { std::fprintf(stderr, "submit: %s\n", vk.error.c_str()); rc = 1; break; }
-            if (Texture* dn = plan.texture("denoised"); dn && plan.texture("v3hist")) {   // stand-in history for the V3 experiment
+            if (Texture* dn = plan.texture("denoised"); dn && plan.texture("v3hist") && !plan.texture("v3out")) {   // stand-in history for the V3 experiment
                 std::vector<uint8_t> tmp(size_t(dn->width) * dn->height * 8);
                 vk.download(*dn, tmp.data(), tmp.size());
                 vk.upload(*plan.texture("v3hist"), tmp.data(), tmp.size());

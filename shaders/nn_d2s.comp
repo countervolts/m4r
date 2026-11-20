@@ -1,5 +1,5 @@
 // m4r: UBFNet's last step: depth-to-space (block 2, channel = c * 4 + sub-pixel row * 2 + sub-pixel column) and sigmoid.
-// args: 0 input [H][W][44] half, 1 output [2H][2W][11] half; consts 8 W, 9 H (input size)
+// args: 0 input [H][W][44] half, 1 output [2H][2W][11] half; consts 8 W, 9 H (input size), 10 sigmoid (1) or raw logits (0)
 // SPDX-License-Identifier: GPL-3.0-only
 #version 460
 #extension GL_EXT_buffer_reference : require
@@ -18,6 +18,6 @@ void main() {
         for (uint i = 0u; i < 2u; ++i)
             for (uint j = 0u; j < 2u; ++j) {
                 const float v = float(src.v[(p.y * W + p.x) * 44u + c * 4u + i * 2u + j]);
-                dst.v[((p.y * 2u + i) * (W * 2u) + p.x * 2u + j) * 11u + c] = float16_t(1.0 / (1.0 + exp(-v)));
+                dst.v[((p.y * 2u + i) * (W * 2u) + p.x * 2u + j) * 11u + c] = float16_t(a.c[2] != 0u ? 1.0 / (1.0 + exp(-v)) : v);
             }
 }

@@ -244,7 +244,7 @@ def ubf_ref(dat, head, x):
     return (1.0 / (1.0 + np.exp(-t))).astype(np.float16)
 
 
-def ubf_net(p, dat, head, H, W, in_name='ubf_in', out_name='ubf_out', pre=''):
+def ubf_net(p, dat, head, H, W, in_name='ubf_in', out_name='ubf_out', pre='', sigmoid=True):
     """appends the UBFNet passes to plan generator p; in_name [H][W][5] f16 (NHWC), out_name [H/2][W/2][11]; H, W multiples of 32.
     Buffers it creates are named pre + <layer>."""
     assert H % 32 == 0 and W % 32 == 0
@@ -283,7 +283,7 @@ def ubf_net(p, dat, head, H, W, in_name='ubf_in', out_name='ubf_out', pre=''):
     conv('head', 'u3c', 'head', h1, w1, L=UBF_HEAD, d=head, act=0)
     if out_name == 'ubf_out':   # standalone plan: declare the output (callers that pass their own buffer declare it)
         p.buffer(out_name, h1 * 2 * w1 * 2 * 11 * 2)
-    p.glsl('nn_d2s', sh + '/nn_d2s.comp'); p.run('nn_d2s', w1, h1, [pre + 'head', out_name], [w1, h1])
+    p.glsl('nn_d2s', sh + '/nn_d2s.comp'); p.run('nn_d2s', w1, h1, [pre + 'head', out_name], [w1, h1, 1 if sigmoid else 0])
     return h1 * 2, w1 * 2
 
 

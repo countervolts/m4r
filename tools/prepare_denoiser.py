@@ -194,7 +194,7 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
             ['tex 0 warp_color', 'tex 1 color', 'tex 4 shin', 'tex 5 denoised', 'tex 6 specular', 'tex 7 diffuse', 'tex 8 roughness',
              'tex 9 dbf_tw', 'buf 10 exp0|exp1', 'buf 11 preexp'])
     if stage >= 'E':
-        v3_ubf(g, iw, ih, W, H, ow, oh)
+        v3_ubf(g, iw, ih, W, H, ow, oh, full=stage >= 'F')
     if runtime:
         # last pass: interim firefly clamp on the denoised colour (m4r copies 'denoised' to den_raw first and den_cl back afterwards)
         g.buffer('den_raw', iw * ih * 8); g.buffer('den_cl', iw * ih * 8)
@@ -204,21 +204,29 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
     return dict(W=W, H=H, tw=tw, th=th)
 
 
-def v3_ubf(g, iw, ih, W, H, ow, oh):
-    """BRNet_v3_Filter::encodePreForDenoise (build_tensors_low_resolution, lowres_signals) and the UBFNet pass, for frames without history
-    (isHistoryInvalid = 1): the UBF input tensor 'ubf_in' [Hn][Wn][5] and its output 'ubf_out' [Hn/2][Wn/2][11]. Bindings from the host code
-    (docs/metalfx-denoiser-passes.txt); history textures stay zero."""
-    Wn, Hn = (iw + 31) & ~31, (ih + 31) & ~31
-    hw, hh = (iw + 1) // 2, (ih + 1) // 2
-    g.texture('crr', 'R16G16B16A16_SFLOAT', iw, ih); g.texture('v3hist', 'R16G16B16A16_SFLOAT', iw, ih)   # v3hist: stand-in history
-    for n in ('fah', 'v3clamp', 'v3blend', 'v3fblend'):   # warp_history_high_resolution works at output size
-        g.texture(n, 'R16G16B16A16_SFLOAT', ow, oh)
-    for n in ('v3ema0', 'v3ema1', 'v3var0', 'v3var1'):
-        g.texture(n, 'R16_SFLOAT', hw, hh)
-    g.texture('v3temporal', 'R16_SFLOAT', iw, ih); g.texture('v3lwv', 'R16_SFLOAT', hw, hh)
-    g.texture('aabbmin', 'R16G16B16A16_SFLOAT', hw, hh); g.texture('aabbmax', 'R16G16B16A16_SFLOAT', hw, hh)
-    g.buffer('v3reset', 16); g.buffer('v3desc', 24)
-    g.buffer('ubf_in', Wn * Hn * 10)
+def v3_sizes(ow, oh):
+    """UBFNet input size (half the output size, rounded up to 32) and its output size"""
+    Wn, Hn = ((ow // 2 + 31) // 32) * 32, ((oh // 2 + 31) // 32) * 32
+    return Wn, Hn, Wn // 2, Hn // 2
+
+
+def v3_ubf(g, iw, ih, W, H, ow, oh, full=False):
+    """BRNet_v3_Filter::encodePreForDenoise (build_tensors_low_resolution, warp_history_high_resolution, lowres_signals), the UBFNet
+    pass and, with full, encodePost (the two output conversions and the anisotropic gaussian filter that writes 'v3out' and the history).
+    Bindings from the host code (docs/metalfx-denoiser-passes.txt, fn_BRN_*.txt); the sample-statistics textures stay zero as in the
+    denoise path (update_sample_statistics is not called there). The network works at half the output size (as BBR's spatial network
+    works at a quarter and its temporal one at half): spatial parameters at Wt x Ht, temporal ones at Wn x Hn."""
+    Wn, Hn, Wt, Ht = v3_sizes(ow, oh)
+    F = 'R16G16B16A16_SFLOAT'
+    g.texture('crr', F, iw, ih)
+    g.texture('v3hist', F, ow, oh)                                      # the previous output (written by the filter below)
+    for n in ('fah', 'v3clamp', 'v3blend', 'v3fblend'):                 # output size
+        g.texture(n, F, ow, oh)
+    for n in ('v3ema0', 'v3ema1', 'v3var0', 'v3var1', 'v3lwv'):         # network-input size
+        g.texture(n, 'R16_SFLOAT', Wn, Hn)
+    g.texture('v3temporal2', F, Wn, Hn); g.texture('aabbmin', F, Wn, Hn); g.texture('aabbmax', F, Wn, Hn)
+    g.texture('v3spatial', F, Wt, Ht); g.texture('v3sema', 'R16_SFLOAT', 16, 16)
+    g.buffer('v3reset', 16); g.buffer('v3desc', 24); g.buffer('v3bd', 8); g.buffer('ubf_in', Wn * Hn * 10)
     g.run_k('brnetv3_build_tensors_low_resolution', {'bfnet1_enabled': True, 'full_resolution_flow': False, 'jittered_motion_vectors': False},
             (8, 8, 1), (iw + 2, ih + 2, 1),
             ['tex 0 denoised', 'tex 1 int_depth', 'tex 2 int_motion', 'tex 3 crr', 'tex 4 flowd', 'bytes 0 ' + struct.pack('<f', 1.0).hex(),
@@ -231,12 +239,27 @@ def v3_ubf(g, iw, ih, W, H, ow, oh):
                                       'bfnet1_enabled': True, 'big_epsilon_and_default_scales_enabled': False, 'new_overshoot_clamp': False},
             (8, 8, 1), (Wn, Hn, 1),
             ['tex 0 crr', 'tex 1 fah', 'tex 2 flowd', 'tex 3 v3hist', 'tex 4 v3ema0|v3ema1', 'tex 5 v3var0|v3var1',
-             'tex 6 v3ema1|v3ema0', 'tex 7 v3var1|v3var0', 'tex 8 v3temporal', 'tex 9 v3lwv', 'tex 15 aabbmin', 'tex 16 aabbmax',
+             'tex 6 v3ema1|v3ema0', 'tex 7 v3var1|v3var0', 'tex 8 v3temporal2', 'tex 9 v3lwv', 'tex 15 aabbmin', 'tex 16 aabbmax',
              'tex 17 normals', 'tex 18 diffuse', 'tex 19 roughness', 'tex 20 specular',
              'buf 0 v3desc', 'buf 1 bparams', 'buf 2 ubf_in', 'buf 3 exp0|exp1', 'buf 4 exp1|exp0', 'buf 5 v3reset',
-             'bytes 6 ' + struct.pack('<2H', Wn // 2, Hn // 2).hex()])
+             'bytes 6 ' + struct.pack('<2H', ow // 2, oh // 2).hex()])
     import denoise_nets as dn
-    dn.ubf_net(g, g.dat['ubf'], dn.ubf_head_blob(g.res), Hn, Wn, 'ubf_in', 'ubf_out', pre='ubf_')
+    # sigmoid in the network: with bfnet1_enabled the conversion kernels copy the values (the fp16 + sigmoid branch is for bfnet1 off)
+    dn.ubf_net(g, g.dat['ubf'], dn.ubf_head_blob(g.res), Hn, Wn, 'ubf_in', 'ubf_out', pre='ubf_', sigmoid=True)
+    if not full:
+        return
+    fc = {'quantized': False, 'is_tensor_layout_nchw': False, 'bfnet1_enabled': True}
+    g.run_k('brnetv3_output_spatial_lr', fc, (8, 8, 1), (Wt, Ht, 1), ['tex 0 v3spatial', 'buf 0 ubf_out', 'buf 1 v3bd'])
+    g.run_k('brnetv3_output_temporal', fc, (8, 8, 1), (Wn, Hn, 1), ['tex 0 v3temporal2', 'buf 0 ubf_out', 'buf 1 v3bd'])
+    g.texture('v3out', F, ow, oh)
+    g.run_k('brnetv3_anisotropic_gaussian_filter',
+            {'quantized': False, 'reactive_mask_enabled': False, 'bfnet1_enabled': True, 'line_locking_enabled': False,
+             'exposure_viz_enabled': False, 'big_epsilon_and_default_scales_enabled': False, 'stlanczos_enabled': False,
+             'new_overshoot_clamp': False}, (8, 8, 1), (ow, oh, 1),
+            ['tex 0 crr', 'tex 1 fah', 'tex 3 v3out', 'tex 4 v3hist', 'tex 5 flowdiff', 'tex 6 v3lwv', 'tex 7 flowd', 'tex 10 v3clamp',
+             'tex 11 v3spatial', 'tex 12 v3temporal2', 'tex 13 aabbmin', 'tex 14 aabbmax', 'tex 15 v3sema', 'tex 16 v3sema',
+             'tex 19 v3fblend', 'tex 20 v3blend', 'buf 0 bparams', 'bytes 1 ' + struct.pack('<2f', iw / ow, ih / oh).hex(),
+             'buf 2 v3reset', 'buf 3 preexp', 'buf 4 exp0|exp1'])
 
 
 def mat(v):
@@ -267,14 +290,14 @@ def frame_buffers(cap, fid, t, sz, iw, ih, prev):
             struct.pack('<4f', 1.0 / sz['W'], 1.0 / sz['H'], sz['W'] / ms[0], sz['H'] / ms[1]))
     out_params = struct.pack('<6fiHHB', 0, 0, 0, 0, 0, 0, 14, sz['th'], sz['tw'], 1 if t == 0 else 0).ljust(40, b'\0')
     ow, oh = (int(meta['output'][0]), int(meta['output'][1])) if 'output' in meta else (iw * 3, ih * 3)
-    Wn, Hn = (iw + 31) & ~31, (ih + 31) & ~31
+    Wn, Hn, Wt, Ht = v3_sizes(ow, oh)
     # BRNetShaderParams (144 B): contentSize, maxInputSize, outputSize, five offsets (zero), jitter, motionScale, outputResMotionMultiplier,
     # normalizeMotionScale, tensor strides (zero)
     bsp = (struct.pack('<6H', iw, ih, iw, ih, ow, oh) + bytes(20) +
            struct.pack('<8f', jitter[0], jitter[1], ms[0], ms[1], iw / ow, ih / oh, ms[0] / iw, ms[1] / ih)).ljust(144, b'\0')
     # brnet_v3_build_tensors_t (24 B): motionScale * outputSize, jitter, tensor row bytes (5 halves), height, width
     v3d = struct.pack('<ffffiHH', ms[0] * ow, ms[1] * oh, jitter[0], jitter[1], 10, Hn, Wn)
-    bufs = {'bparams': bsp, 'v3desc': v3d, 'v3reset': (b'\x01' if t == 0 else b'\x00').ljust(16, b'\0'), 'npix': struct.pack('<I', iw * ih),
+    bufs = {'bparams': bsp, 'v3desc': v3d, 'v3bd': struct.pack('<iHH', 22, Ht, Wt), 'v3reset': (b'\x01' if t == 0 else b'\x00').ljust(16, b'\0'), 'npix': struct.pack('<I', iw * ih),
             'dbf_params_out': out_params, 'rw_ms': struct.pack('<2f', *ms), 'rw_pj': struct.pack('<2f', *pj),
             'rw_cj': struct.pack('<2f', *jitter), 'dbf_params': dbf, 'refl_params': refl, 'preexp': struct.pack('<f', f('preexposure')),
             'reset': struct.pack('<B', 1 if t == 0 else 0).ljust(16, b'\0')}
