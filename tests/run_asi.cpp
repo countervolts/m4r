@@ -26,10 +26,14 @@ static OptiGetProcFn g_getProc[8] = {};
 
 static bool registerProvider(OptiPlugin*, const char* name, OptiProviderKind kind, OptiGetProcFn getProc, void*) {
     std::printf("provider: %s (kind %d)\n", name, int(kind));
-    if (unsigned(kind) < 8) g_getProc[kind] = getProc;
+    const char* want = std::getenv("RUN_ASI_PROVIDER");   // a plugin with several backends (all4r.asi): the provider to test
+    if (unsigned(kind) < 8 && (!want || !std::strcmp(want, name) || (std::string(want) + " FG") == name)) g_getProc[kind] = getProc;
     return true;
 }
-static void logFn(OptiPlugin*, OptiLogLevel, const char* m) { std::printf("[m4r] %s\n", m); }
+static void logFn(OptiPlugin*, OptiLogLevel, const char* m) { std::printf("[plugin] %s\n", m); }
+static bool registerTab(OptiPlugin*, const char* name, const char*, OptiDrawTabFn, void*) { std::printf("tab: %s\n", name); return true; }
+static bool getString(OptiPlugin*, const char*, char* buf, size_t n, const char* def) { std::snprintf(buf, n, "%s", def); return false; }
+static bool getBool(OptiPlugin*, const char*, bool def) { return def; }
 
 static std::vector<uint8_t> readAll(const std::string& p) {
     std::ifstream f(p, std::ios::binary);
@@ -311,7 +315,7 @@ int main(int argc, char** argv) {
     if (!init) { std::fprintf(stderr, "no OptiPluginInit\n"); return 1; }
     OptiPluginApi api{};
     api.size = sizeof api; api.version = OPTI_PLUGIN_API_VERSION;
-    api.Log = &logFn; api.RegisterProvider = &registerProvider;
+    api.Log = &logFn; api.RegisterProvider = &registerProvider; api.RegisterTab = &registerTab; api.GetString = &getString; api.GetBool = &getBool;
     if (!init(&api, reinterpret_cast<OptiPlugin*>(&api))) { std::fprintf(stderr, "OptiPluginInit failed\n"); return 1; }
     Ffx ffx{};
     const OptiProviderKind kind = mode == "fg" ? OptiProvider_FfxFg : OptiProvider_Ffx;

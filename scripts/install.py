@@ -40,8 +40,25 @@ def need(tool):
 
 
 def detect_gpu():
-    """LLVM target of this machine's AMD GPU from amdgpu's KFD topology (gfx_target_version 110001 -> gfx1101); the first
-    GPU node if there are several (pass --gpu to choose)."""
+    """LLVM target of this machine's AMD GPU: on Windows from AMD's HIP runtime (part of the Adrenalin driver), otherwise from
+    amdgpu's KFD topology (gfx_target_version 110001 -> gfx1101); the first GPU if there are several (pass --gpu to choose)."""
+    if os.name == 'nt':
+        import ctypes
+        for dll in ('amdhip64_7.dll', 'amdhip64_6.dll'):
+            try:
+                hip = ctypes.WinDLL(dll)
+            except OSError:
+                continue
+            n = ctypes.c_int(0)
+            if hip.hipInit(0) or hip.hipGetDeviceCount(ctypes.byref(n)) or n.value < 1:
+                return []
+            found = []
+            for i in range(n.value):
+                props = ctypes.create_string_buffer(1472 + 1024)   # hipDeviceProp_tR0600; gcnArchName at 1160 (as runtime/hipvk)
+                if not hip.hipGetDevicePropertiesR0600(props, i):
+                    found.append(props.raw[1160:1416].split(b'\0')[0].decode().split(':')[0])
+            return found
+        return []
     import glob
     found = []
     for p in sorted(glob.glob('/sys/class/kfd/kfd/topology/nodes/*/properties')):
@@ -85,12 +102,14 @@ def main():
         sys.exit('pass --game or --plans')
     if not a.plans and not os.path.isfile(a.m4r_dll):
         sys.exit(f'{a.m4r_dll} not found (build it with: cmake --build build-win, or pass --m4r-dll)')
-    for t in ('llvm-as', 'llvm-dis', 'opt', 'llc', 'ld.lld', 'llvm-nm', 'llvm-objdump'):
+    native = os.name == 'nt'   # native Windows: kernels for HIP (code objects; air/m4r_air.py builds with clang when there is no llc)
+    for t in ('llvm-as', 'llvm-dis', 'opt', 'clang' if native else 'llc', 'ld.lld', 'llvm-nm', 'llvm-objdump'):
         need(t)
-    if not os.path.isfile(os.path.join(ROOT, 'shaders', 'sacneh.spv')):   # a release ships it compiled
+    if not native and not os.path.isfile(os.path.join(ROOT, 'shaders', 'sacneh.spv')):   # a release ships it compiled
         need('glslangValidator')
-    llc = subprocess.run(['llc', '--version'], capture_output=True, text=True).stdout
-    major = next((int(w.split('.')[0]) for l in llc.split('\n') if 'LLVM version' in l for w in l.split() if w[:1].isdigit()), 0)
+    llc = subprocess.run(['clang' if native else 'llc', '--version'], capture_output=True, text=True).stdout
+    major = next((int(w.split('.')[0]) for l in llc.split('\n') if ('LLVM version' in l or 'clang version' in l)
+                  for w in l.split() if w[:1].isdigit()), 0)
     if major < 23:
         sys.exit(f'LLVM {major or "?"} found; m4r needs LLVM 23 or newer (it reads Apple\'s bitcode)')
 
@@ -122,6 +141,10 @@ def main():
 
     plans_dir = a.plans or os.path.join(a.game, 'm4r', 'plans')
     os.makedirs(plans_dir, exist_ok=True)
+    if native:   # hipvk's format-converting blit, next to the plans (runtime/hipvk/hipvk.h)
+        sys.path.insert(0, ROOT)
+        from air import m4r_air
+        m4r_air.compile_cl(os.path.join(ROOT, 'runtime', 'hipvk', 'hipvk_blit.cl'), os.path.join(plans_dir, 'hipvk_blit.hsaco'), mcpu=a.gpu)
     if not a.plans:
         shutil.copyfile(a.m4r_dll, os.path.join(a.game, 'm4r', 'm4r.dll'))
 
@@ -150,11 +173,17 @@ def main():
         out = os.path.join(plans_dir, name)
         if os.path.exists(os.path.join(out, 'plan.txt')) and not a.force:
             return name, 'kept'
-        if a.force and os.path.isdir(os.path.join(out, 'k')):
-            shutil.rmtree(os.path.join(out, 'k'))   # kernels of an older translator
-        r = subprocess.run(cmd + ['--out', out] + (['--force'] if a.force else []), capture_output=True, text=True)
+        # built in <name>.part and moved into place when complete: an interrupted or failed build never looks finished
+        part = out + '.part'
+        if os.path.isdir(part):
+            shutil.rmtree(part)
+        r = subprocess.run(cmd + ['--out', part, '--force'], capture_output=True, text=True)
         if r.returncode:
+            shutil.rmtree(part, ignore_errors=True)
             return name, 'FAILED\n' + (r.stderr or r.stdout)[-2000:]
+        if os.path.isdir(out):
+            shutil.rmtree(out)
+        os.replace(part, out)
         return name, 'done'
 
     failed = 0

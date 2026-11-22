@@ -95,7 +95,8 @@ def llc_command(args):
         elif a == '-filetype=obj': obj = True
         elif a.startswith('-'): flags.append(a)
         else: rest.append(a)
-    cmd = ['clang', f'--target={triple}', f'-mcpu={cpu}', olevel, '-Xclang', '-disable-llvm-optzns', '-c' if obj else '-S', '-x', 'ir']
+    # -nogpulib: no ROCm device library is linked (llc links none either; an installer's trimmed LLVM has none to find)
+    cmd = ['clang', f'--target={triple}', f'-mcpu={cpu}', olevel, '-nogpulib', '-Xclang', '-disable-llvm-optzns', '-c' if obj else '-S', '-x', 'ir']
     for f in feats: cmd += ['-Xclang', '-target-feature', '-Xclang', f]
     for f in flags: cmd += ['-mllvm', f]
     return cmd + rest + ['-o', out]

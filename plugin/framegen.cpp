@@ -38,7 +38,8 @@ bool loadAmd() {
     GetModuleFileNameA(nullptr, exe, MAX_PATH);
     std::string gameDir = exe;
     gameDir = gameDir.substr(0, gameDir.find_last_of('\\'));
-    for (const std::string& dir : {optiDir, pluginDir, gameDir})
+    // OptiScaler v10 keeps its dependencies in <game>\OptiScaler (OptiDllPath)
+    for (const std::string& dir : {optiDir, pluginDir, gameDir, gameDir + "\\OptiScaler", optiDir.substr(0, optiDir.find_last_of('\\')) + "\\OptiScaler"})
         for (const char* name : {"amd_fidelityfx_framegeneration_dx12.dll", "amd_fidelityfx_dx12.dll", "amd_fidelityfx_loader_dx12.dll"}) {
             const std::string path = dir + "\\" + name;
             if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
