@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "hipvk.h"
 #include "hip_dyn.h"
-#include "../vkfn.h"
+#include "hipvk_table.h"   // the project's Vulkan function table, which install() fills
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -155,6 +155,8 @@ bool formatInfo(VkFormat f, FormatInfo& fi) {
     case VK_FORMAT_R16G16_UNORM: fi = {4, d(16, 16, 0, 0, U), N, false}; return true;
     case VK_FORMAT_R16G16_SNORM: fi = {4, d(16, 16, 0, 0, S), N, false}; return true;
     case VK_FORMAT_R16G16_UINT: fi = {4, d(16, 16, 0, 0, U), E, false}; return true;
+    case VK_FORMAT_R16G16_SINT: fi = {4, d(16, 16, 0, 0, S), E, false}; return true;
+    case VK_FORMAT_R16G16B16A16_SINT: fi = {8, d(16, 16, 16, 16, S), E, false}; return true;
     case VK_FORMAT_R16G16B16A16_SFLOAT: fi = {8, d(16, 16, 16, 16, F), E, false}; return true;
     case VK_FORMAT_R16G16B16A16_UNORM: fi = {8, d(16, 16, 16, 16, U), N, false}; return true;
     case VK_FORMAT_R16G16B16A16_UINT: fi = {8, d(16, 16, 16, 16, U), E, false}; return true;
@@ -213,11 +215,14 @@ struct Pipeline {
 };
 
 struct Cmd {
-    enum Kind { Dispatch, Barrier, CopyBI, CopyIB, CopyII, Clear, Blit, Timestamp, ResetQuery } kind;
+    enum Kind { Dispatch, Barrier, CopyBI, CopyIB, CopyII, Clear, Blit, Timestamp, ResetQuery, Fill, Update, CopyBB } kind;
     Pipeline* pipe = nullptr;
     uint64_t push = 0;
     uint32_t n[3] = {};
-    Buffer* buf = nullptr;
+    Buffer *buf = nullptr, *buf2 = nullptr;   // Fill / Update / CopyBB: buf is the destination, buf2 the copy's source
+    uint64_t offset = 0, srcOffset = 0, size = 0;
+    uint32_t value = 0;
+    std::vector<uint8_t> bytes;                // Update's data
     Image *src = nullptr, *dst = nullptr;
     VkBufferImageCopy bic{};
     VkImageCopy ic{};
@@ -343,6 +348,29 @@ bool replay(CommandBuffer* cb) {
                 if (!ok(H->hipExtModuleLaunchKernel(g_blitFn, (w + 7) / 8 * 8, (h + 7) / 8 * 8, 1, 8, 8, 1, 0, g_stream, nullptr, cfg, nullptr, nullptr, 0),
                         "blit")) return false;
             }
+            ordered = true;
+            break;
+        }
+        case Cmd::Fill: {
+            if (!ok(H->hipMemsetD32Async(c.buf->dev() + c.offset, int(c.value), size_t(c.size / 4), g_stream), "fill")) return false;
+            ordered = true;
+            break;
+        }
+        case Cmd::Update: {
+            size_t off = 0;
+            uint8_t* s = g_staging.alloc(c.bytes.size(), off);
+            if (!s) return false;
+            std::memcpy(s, c.bytes.data(), c.bytes.size());
+            if (!ok(H->hipMemcpyAsync(c.buf->dev() + c.offset, s, c.bytes.size(), hipMemcpyHostToDevice, g_stream), "update")) return false;
+            g_staging.close(off, off + c.bytes.size());
+            ordered = true;
+            break;
+        }
+        case Cmd::CopyBB: {
+            uint8_t* d = c.buf->dev() + c.offset;
+            if (!ok(H->hipMemcpyAsync(d, c.buf2->dev() + c.srcOffset, size_t(c.size), hipMemcpyDeviceToDevice, g_stream), "buffer copy")) return false;
+            if (c.buf->mem->shadow)   // a readback: the CPU sees it after the fence
+                H->hipMemcpyAsync(c.buf->mem->shadow + c.buf->offset + c.offset, d, size_t(c.size), hipMemcpyDeviceToHost, g_stream);
             ordered = true;
             break;
         }
@@ -472,6 +500,7 @@ VKAPI_ATTR VkResult VKAPI_CALL MapMemory(VkDevice, VkDeviceMemory h, VkDeviceSiz
     *out = m->shadow + off;
     return VK_SUCCESS;
 }
+VKAPI_ATTR void VKAPI_CALL UnmapMemory(VkDevice, VkDeviceMemory) {}   // the host copy stays: writes are picked up at the next submission
 
 VKAPI_ATTR VkResult VKAPI_CALL CreateBuffer(VkDevice, const VkBufferCreateInfo* ci, const VkAllocationCallbacks*, VkBuffer* out) {
     auto* b = new Buffer; b->size = size_t(ci->size); *out = handle<VkBuffer>(b); return VK_SUCCESS;
@@ -641,6 +670,23 @@ VKAPI_ATTR void VKAPI_CALL CmdBlitImage(VkCommandBuffer cb, VkImage s, VkImageLa
     Cmd c{Cmd::Blit}; c.src = obj<Image>(uint64_t(s)); c.dst = obj<Image>(uint64_t(d));   // m4r blits whole images of equal size
     cbOf(cb)->cmds.push_back(c);
 }
+VKAPI_ATTR void VKAPI_CALL CmdFillBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, VkDeviceSize size, uint32_t value) {
+    Cmd c{Cmd::Fill}; c.buf = obj<Buffer>(uint64_t(b)); c.offset = off; c.value = value;
+    c.size = size == VK_WHOLE_SIZE ? (c.buf->size - off) & ~VkDeviceSize(3) : size;
+    cbOf(cb)->cmds.push_back(c);
+}
+VKAPI_ATTR void VKAPI_CALL CmdUpdateBuffer(VkCommandBuffer cb, VkBuffer b, VkDeviceSize off, VkDeviceSize size, const void* data) {
+    Cmd c{Cmd::Update}; c.buf = obj<Buffer>(uint64_t(b)); c.offset = off;
+    c.bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
+    cbOf(cb)->cmds.push_back(std::move(c));
+}
+VKAPI_ATTR void VKAPI_CALL CmdCopyBuffer(VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n, const VkBufferCopy* r) {
+    for (uint32_t i = 0; i < n; ++i) {
+        Cmd c{Cmd::CopyBB}; c.buf = obj<Buffer>(uint64_t(d)); c.buf2 = obj<Buffer>(uint64_t(s));
+        c.offset = r[i].dstOffset; c.srcOffset = r[i].srcOffset; c.size = r[i].size;
+        cbOf(cb)->cmds.push_back(c);
+    }
+}
 
 uint16_t toHalf(float f) {
     uint32_t x; std::memcpy(&x, &f, 4);
@@ -762,13 +808,13 @@ PFN_vkVoidFunction lookup(const char* name) {
 #define E(f) {"vk" #f, reinterpret_cast<PFN_vkVoidFunction>(&f)}
         E(CreateInstance), E(DestroyInstance), E(EnumeratePhysicalDevices), E(GetPhysicalDeviceFormatProperties), E(GetPhysicalDeviceMemoryProperties),
         E(GetPhysicalDeviceProperties), E(GetPhysicalDeviceProperties2), E(GetPhysicalDeviceQueueFamilyProperties), E(CreateDevice), E(DestroyDevice),
-        E(GetDeviceQueue), E(DeviceWaitIdle), E(AllocateMemory), E(FreeMemory), E(MapMemory), E(CreateBuffer), E(DestroyBuffer),
+        E(GetDeviceQueue), E(DeviceWaitIdle), E(AllocateMemory), E(FreeMemory), E(MapMemory), E(UnmapMemory), E(CreateBuffer), E(DestroyBuffer),
         E(GetBufferMemoryRequirements), E(BindBufferMemory), E(GetBufferDeviceAddress), E(CreateImage), E(DestroyImage), E(GetImageMemoryRequirements),
         E(BindImageMemory), E(CreateImageView), E(DestroyImageView), E(CreateSampler), E(DestroySampler), E(GetDescriptorEXT), E(CreatePipelineLayout),
         E(DestroyPipelineLayout), E(CreateShaderModule), E(DestroyShaderModule), E(CreateComputePipelines), E(DestroyPipeline), E(CreateCommandPool),
         E(DestroyCommandPool), E(AllocateCommandBuffers), E(FreeCommandBuffers), E(BeginCommandBuffer), E(EndCommandBuffer), E(CmdBindPipeline),
         E(CmdPushConstants), E(CmdDispatch), E(CmdDispatchBase), E(CmdPipelineBarrier), E(CmdCopyBufferToImage), E(CmdCopyImageToBuffer), E(CmdCopyImage),
-        E(CmdBlitImage), E(CmdClearColorImage), E(CreateQueryPool), E(DestroyQueryPool), E(CmdResetQueryPool), E(CmdWriteTimestamp),
+        E(CmdBlitImage), E(CmdClearColorImage), E(CmdFillBuffer), E(CmdUpdateBuffer), E(CmdCopyBuffer), E(CreateQueryPool), E(DestroyQueryPool), E(CmdResetQueryPool), E(CmdWriteTimestamp),
         E(GetQueryPoolResults), E(CreateFence), E(DestroyFence), E(WaitForFences), E(QueueSubmit), E(GetDeviceProcAddr), E(GetInstanceProcAddr),
 #undef E
     };
@@ -798,15 +844,20 @@ bool install(std::string& why) {
     H->hipEventCreateWithFlags(&g_submitEnd, 0);
     g_timed = true;
 #define SET(f) f = reinterpret_cast<PFN_##f>(lookup(#f));
-    SET(vkCreateInstance)
-    M4R_VK_INSTANCE_FUNCS(SET)
-    M4R_VK_DEVICE_FUNCS(SET)
+    HIPVK_TABLE(SET)
 #undef SET
     g_installed = true;
     return true;
 }
 
 bool installed() { return g_installed; }
+PFN_vkVoidFunction procAddr(const char* name) { return lookup(name); }
+bool imageViewSize(VkImageView view, uint32_t& w, uint32_t& h) {
+    const View* v = obj<View>(uint64_t(view));
+    if (!v || !v->image) return false;
+    w = v->image->w; h = v->image->h;
+    return true;
+}
 std::string gpuTarget() { return g_arch; }
 void setKernelDir(const std::string& dir) { g_kernelDir = dir; g_blitTried = false; }
 

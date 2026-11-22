@@ -27,6 +27,10 @@ namespace hipvk {
 // Loads HIP and fills m4r's Vulkan function table (vkfn.h). Idempotent. False: *why says why (no HIP runtime, no AMD GPU).
 bool install(std::string& why);
 bool installed();
+// Any hipvk entry point by name (also those outside the project's table, e.g. vkGetDescriptorEXT); null if hipvk has none.
+PFN_vkVoidFunction procAddr(const char* name);
+// The size of the image a view shows (for kernels that ask for it, e.g. GLSL textureSize). False for an unknown view.
+bool imageViewSize(VkImageView view, uint32_t& w, uint32_t& h);
 // "gfx1101" for the HIP device (install() first).
 std::string gpuTarget();
 // <dir>/hipvk_blit.hsaco: the format-converting blit kernel for this GPU (built by install.py next to the plans). Without it only
