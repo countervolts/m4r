@@ -4,7 +4,7 @@ usage: compare_fg.py <plan dir> <fixture dir> <frames> <ow> <oh>"""
 import sys
 import numpy as np
 from PIL import Image
-sys.path.insert(0, __file__.rsplit('/', 1)[0])
+sys.path.insert(0, __import__("os").path.dirname(__file__))
 from compare import srgb, psnr  # noqa: E402
 
 d, fx, n, ow, oh = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])

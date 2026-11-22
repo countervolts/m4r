@@ -89,8 +89,14 @@ class Plan:
 
     def glsl(self, name, src, lx=8, ly=8):
         if name not in self.kernels:
-            subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', src, '-o', f'{self.out}/{name}.spv'], check=True,
-                           capture_output=True)
+            from air import m4r_air
+            if m4r_air.HIP_PORTS and not shutil.which('glslangValidator'):
+                open(f'{self.out}/{name}.spv', 'wb').close()
+            else:
+                subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', src, '-o', f'{self.out}/{name}.spv'], check=True,
+                               capture_output=True)
+            if m4r_air.HIP_PORTS:
+                m4r_air.glsl_port(f'{self.out}/{name}.spv', src)
             shutil.copy(src, self.out + '/')
             self.lines.append(f'glsl {name} {name}.spv {lx} {ly} 1')
             self.kernels.add(name)

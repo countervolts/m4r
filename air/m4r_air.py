@@ -1028,13 +1028,15 @@ def compile_cl(src, out_path, mcpu=None, defs=None):
         run(['ld.lld', '-shared', obj, '-o', out_path])
 
 
-def glsl_port(spv_path):
-    """builds the OpenCL port of the GLSL pass compiled to spv_path (shaders/<name>.cl, same name as the .spv) next to it"""
+def glsl_port(spv_path, comp=None):
+    """builds the OpenCL port of a GLSL pass (comp: its .comp source, default shaders/<name of the .spv>.comp; the port is the .cl
+    beside it) as <spv without .spv>.hsaco, with its kernel named like the .spv (the runtime looks it up by that name)"""
     name = os.path.splitext(os.path.basename(spv_path))[0]
-    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'shaders', name + '.cl')
+    comp = comp or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'shaders', name + '.comp')
+    src = os.path.splitext(comp)[0] + '.cl'
     if not os.path.isfile(src):
-        raise RuntimeError(f'{name}: no OpenCL port (shaders/{name}.cl) for HIP')
-    compile_cl(src, os.path.splitext(spv_path)[0] + '.hsaco')
+        raise RuntimeError(f'{name}: no OpenCL port ({src}) for HIP')
+    compile_cl(src, os.path.splitext(spv_path)[0] + '.hsaco', defs={'KNAME': name})
 
 
 def write_manifest(man, base):
