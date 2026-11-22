@@ -178,6 +178,50 @@ def ffract(b, s):
     return intr(b, t, f'llvm.minnum.{ivsuffix(t)}', [(t, d), (t, splat(t, one_minus))])
 
 
+def _raw_f32(b, t, name, x):
+    """The raw hardware instruction (v_exp_f32 / v_log_f32 / v_sqrt_f32) on f32 or each lane of a float vector, without LLVM's range and
+    denormal handling. Metal's fast:: functions are defined on the raw instruction; the strict llvm.exp2/log2/sqrt expand into compares,
+    scales and ldexp around it."""
+    n, e = vec(t)
+    if n == 1:
+        return intr(b, 'float', f'llvm.amdgcn.{name}', [('float', x)])
+    out = f'poison'
+    for i in range(n):
+        v = b.v(f'extractelement {t} {x}, i32 {i}')
+        r = intr(b, 'float', f'llvm.amdgcn.{name}', [('float', v)])
+        out = b.v(f'insertelement {t} {out}, float {r}, i32 {i}')
+    return out
+
+
+def fast_raw(which):
+    """Plan-time switch M4R_FAST_MATH=<list of exp,log,sqrt,pow>, or 1 for all: that fast_ function on the raw hardware instruction."""
+    v = os.environ.get('M4R_FAST_MATH', '')
+    return v == '1' or which in v.split(',')
+
+
+def fast_exp(b, s):
+    t = s.ret
+    if not fast_raw('exp') or vec(t)[1] != 'float':
+        return unary_llvm('exp')(b, s)
+    m = b.v(f'fmul {FAST} {t} %a0, {splat(t, "0x3FF7154760000000")}')            # x * log2(e)
+    return _raw_f32(b, t, 'exp2.f32', m)
+
+
+def fast_log(b, s):
+    t = s.ret
+    if not fast_raw('log') or vec(t)[1] != 'float':
+        return unary_llvm('log')(b, s)
+    l = _raw_f32(b, t, 'log.f32', '%a0')
+    return b.v(f'fmul {FAST} {t} {l}, {splat(t, "0x3FE62E4300000000")}')         # * ln(2)
+
+
+def fast_sqrt(b, s):
+    t = s.ret
+    if not fast_raw('sqrt') or vec(t)[1] != 'float':
+        return unary_llvm('sqrt')(b, s)
+    return _raw_f32(b, t, 'sqrt.f32', '%a0')
+
+
 def fpow(b, s):
     # Metal pow/powr with fast math: exp2(y * log2(x)). pow (not powr) accepts a negative x with an integer y
     # (reproject_warp squares a signed difference with fast_pow(d, 2)), so the sign is split off and restored for odd y.
@@ -185,9 +229,10 @@ def fpow(b, s):
     sfx = ivsuffix(t)
     pr = s.name.endswith('powr.' + t) or '.powr.' in s.name
     base = '%a0' if pr else intr(b, t, f'llvm.fabs.{sfx}', [(t, '%a0')])
-    l = intr(b, t, f'llvm.log2.{sfx}', [(t, base)])
+    raw = fast_raw('pow') and vec(t)[1] == 'float'
+    l = _raw_f32(b, t, 'log.f32', base) if raw else intr(b, t, f'llvm.log2.{sfx}', [(t, base)])
     m = b.v(f'fmul {FAST} {t} {l}, %a1')
-    e = intr(b, t, f'llvm.exp2.{sfx}', [(t, m)])
+    e = _raw_f32(b, t, 'exp2.f32', m) if raw else intr(b, t, f'llvm.exp2.{sfx}', [(t, m)])
     if pr:
         return e
     n, el = vec(t)
@@ -506,6 +551,13 @@ def struct_first(rt):
     return rt[1:rt.index(',')].strip()
 
 
+def cpol_of(s):
+    """cache-policy immediate of a texture access renamed by m4r_air (M4R_CPOL experiments): name suffix .cpol<bits>, gfx11 bits 1 glc,
+    2 slc (L2 stream), 4 dlc (Infinity Cache / MALL no-allocate); 0 otherwise"""
+    m = re.search(r'\.cpol(\d+)$', s.name)
+    return m.group(1) if m else '0'
+
+
 def read_tex(b, s):
     vt = struct_first(s.ret)
     array = 'texture_2d_array' in s.name
@@ -519,7 +571,7 @@ def read_tex(b, s):
         xs = coords_i32(b, s.params[2], '%a2')
         args = [('i32', '15'), ('i32', xs[0]), ('i32', xs[1])]
         name = 'llvm.amdgcn.image.load.2d.{s}.i32'
-    v = img_call(b, vt, name, args + [('<8 x i32>', d), ('i32', '0'), ('i32', '0')])
+    v = img_call(b, vt, name, args + [('<8 x i32>', d), ('i32', '0'), ('i32', cpol_of(s))])
     r = b.v(f'insertvalue {s.ret} poison, {vt} {v}, 0')
     return b.v(f'insertvalue {s.ret} {r}, i8 1, 1')
 
@@ -557,7 +609,7 @@ def sample_tex(b, s):
     off = pack_offset(b, off_t, off_v)
     v = img_call(b, vt, 'llvm.amdgcn.image.sample.lz.o.{dim}.{s}.f32'.replace('{dim}', dim),
              [('i32', '15'), ('i32', off)] + coords +
-             [('<8 x i32>', d), ('<4 x i32>', smp), ('i1', 'false'), ('i32', '0'), ('i32', '0')])
+             [('<8 x i32>', d), ('<4 x i32>', smp), ('i1', 'false'), ('i32', '0'), ('i32', cpol_of(s))])
     r = b.v(f'insertvalue {s.ret} poison, {vt} {v}, 0')
     return b.v(f'insertvalue {s.ret} {r}, i8 1, 1')
 
@@ -654,7 +706,7 @@ def write_tex(b, s):
         vv = b.v(f'bitcast {vt} {vv} to {ft}')
         vt = ft
     intr(b, 'void', f'llvm.amdgcn.image.store.{dim}.{ivsuffix(vt)}.i32',
-         [(vt, vv), ('i32', '15')] + cargs + [('<8 x i32>', d), ('i32', '0'), ('i32', '0')])
+         [(vt, vv), ('i32', '15')] + cargs + [('<8 x i32>', d), ('i32', '0'), ('i32', cpol_of(s))])
     return None
 
 
@@ -761,11 +813,14 @@ TABLE = [
     (r'air\.(fast_)?fabs\.', unary_llvm('fabs')),
     (r'air\.(fast_)?floor\.', unary_llvm('floor')),
     (r'air\.(fast_)?ceil\.', unary_llvm('ceil')),
+    (r'air\.fast_sqrt\.', fast_sqrt),
     (r'air\.(fast_)?sqrt\.', unary_llvm('sqrt')),
     (r'air\.(fast_)?rint\.', unary_llvm('rint')),
     (r'air\.(fast_)?round\.', unary_llvm('round')),
+    (r'air\.fast_exp\.', fast_exp),
     (r'air\.(fast_)?exp\.', unary_llvm('exp')),
     (r'air\.(fast_)?exp2\.', unary_llvm('exp2')),
+    (r'air\.fast_log\.', fast_log),
     (r'air\.(fast_)?log\.', unary_llvm('log')),
     (r'air\.(fast_)?log2\.', unary_llvm('log2')),
     (r'air\.(fast_)?rsqrt\.', frsqrt),
@@ -1244,7 +1299,8 @@ def _wmma_soft(b, kind, a, bb, c, signed=None):
     operand and keep 64 of them alive across those products (spills; RDNA2 cannot run kernels with scratch in vkhip). fp16:
     v_dot2c_f32_f16 (gfx11: v_dot2acc_f32_f16) takes the DPP broadcast itself; int8: a DPP move into a private temporary,
     then the VOP3P dot. Each statement starts with s_nop 1: LLVM does not see the DPP read inside it, and a DPP source
-    written by the previous VALU instruction needs two wait states."""
+    written by the previous VALU instruction needs two wait states. The sum is early-clobber: it is written by the first instruction
+    while later ones still read operands, and without it LLVM may give an operand with the same value (a zero) the sum's register."""
     fam = CTX.get('family', 'gfx11')
     if fam not in ('gfx10', 'gfx11'):
         raise ValueError(f'software WMMA is written for gfx10/gfx11, not {fam}')
@@ -1264,7 +1320,7 @@ def _wmma_soft(b, kind, a, bb, c, signed=None):
         if kind == 'f':
             op = 'v_dot2c_f32_f16_dpp' if fam == 'gfx10' else 'v_dot2acc_f32_f16_dpp'
             body = '\\0As_nop 1' + ''.join(f'\\0A{op} $0, ${1 + j}, ${1 + n + j} {sh} {dpp}' for j in range(n))
-            cons = '=v,' + ','.join(['v'] * (2 * n)) + ',0'
+            cons = '=&v,' + ','.join(['v'] * (2 * n)) + ',0'
             acc = b.v(f'call float asm "{body[3:]}", "{cons}"(' + ', '.join([f'i32 {x}' for x in ar] + [f'i32 {x}' for x in bb])
                       + f', float {c[i]})')
         else:
@@ -1272,7 +1328,7 @@ def _wmma_soft(b, kind, a, bb, c, signed=None):
                 if signed else 'v_dot4_u32_u8 $0, $1, ${0}, $0'
             body = '\\0As_nop 1' + ''.join(f'\\0Av_mov_b32_dpp $1, ${2 + j} {sh} {dpp}\\0A' + dot.replace('${0}', f'${2 + n + j}')
                                             for j in range(n))
-            cons = '=v,=&v,' + ','.join(['v'] * (2 * n)) + ',0'
+            cons = '=&v,=&v,' + ','.join(['v'] * (2 * n)) + ',0'
             r = b.v(f'call {{ i32, i32 }} asm "{body[3:]}", "{cons}"(' + ', '.join([f'i32 {x}' for x in ar] + [f'i32 {x}' for x in bb])
                     + f', i32 {c[i]})')
             acc = b.v(f'extractvalue {{ i32, i32 }} {r}, 0')

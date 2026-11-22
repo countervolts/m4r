@@ -75,7 +75,10 @@ int main(int argc, char** argv) {
     { VkCommandBuffer cb = vk.begin(); vk.toGeneral(cb, output); vk.submit(cb); }
     int rc = 0;
     for (int t = 0; t < frames && !rc; ++t) {
-        const int id = first + t;
+        // M4R_API_CYCLE=n: replay the first n captured frames in a loop (steady-state timing); M4R_NO_DUMP=1 writes no images
+        static const int cyc = std::getenv("M4R_API_CYCLE") ? std::atoi(std::getenv("M4R_API_CYCLE")) : 0;
+        static const bool noDump = std::getenv("M4R_NO_DUMP") != nullptr;
+        const int id = first + (cyc ? t % cyc : t);
         for (int i = 0; i < 6; ++i) {
             auto d = readAll(cap + "/rr-" + std::to_string(id) + "-" + ins[i].file + ".raw");
             if (d.size() != size_t(iw) * ih * ins[i].bpp) { std::fprintf(stderr, "frame %d: %s size\n", id, ins[i].file); return 1; }
@@ -142,6 +145,7 @@ int main(int argc, char** argv) {
         } else if (m4r_denoise(ctx, cb, &d) != 0) { std::fprintf(stderr, "m4r_denoise: %s\n", m4r_last_error(ctx)); rc = 1; break; }
         if (!vk.submit(cb)) { std::fprintf(stderr, "submit: %s\n", vk.error.c_str()); rc = 1; break; }
         auto dump = [&](Texture& x, const char* name) {
+            if (noDump) return;
             std::vector<uint8_t> b(size_t(x.width) * x.height * 8);
             vk.download(x, b.data(), b.size());
             char nm[256]; std::snprintf(nm, sizeof nm, "%s/%s-%02d.raw", out.c_str(), name, t);
@@ -151,7 +155,7 @@ int main(int argc, char** argv) {
             Texture den; vk.wrap(den, m4r_denoise_texture(ctx, "denoised"), VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih);
             dump(den, "denoised");
         }
-        if (const char* names = std::getenv("M4R_DUMP_TEX")) {   // plan textures by name: M4R_DUMP_TEX=shin,mm0,... (R8, R16F, RG16F, RGBA16F ones)
+        if (const char* names = noDump ? nullptr : std::getenv("M4R_DUMP_TEX")) {   // plan textures by name: M4R_DUMP_TEX=shin,mm0,... (R8, R16F, RG16F, RGBA16F ones)
             std::string all = names; size_t pos = 0;
             while (pos <= all.size()) {
                 size_t e = all.find(',', pos); if (e == std::string::npos) e = all.size();
@@ -164,17 +168,24 @@ int main(int argc, char** argv) {
                     {"bw0", {VK_FORMAT_R8_UNORM, 1}}, {"bw1", {VK_FORMAT_R8_UNORM, 1}}, {"flowdiff", {VK_FORMAT_R16_SFLOAT, 2}}, {"fc0", {VK_FORMAT_R16_SFLOAT, 2}},
                     {"fc1", {VK_FORMAT_R16_SFLOAT, 2}}, {"spec_mvec", {VK_FORMAT_R16G16_SFLOAT, 4}}, {"int_motion", {VK_FORMAT_R16G16_SFLOAT, 4}},
                     {"int_depth", {VK_FORMAT_R32_SFLOAT, 4}}, {"hist", {VK_FORMAT_R16G16B16A16_SFLOAT, 8}}, {"warp_color", {VK_FORMAT_R16G16B16A16_SFLOAT, 8}},
-                    {"warp_prev", {VK_FORMAT_R16G16B16A16_SFLOAT, 8}}, {"roughness", {VK_FORMAT_R16_SFLOAT, 2}}};
+                    {"warp_prev", {VK_FORMAT_R16G16B16A16_SFLOAT, 8}}, {"roughness", {VK_FORMAT_R16_SFLOAT, 2}},
+                    {"denoised_t", {VK_FORMAT_R16G16B16A16_SFLOAT, 8}}, {"mir_img", {VK_FORMAT_R16G16B16A16_SFLOAT, 8}},
+                    {"dbf_feat", {VK_FORMAT_R16G16B16A16_SFLOAT, 8}}, {"dbf_noise", {VK_FORMAT_R16G16_SFLOAT, 4}}, {"dbf_tw", {VK_FORMAT_R16_SFLOAT, 2}},
+                    {"nr0", {VK_FORMAT_R16G16B16A16_SFLOAT, 8}}, {"nr1", {VK_FORMAT_R16G16B16A16_SFLOAT, 8}}, {"dy0", {VK_FORMAT_R16_SFLOAT, 2}}, {"dy1", {VK_FORMAT_R16_SFLOAT, 2}},
+                    {"rm0", {VK_FORMAT_R16G16B16A16_SFLOAT, 8}}, {"rm1", {VK_FORMAT_R16G16B16A16_SFLOAT, 8}}, {"shin", {VK_FORMAT_R8_UNORM, 1}}};
                 auto k = known.find(n);
                 if (k == known.end()) { std::fprintf(stderr, "unknown format of %s\n", n.c_str()); continue; }
-                Texture x; vk.wrap(x, img, k->second.first, iw, ih);
-                std::vector<uint8_t> b(size_t(iw) * ih * k->second.second);
+                // the network's outputs (dbf_*) are half the BFNet size (render size rounded up to 8)
+                const bool half = n.rfind("dbf_", 0) == 0;
+                const uint32_t tw = half ? ((iw + 7) & ~7u) / 2 : iw, th = half ? ((ih + 7) & ~7u) / 2 : ih;
+                Texture x; vk.wrap(x, img, k->second.first, tw, th);
+                std::vector<uint8_t> b(size_t(tw) * th * k->second.second);
                 vk.download(x, b.data(), b.size());
                 char nm[256]; std::snprintf(nm, sizeof nm, "%s/tex-%s-%02d.raw", out.c_str(), n.c_str(), t);
                 std::ofstream(nm, std::ios::binary).write(reinterpret_cast<char*>(b.data()), std::streamsize(b.size()));
             }
         }
-        if (kOutTest) {
+        if (kOutTest && !noDump) {
             auto dumpK = [&](Texture& x, const char* name, size_t bpp) {
                 std::vector<uint8_t> b(size_t(x.width) * x.height * bpp);
                 vk.download(x, b.data(), b.size());

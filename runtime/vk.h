@@ -13,6 +13,8 @@ struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
+    VkDeviceSize allocated = 0;   // vkGetBufferMemoryRequirements size
+    bool deviceLocal = false;
     VkDeviceAddress address = 0;
     void* map = nullptr;  // host-visible buffers only
 };
@@ -27,6 +29,8 @@ struct Texture {
     uint32_t width = 0, height = 0, layers = 1;
     VkDeviceAddress record = 0;
     bool owned = true;
+    bool sampledOnly = false;   // record holds no storage descriptor (swizzled views)
+    VkDeviceSize allocated = 0;   // vkGetImageMemoryRequirements size (owned images)
 };
 
 // The LLVM GPU target (gfx1030 ... gfx1201) of a RADV device, from the chip name RADV puts in the device name
@@ -55,13 +59,15 @@ struct Context {
     // use an existing device (inside a game); no work is submitted to its queues
     bool adopt(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32_t family);
     // a view and descriptor record for an image owned by someone else (not destroyed by destroyTexture's owner check)
-    bool wrap(Texture& t, VkImage image, VkFormat format, uint32_t w, uint32_t h);
+    // alphaToAll: a sampled-only view that reads the image's alpha in every channel (e.g. roughness in the game's normals.w)
+    bool wrap(Texture& t, VkImage image, VkFormat format, uint32_t w, uint32_t h, bool alphaToAll = false);
     void destroy();
 
     uint32_t memoryType(uint32_t bits, VkMemoryPropertyFlags want) const;
     bool createBuffer(Buffer& b, VkDeviceSize size, bool hostVisible, VkBufferUsageFlags extra = 0);
     void destroyBuffer(Buffer& b);
-    bool createTexture(Texture& t, VkFormat format, uint32_t w, uint32_t h, uint32_t layers = 1);
+    // compress: also a colour attachment usage, which is what makes RADV give the image DCC (lossless compression; only above 512x512)
+    bool createTexture(Texture& t, VkFormat format, uint32_t w, uint32_t h, uint32_t layers = 1, bool compress = false);
     void destroyTexture(Texture& t);
     bool writeRecord(Texture& t);   // (re)writes the descriptor record for t
     VkDeviceAddress nullRecord();   // a record of zeros (Metal nil texture)

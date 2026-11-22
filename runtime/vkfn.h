@@ -12,13 +12,14 @@
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkDestroyInstance) X(vkGetDeviceProcAddr)
 #define M4R_VK_DEVICE_FUNCS(X) X(vkAllocateCommandBuffers) X(vkAllocateMemory) X(vkBeginCommandBuffer) X(vkBindBufferMemory) \
     X(vkBindImageMemory) X(vkCmdBindPipeline) X(vkCmdClearColorImage) X(vkCmdBlitImage) X(vkCmdCopyImage) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) \
-    X(vkCmdDispatch) X(vkCmdPipelineBarrier) X(vkCmdPushConstants) X(vkCreateBuffer) X(vkCreateCommandPool) \
+    X(vkCmdDispatch) X(vkCmdDispatchBase) X(vkCmdPipelineBarrier) X(vkCmdPushConstants) X(vkCreateBuffer) X(vkCreateCommandPool) \
     X(vkCreateComputePipelines) X(vkCreateFence) X(vkCreateImage) X(vkCreateImageView) X(vkCreatePipelineLayout) \
     X(vkCreateSampler) X(vkCreateShaderModule) X(vkDestroyBuffer) X(vkDestroyCommandPool) X(vkDestroyDevice) X(vkDestroyFence) \
     X(vkDestroyImage) X(vkDestroyImageView) X(vkDestroyPipeline) X(vkDestroyPipelineLayout) X(vkDestroySampler) \
     X(vkDestroyShaderModule) X(vkDeviceWaitIdle) X(vkEndCommandBuffer) X(vkFreeCommandBuffers) X(vkFreeMemory) \
     X(vkGetBufferDeviceAddress) X(vkGetBufferMemoryRequirements) X(vkGetDeviceQueue) X(vkGetImageMemoryRequirements) \
-    X(vkMapMemory) X(vkQueueSubmit) X(vkWaitForFences)
+    X(vkMapMemory) X(vkQueueSubmit) X(vkWaitForFences) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) \
+    X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #ifdef M4R_DYNAMIC_VK
 #define M4R_VK_DECLARE(f) extern PFN_##f f;

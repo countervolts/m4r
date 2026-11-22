@@ -176,6 +176,12 @@ bool Encoder::dispatchThreadgroups(uint32_t x, uint32_t y, uint32_t z) {
     return dispatch(x * k_->tg[0], y * k_->tg[1], z * k_->tg[2], x, y, z);
 }
 
+void Encoder::launch(uint32_t nx, uint32_t ny, uint32_t nz) {
+    if (bands_ <= 1) { vkCmdDispatch(cb_, nx, ny, nz); return; }
+    const uint32_t y0 = uint32_t(uint64_t(ny) * band_ / bands_), y1 = uint32_t(uint64_t(ny) * (band_ + 1) / bands_);
+    if (y1 > y0) vkCmdDispatchBase(cb_, 0, y0, 0, nx, y1 - y0, nz);
+}
+
 bool Encoder::dispatch(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t nx, uint32_t ny, uint32_t nz) {
     if (!nx || !ny || !nz) return true;
     if (k_->glsl) {
@@ -199,7 +205,7 @@ bool Encoder::dispatch(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t nx, uint3
         barrier_ = true;
         vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, k_->pipeline);
         vkCmdPushConstants(cb_, rt_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &args);
-        vkCmdDispatch(cb_, nx, ny, nz);
+        launch(nx, ny, nz);
         return true;
     }
     std::vector<uint8_t> block(k_->kernargSize, 0);
@@ -227,7 +233,7 @@ bool Encoder::dispatch(uint32_t gx, uint32_t gy, uint32_t gz, uint32_t nx, uint3
     barrier_ = true;
     vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, k_->pipeline);
     vkCmdPushConstants(cb_, rt_.layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &args);
-    vkCmdDispatch(cb_, nx, ny, nz);
+    launch(nx, ny, nz);
     return true;
 }
 

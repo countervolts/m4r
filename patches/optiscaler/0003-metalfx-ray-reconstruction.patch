@@ -1,8 +1,8 @@
 diff --git a/OptiScaler.ini b/OptiScaler.ini
-index 54b3b44..77b1af6 100644
+index 54b3b44..96fe87d 100644
 --- a/OptiScaler.ini
 +++ b/OptiScaler.ini
-@@ -1344,6 +1344,19 @@ FlipJitter=auto
+@@ -1344,6 +1344,26 @@ FlipJitter=auto
  ; true or false - Default (auto) is true
  FGPacing=auto
  
@@ -19,40 +19,50 @@ index 54b3b44..77b1af6 100644
 +; true or false - Default (auto) is false
 +DenoiserDlss=auto
 +
++; The denoiser's bilateral filter (Apple's kernel) on the raw hardware exp/log/sqrt/pow instructions, which is what Metal's fast::
++; functions mean, instead of LLVM's strict (and more accurate) versions: the filter runs about twice as fast (Alan Wake 2, 1280x720:
++; denoiser 3.5 -> 2.8 ms). Not bit-identical: one filter pass is 99.99% identical with a 1 ulp maximum, and after several frames of
++; temporal accumulation 92% of the fp16 values are identical, 98% within 1 ulp, mean difference 7e-5.
++; true or false - Default (auto) is false
++FastMath=auto
++
  ; -------------------------------------------------------
  [Log]
  ; -------------------------------------------------------
 diff --git a/OptiScaler/Config.cpp b/OptiScaler/Config.cpp
-index 6969a99..ba54592 100644
+index 6969a99..8d71907 100644
 --- a/OptiScaler/Config.cpp
 +++ b/OptiScaler/Config.cpp
-@@ -248,6 +248,8 @@ bool Config::Reload(std::filesystem::path iniPath)
+@@ -248,6 +248,9 @@ bool Config::Reload(std::filesystem::path iniPath)
          {
              MetalFXFlipJitter.set_from_config(readBool("MetalFX", "FlipJitter"));
              MetalFXFGPacing.set_from_config(readBool("MetalFX", "FGPacing"));
 +            MetalFXDenoiser.set_from_config(readBool("MetalFX", "Denoiser"));
 +            MetalFXDenoiserDlss.set_from_config(readBool("MetalFX", "DenoiserDlss"));
++            MetalFXFastMath.set_from_config(readBool("MetalFX", "FastMath"));
          }
  
          // FSR FG Inputs
-@@ -1075,6 +1077,8 @@ bool Config::SaveIni()
+@@ -1075,6 +1078,9 @@ bool Config::SaveIni()
      {
          ini.SetValue("MetalFX", "FlipJitter", GetBoolValue(Instance()->MetalFXFlipJitter.value_for_config()).c_str());
          ini.SetValue("MetalFX", "FGPacing", GetBoolValue(Instance()->MetalFXFGPacing.value_for_config()).c_str());
 +        ini.SetValue("MetalFX", "Denoiser", GetBoolValue(Instance()->MetalFXDenoiser.value_for_config()).c_str());
 +        ini.SetValue("MetalFX", "DenoiserDlss", GetBoolValue(Instance()->MetalFXDenoiserDlss.value_for_config()).c_str());
++        ini.SetValue("MetalFX", "FastMath", GetBoolValue(Instance()->MetalFXFastMath.value_for_config()).c_str());
      }
  
      // OptiFG
 diff --git a/OptiScaler/Config.h b/OptiScaler/Config.h
-index 09c7252..d234b9a 100644
+index 09c7252..b1dd83c 100644
 --- a/OptiScaler/Config.h
 +++ b/OptiScaler/Config.h
-@@ -263,6 +263,8 @@ class Config
+@@ -263,6 +263,9 @@ class Config
  
      // MetalFX (m4r)
      CustomOptional<bool> MetalFXFlipJitter { false };
 +    CustomOptional<bool> MetalFXDenoiser { false }; // answer NGX feature 13 (Ray Reconstruction) with m4r
++    CustomOptional<bool> MetalFXFastMath { false }; // the denoiser's bilateral filter on the raw hardware exp/log/sqrt/pow (faster, not bit-identical)
 +    CustomOptional<bool> MetalFXDenoiserDlss { false }; // upscale the denoised image with DLSS Super Resolution (an NGX proxy such as d4r) instead of BBR
      CustomOptional<bool> MetalFXFGPacing { true }; // hold the real frame back by half a frame after the generated one
  
@@ -179,15 +189,22 @@ index e86ccb8..0a51187 100644
              LOG_ERROR("MetalFX: m4r.dll is missing exports");
 diff --git a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
 new file mode 100644
-index 0000000..7d648b0
+index 0000000..231c11f
 --- /dev/null
 +++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,359 @@
 +// SPDX-License-Identifier: GPL-3.0-only
 +#include <pch.h>
 +#include "MetalFXDenoiserFeature_Dx12.h"
 +#include <Config.h>
 +#include <State.h>
++#include <chrono>
++
++static double NowMs()
++{
++    using namespace std::chrono;
++    return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
++}
 +
 +namespace
 +{
@@ -270,6 +287,7 @@ index 0000000..7d648b0
 +    d.depth_reversed = DepthInverted() ? 1 : 0;
 +    d.motion_low_res = LowResMV() ? 1 : 0;
 +    d.flip_upscale_jitter = Config::Instance()->MetalFXFlipJitter.value_or(false) ? 1 : 0;
++    d.fast_math = Config::Instance()->MetalFXFastMath.value_or_default() ? 1 : 0;
 +    return true;
 +}
 +
@@ -308,6 +326,8 @@ index 0000000..7d648b0
 +        return true;
 +    }
 +    _denoise = true;
++    _tDenoise = std::make_unique<GpuTime_Dx12>(Device);
++    _tDlss = std::make_unique<GpuTime_Dx12>(Device);
 +    LOG_INFO("MetalFX denoiser: ready, {}x{}", RenderWidth(), RenderHeight());
 +    if (Config::Instance()->MetalFXDenoiserDlss.value_or_default() && !InitDlss(InCommandList, InParameters))
 +        LOG_WARN("MetalFX denoiser: DLSS Super Resolution is not available, upscaling with the MetalFX upscaler");
@@ -317,6 +337,34 @@ index 0000000..7d648b0
 +MetalFXDenoiserFeatureDx12::~MetalFXDenoiserFeatureDx12()
 +{
 +    ReleaseDlss();
++}
++
++// called by OptiScaler once per frame with the queue: reads the stage timers and logs averages (frames 30, 60, 120, then every 300)
++std::optional<double> MetalFXDenoiserFeatureDx12::ReadUpscalerTime(void* commandQueue)
++{
++    const auto total = MetalFXFeatureDx12::ReadUpscalerTime(commandQueue);
++    if (_tDenoise == nullptr || _tDlss == nullptr)
++        return total;
++    const auto a = _tDenoise->ReadGpuTime((ID3D12CommandQueue*) commandQueue);
++    const auto b = _tDlss->ReadGpuTime((ID3D12CommandQueue*) commandQueue);
++    if (a && b && total)
++    {
++        _gpuDenoise += *a;
++        _gpuDlss += *b;
++        _gpuTotal += *total;
++        ++_timeN;
++    }
++    ++_timeCalls;
++    if (_timeN > 0 && (_timeCalls == 30 || _timeCalls == 60 || _timeCalls == 120 || _timeCalls % 300 == 0))
++    {
++        LOG_INFO("MetalFX denoiser timing, {} frames in: GPU denoise {:.2f} ms, DLSS {:.2f} ms, OptiScaler's upscaler time {:.2f} ms "
++                 "(mean of the last {}; CPU recording denoise {:.2f} ms, DLSS {:.2f} ms per frame)",
++                 _timeCalls, _gpuDenoise / _timeN, _gpuDlss / _timeN, _gpuTotal / _timeN, _timeN,
++                 _cpuDenoise / std::max(1, _timeN), _cpuDlss / std::max(1, _timeN));
++        _gpuDenoise = _gpuDlss = _gpuTotal = _cpuDenoise = _cpuDlss = 0;
++        _timeN = 0;
++    }
++    return total;
 +}
 +
 +void MetalFXDenoiserFeatureDx12::ReleaseDlss()
@@ -451,11 +499,17 @@ index 0000000..7d648b0
 +                    d.depth_out = Image(_dnDepth, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 +            }
 +            VkCommandBuffer cb = VK_NULL_HANDLE;
++            const double t0 = NowMs();
++            if (_tDenoise)
++                _tDenoise->Start(InCommandList);
 +            if (SUCCEEDED(_interop->BeginVkCommandBufferInterop(InCommandList, &cb)) && cb != VK_NULL_HANDLE)
 +            {
 +                auto& m4r = M4RProxy::Get();
 +                const int r = m4r.denoise(_ctx, cb, &d);
 +                _interop->EndVkCommandBufferInterop(InCommandList);
++                if (_tDenoise)
++                    _tDenoise->End(InCommandList);
++                _cpuDenoise += NowMs() - t0;
 +                if (r == 0 && useDlss)
 +                {
 +                    // m4r wrote the denoised colour (and depth); DLSS Super Resolution upscales it with the game's own other inputs
@@ -468,7 +522,13 @@ index 0000000..7d648b0
 +                    InParameters->Set(NVSDK_NGX_Parameter_Color, (void*) _dnColor);
 +                    if (_dnDepth)
 +                        InParameters->Set(NVSDK_NGX_Parameter_Depth, (void*) _dnDepth);
++                    const double t1 = NowMs();
++                    if (_tDlss)
++                        _tDlss->Start(InCommandList);
 +                    const bool ok = _dlss->EvaluateInternal(InCommandList, InParameters);
++                    if (_tDlss)
++                        _tDlss->End(InCommandList);
++                    _cpuDlss += NowMs() - t1;
 +                    InParameters->Set(NVSDK_NGX_Parameter_Color, origColor);
 +                    InParameters->Set(NVSDK_NGX_Parameter_Depth, origDepth);
 +                    if (ok)
@@ -494,10 +554,10 @@ index 0000000..7d648b0
 +}
 diff --git a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
 new file mode 100644
-index 0000000..0885e5d
+index 0000000..b2eb83f
 --- /dev/null
 +++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
-@@ -0,0 +1,36 @@
+@@ -0,0 +1,43 @@
 +#pragma once
 +// NGX feature 13 (DLSS Ray Reconstruction) answered by m4r on GPUs without DLSS: MetalFX's temporal denoiser (render size), then
 +// the MetalFX upscaler. Without a denoiser plan (m4r\\plans\\dn-WxH) or with M4R_NO_DENOISE set it only upscales the noisy colour.
@@ -505,6 +565,7 @@ index 0000000..0885e5d
 +#include "MetalFXFeature_Dx12.h"
 +#include <upscalers/dlss/DLSSFeature_Dx12.h>
 +#include <memory>
++#include <gpu_time/GpuTime_Dx12.h>
 +
 +class MetalFXDenoiserFeatureDx12 : public MetalFXFeatureDx12
 +{
@@ -517,6 +578,7 @@ index 0000000..0885e5d
 +    bool InitInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
 +    bool EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
 +    ~MetalFXDenoiserFeatureDx12();
++    std::optional<double> ReadUpscalerTime(void* commandQueue) override;
 +
 +  private:
 +    bool FillDesc(NVSDK_NGX_Parameter* p, m4r_denoise_desc& d);
@@ -529,6 +591,11 @@ index 0000000..0885e5d
 +    bool InitDlss(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters);
 +    void ReleaseDlss();
 +    void Transition(ID3D12GraphicsCommandList* cmd, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to);
++    // per-stage timing (logged now and then): GPU time between the D3D12 timestamps around the m4r denoiser and around DLSS, and the
++    // CPU time spent recording each; the sum of the GPU parts is not OptiScaler's number when the command list is split in between
++    std::unique_ptr<GpuTime_Dx12> _tDenoise, _tDlss;
++    double _gpuDenoise = 0, _gpuDlss = 0, _cpuDenoise = 0, _cpuDlss = 0, _gpuTotal = 0;
++    int _timeN = 0, _timeCalls = 0;
 +    std::unique_ptr<DLSSFeatureDx12> _dlss;
 +    ID3D12Resource* _dnColor = nullptr;   // RGBA16F, render size
 +    ID3D12Resource* _dnDepth = nullptr;   // R32F, render size (only when the game has no hardware depth)
@@ -554,10 +621,10 @@ index 089d8c2..69eb3d0 100644
      feature_version Version() override { return feature_version { 1, 0, 0 }; }
      Upscaler GetUpscalerType() const final { return Upscaler::MetalFX; }
 diff --git a/OptiScaler/upscalers/metalfx/m4r.h b/OptiScaler/upscalers/metalfx/m4r.h
-index 8930aa6..fcda6a1 100644
+index 8930aa6..c0fc831 100644
 --- a/OptiScaler/upscalers/metalfx/m4r.h
 +++ b/OptiScaler/upscalers/metalfx/m4r.h
-@@ -48,6 +48,23 @@ typedef struct m4r_interpolate_desc {
+@@ -48,6 +48,27 @@ typedef struct m4r_interpolate_desc {
      int depth_reversed, reset;
  } m4r_interpolate_desc;
  
@@ -576,12 +643,16 @@ index 8930aa6..fcda6a1 100644
 +     * (hardware_depth = 0) depth_out (R32F, render size) receives the depth in the game's own projection convention
 +     * (z * [2][2] + [3][2]) / (z * [2][3] + [3][3]), sky = the far value, for that upscaler. */
 +    m4r_image denoised_out, depth_out;
++    /* Opt-in: run MetalFX's bilateral filter on the raw hardware exp/log/sqrt/pow instructions (what Metal's fast:: functions mean) instead
++     * of LLVM's strict lowering: about 2x faster filter (0.25 -> 0.13 ms per pass at 1280x720), not bit-identical (see docs/metalfx-denoiser.md).
++     * Also switched on by the environment variable M4R_FAST_MATH=1. */
++    int fast_math;
 +} m4r_denoise_desc;
 +
  /* Frame generation at present time. The finished frame (backbuffer, display size) and this frame's render-size depth
   * and motion vectors go in; m4r keeps a copy of the frame and, once it has the previous one, writes the MetalFX
   * in-between frame into the backbuffer. */
-@@ -65,6 +82,16 @@ M4R_API void m4r_destroy(m4r_context* ctx);
+@@ -65,6 +86,16 @@ M4R_API void m4r_destroy(m4r_context* ctx);
  /* 0 on success; a non-zero return means the configuration is not prepared or not supported (see m4r_last_error) */
  M4R_API int m4r_upscale_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t max_in_w, uint32_t max_in_h);
  M4R_API int m4r_upscale(m4r_context* ctx, VkCommandBuffer cb, const m4r_upscale_desc* desc);

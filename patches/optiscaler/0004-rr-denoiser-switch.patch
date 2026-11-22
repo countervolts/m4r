@@ -1,0 +1,370 @@
+--- a/OptiScaler/Config.cpp
++++ b/OptiScaler/Config.cpp
+@@ -250,6 +250,8 @@
+             MetalFXFGPacing.set_from_config(readBool("MetalFX", "FGPacing"));
+             MetalFXDenoiser.set_from_config(readBool("MetalFX", "Denoiser"));
+             MetalFXDenoiserDlss.set_from_config(readBool("MetalFX", "DenoiserDlss"));
++            MetalFXRrDenoiser.set_from_config(readString("MetalFX", "RrDenoiser", true));
++            MetalFXDenoiserUpscaler.set_from_config(readString("MetalFX", "DenoiserUpscaler", true));
+             MetalFXFastMath.set_from_config(readBool("MetalFX", "FastMath"));
+         }
+ 
+@@ -1080,6 +1082,8 @@
+         ini.SetValue("MetalFX", "FGPacing", GetBoolValue(Instance()->MetalFXFGPacing.value_for_config()).c_str());
+         ini.SetValue("MetalFX", "Denoiser", GetBoolValue(Instance()->MetalFXDenoiser.value_for_config()).c_str());
+         ini.SetValue("MetalFX", "DenoiserDlss", GetBoolValue(Instance()->MetalFXDenoiserDlss.value_for_config()).c_str());
++        ini.SetValue("MetalFX", "RrDenoiser", Instance()->MetalFXRrDenoiser.value_for_config_or("auto").c_str());
++        ini.SetValue("MetalFX", "DenoiserUpscaler", Instance()->MetalFXDenoiserUpscaler.value_for_config_or("auto").c_str());
+         ini.SetValue("MetalFX", "FastMath", GetBoolValue(Instance()->MetalFXFastMath.value_for_config()).c_str());
+     }
+ 
+--- a/OptiScaler/Config.h
++++ b/OptiScaler/Config.h
+@@ -266,6 +266,25 @@
+     CustomOptional<bool> MetalFXDenoiser { false }; // answer NGX feature 13 (Ray Reconstruction) with m4r
+     CustomOptional<bool> MetalFXFastMath { false }; // the denoiser's bilateral filter on the raw hardware exp/log/sqrt/pow (faster, not bit-identical)
+     CustomOptional<bool> MetalFXDenoiserDlss { false }; // upscale the denoised image with DLSS Super Resolution (an NGX proxy such as d4r) instead of BBR
++    CustomOptional<std::string> MetalFXRrDenoiser { "metalfx" }; // with Denoiser: which denoiser answers Ray Reconstruction: metalfx (m4r), dlss or fsr (the NGX proxy d4r, D4R_RR_BACKEND); switchable in the menu
++    CustomOptional<std::string> MetalFXDenoiserUpscaler { "auto" }; // after m4r's denoiser: metalfx (BBR), dlss (NGX proxy), ffx (FSR 3.1/4) or xess; auto = DenoiserDlss ? dlss : metalfx
++    std::string MetalFXDenoiserUpscalerName() const
++    {
++        std::string v = MetalFXDenoiserUpscaler.value_or_default();
++        for (auto& c : v)
++            c = (char) std::tolower((unsigned char) c);
++        if (v == "metalfx" || v == "dlss" || v == "ffx" || v == "xess")
++            return v;
++        return MetalFXDenoiserDlss.value_or_default() ? "dlss" : "metalfx";
++    }
++    // MetalFXRrDenoiser normalised: "metalfx", "dlss" or "fsr"
++    std::string MetalFXRrDenoiserName() const
++    {
++        std::string v = MetalFXRrDenoiser.value_or_default();
++        for (auto& c : v)
++            c = (char) std::tolower((unsigned char) c);
++        return v == "dlss" || v == "fsr" ? v : "metalfx";
++    }
+     CustomOptional<bool> MetalFXFGPacing { true }; // hold the real frame back by half a frame after the generated one
+ 
+     // Logging
+--- a/OptiScaler/dllmain.cpp
++++ b/OptiScaler/dllmain.cpp
+@@ -1621,6 +1621,21 @@
+         Config::Instance()->CheckForUpdate.set_volatile_value(false);
+ #endif
+ 
++        // [MetalFX] Denoiser: the menu switches Ray Reconstruction between m4r's MetalFX denoiser and the NGX proxy's (d4r) DLSS RR /
++        // FSR RR while the game runs. d4r prepares both of its backends at NGX init when D4R_RR_SWITCHABLE=1, and AMD's FSR RR needs
++        // dxil-spirv's RDNA3 FP8 emulation, which vkd3d-proton reads from DXIL_SPIRV_CONFIG when the game creates its D3D12 device
++        // (now, before that; a value already set wins). The FSR option only touches shaders that use AMD's matrix intrinsics.
++        if (Config::Instance()->MetalFXDenoiser.value_or_default())
++        {
++            SetEnvironmentVariableA("D4R_RR_SWITCHABLE", "1");
++            if (GetEnvironmentVariableA("DXIL_SPIRV_CONFIG", nullptr, 0) == 0)
++                SetEnvironmentVariableA("DXIL_SPIRV_CONFIG", "wmma_rdna3_workaround");
++            const std::string rr = Config::Instance()->MetalFXRrDenoiserName();
++            if (rr != "metalfx")
++                SetEnvironmentVariableA("D4R_RR_BACKEND", rr.c_str());
++            spdlog::info("Ray Reconstruction denoiser: {} (switchable in the menu)", rr);
++        }
++
+         // Initial state of FG
+         State::Instance().activeFgInput = Config::Instance()->FGInput.value_or_default();
+         State::Instance().activeFgOutput = Config::Instance()->FGOutput.value_or_default();
+--- a/OptiScaler/menu/menu_common.cpp
++++ b/OptiScaler/menu/menu_common.cpp
+@@ -533,7 +533,7 @@
+     if (!State::Instance().currentFeature)
+         return;
+ 
+-    if (State::Instance().currentFeature->GetUpscalerType() == Upscaler::DLSSD)
++    if (State::Instance().currentFeature->IsRayReconstruction())
+         State::Instance().newBackend = Upscaler::DLSSD;
+     else
+         State::Instance().newBackend = currentBackend;
+@@ -2868,9 +2868,11 @@
+     ImGui::PushItemWidth(150.0f * menuResScale);
+ 
+     const bool usesDlssd = currentFeature->GetUpscalerType() == Upscaler::DLSSD;
++    // Ray Reconstruction (DLSSD, or m4r's MetalFX denoiser): never switched to a plain upscaler here
++    const bool isRR = currentFeature->IsRayReconstruction();
+ 
+     // DLSSD can't be switched to another upscaler
+-    if (usesDlssd)
++    if (usesDlssd || isRR)
+     {
+         ImGui::AlignTextToFramePadding();
+         ImGui::TextUnformatted(NameWithVersion(currentFeature).c_str());
+@@ -2905,7 +2907,75 @@
+         ImGui::TextDisabled("(DRS)");
+     }
+ 
+-    if (!usesDlssd)
++    // [MetalFX] Denoiser: which denoiser answers Ray Reconstruction (m4r's MetalFX denoiser, or the NGX proxy's DLSS RR / FSR RR
++    // through D4R_RR_BACKEND) and, after the MetalFX denoiser, which upscaler; Apply recreates the feature like an upscaler change
++    if (isRR && config->MetalFXDenoiser.value_or_default())
++    {
++        static const char* rrNames[] = { "MetalFX (m4r)", "DLSS RR (d4r)", "FSR RR (d4r)" };
++        static const char* rrCodes[] = { "metalfx", "dlss", "fsr" };
++        static const char* upNames[] = { "MetalFX", "DLSS (d4r)", "FSR (FFX)", "XeSS" };
++        static const char* upCodes[] = { "metalfx", "dlss", "ffx", "xess" };
++        static int rrPick = -1, upPick = -1;
++        int rrNow = 0, upNow = 0;
++        for (int i = 0; i < 3; ++i)
++            if (config->MetalFXRrDenoiserName() == rrCodes[i])
++                rrNow = i;
++        for (int i = 0; i < 4; ++i)
++            if (config->MetalFXDenoiserUpscalerName() == upCodes[i])
++                upNow = i;
++        if (rrPick < 0)
++            rrPick = rrNow;
++        if (upPick < 0)
++            upPick = upNow;
++
++        ImGui::Spacing();
++        ImGui::PushItemWidth(150.0f * menuResScale);
++        ImGui::Combo("Denoiser", &rrPick, rrNames, IM_ARRAYSIZE(rrNames));
++        ShowTooltip("Which denoiser answers the game's Ray Reconstruction.\n\n"
++                    "MetalFX: Apple's MetalFX denoiser, run by m4r, then the upscaler below\n"
++                    "DLSS RR: denoises and upscales in one network (d4r)\n"
++                    "FSR RR: AMD's denoiser, then DLSS Super Resolution ([DLSS] Model in d4r.ini)\n\n"
++                    "Press Apply to switch; a denoiser that fails to start falls back to MetalFX.");
++        if (rrPick == 0)
++        {
++            ImGui::Combo("Upscaler##rr", &upPick, upNames, IM_ARRAYSIZE(upNames));
++            ShowTooltip("The upscaler after the MetalFX denoiser.\n\n"
++                        "DLSS: DLSS Super Resolution through d4r ([DLSS] Model in d4r.ini)\n"
++                        "FSR: FSR 3.1 / 4 (the FFX upscaler settings apply)\n"
++                        "MetalFX: Apple's MetalFX upscaler (m4r)");
++        }
++        else
++        {
++            const char* fixed = rrPick == 1 ? "built into DLSS RR" : "DLSS (d4r)";
++            int zero = 0;
++            ImGui::BeginDisabled();
++            ImGui::Combo("Upscaler##rr", &zero, &fixed, 1);
++            ImGui::EndDisabled();
++        }
++        ImGui::PopItemWidth();
++
++        bool switching = false;   // a feature change is already pending
++        for (auto& cb : state.changeBackend)
++            switching = switching || cb.second;
++        const bool changed = rrPick != rrNow || (rrPick == 0 && upPick != upNow);
++        ImGui::SameLine(0.0f, 6.0f);
++        ImGui::BeginDisabled(!changed || switching);
++        if (ImGui::Button("Apply##rrdenoiser"))
++        {
++            LOG_INFO("Ray Reconstruction: denoiser {} -> {}, upscaler after MetalFX {} -> {}", rrCodes[rrNow], rrCodes[rrPick],
++                     upCodes[upNow], upCodes[upPick]);
++            config->MetalFXRrDenoiser = std::string(rrCodes[rrPick]);
++            config->MetalFXDenoiserUpscaler = std::string(upCodes[upPick]);
++            state.newBackend = Upscaler::DLSSD;
++            MARK_ALL_BACKENDS_CHANGED();
++        }
++        ImGui::EndDisabled();
++
++        if (!changed)
++            rrPick = upPick = -1;   // follow the config again (also after a fallback)
++    }
++
++    if (!usesDlssd && !isRR)
+     {
+         if (state.newBackend != Upscaler::Reset && state.newBackend != currentBackend)
+         {
+--- a/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
++++ b/OptiScaler/upscalers/FeatureProvider_Dx12.cpp
+@@ -63,6 +63,16 @@
+     case Upscaler::DLSSD:
+         if (cfg.MetalFXDenoiser.value_or_default())
+         {
++            // [MetalFX] RrDenoiser (switchable in the menu): dlss / fsr hand Ray Reconstruction to the NGX proxy (d4r), which
++            // reads D4R_RR_BACKEND at every feature creation; anything else is m4r's MetalFX denoiser
++            const std::string rr = cfg.MetalFXRrDenoiserName();
++            if (rr != "metalfx" && NVNGXProxy::NVNGXModule() != nullptr)
++            {
++                SetEnvironmentVariableA("D4R_RR_BACKEND", rr.c_str());
++                LOG_INFO("Ray Reconstruction answered by the NGX proxy, D4R_RR_BACKEND={}", rr);
++                *feature = std::make_unique<DLSSDFeatureDx12>(handleId, parameters);
++                break;
++            }
+             // Ray Reconstruction answered by m4r (stored in the config as MetalFX, not DLSS). First, whatever NVAPI says:
+             // dxvk-nvapi's NVIDIA spoof makes the GPU look DLSS capable, and the game's nvngx_dlssd.dll cannot run here
+             *feature = std::make_unique<MetalFXDenoiserFeatureDx12>(handleId, parameters);
+@@ -224,6 +234,18 @@
+             }
+             else
+             {
++                // A Ray Reconstruction denoiser picked in the menu that does not start (DLSS RR / FSR RR through the NGX proxy):
++                // back to m4r's MetalFX denoiser instead of retrying the same one every frame
++                if (cfg.MetalFXDenoiser.value_or_default() && cfg.MetalFXRrDenoiserName() != "metalfx")
++                {
++                    LOG_WARN("Ray Reconstruction denoiser '{}' failed to start, back to MetalFX", cfg.MetalFXRrDenoiserName());
++                    ImGui::InsertNotification({ ImGuiToastType::Warning, 10000,
++                                                cfg.MetalFXRrDenoiserName() == "fsr"
++                                                    ? "FSR RR did not start, back to the MetalFX denoiser"
++                                                    : "DLSS RR did not start, back to the MetalFX denoiser" });
++                    cfg.MetalFXRrDenoiser = std::string("metalfx");
++                }
++
+                 // Retry DLSSD
+                 state.newBackend = Upscaler::DLSSD;
+             }
+--- a/OptiScaler/upscalers/IFeature.h
++++ b/OptiScaler/upscalers/IFeature.h
+@@ -116,6 +116,8 @@
+     virtual bool IsWithDx12() = 0;
+     virtual feature_version Version() = 0;
+     virtual Upscaler GetUpscalerType() const = 0;
++    // a Ray Reconstruction (NGX feature 13) answer: DLSSD, or m4r's MetalFX denoiser (whose upscaler type is MetalFX)
++    virtual bool IsRayReconstruction() const { return GetUpscalerType() == Upscaler::DLSSD; }
+     virtual API Api() const = 0;
+     std::string Name() const { return UpscalerDisplayName(GetUpscalerType()); };
+     std::string ShortName() const { return UpscalerShortName(GetUpscalerType()); }; // Without the version
+--- a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
++++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ #include <pch.h>
+ #include "MetalFXDenoiserFeature_Dx12.h"
++#include <upscalers/ffx/FFXFeature_Dx12.h>
++#include <upscalers/xess/XeSSFeature_Dx12.h>
+ #include <Config.h>
+ #include <State.h>
+ #include <chrono>
+@@ -134,8 +136,11 @@
+     _tDenoise = std::make_unique<GpuTime_Dx12>(Device);
+     _tDlss = std::make_unique<GpuTime_Dx12>(Device);
+     LOG_INFO("MetalFX denoiser: ready, {}x{}", RenderWidth(), RenderHeight());
+-    if (Config::Instance()->MetalFXDenoiserDlss.value_or_default() && !InitDlss(InCommandList, InParameters))
+-        LOG_WARN("MetalFX denoiser: DLSS Super Resolution is not available, upscaling with the MetalFX upscaler");
++    if (Config::Instance()->MetalFXDenoiserUpscalerName() != "metalfx" && !InitDlss(InCommandList, InParameters))
++    {
++        LOG_WARN("MetalFX denoiser: {} is not available, upscaling with the MetalFX upscaler", _upName);
++        ImGui::InsertNotification({ ImGuiToastType::Warning, 10000, "The upscaler after the MetalFX denoiser did not start, using the MetalFX upscaler" });
++    }
+     return true;
+ }
+ 
+@@ -162,8 +167,8 @@
+     ++_timeCalls;
+     if (_timeN > 0 && (_timeCalls == 30 || _timeCalls == 60 || _timeCalls == 120 || _timeCalls % 300 == 0))
+     {
+-        LOG_INFO("MetalFX denoiser timing, {} frames in: GPU denoise {:.2f} ms, DLSS {:.2f} ms, OptiScaler's upscaler time {:.2f} ms "
+-                 "(mean of the last {}; CPU recording denoise {:.2f} ms, DLSS {:.2f} ms per frame)",
++        LOG_INFO("MetalFX denoiser timing, {} frames in: GPU denoise {:.2f} ms, upscaler {:.2f} ms, OptiScaler's upscaler time {:.2f} ms "
++                 "(mean of the last {}; CPU recording denoise {:.2f} ms, upscaler {:.2f} ms per frame)",
+                  _timeCalls, _gpuDenoise / _timeN, _gpuDlss / _timeN, _gpuTotal / _timeN, _timeN,
+                  _cpuDenoise / std::max(1, _timeN), _cpuDlss / std::max(1, _timeN));
+         _gpuDenoise = _gpuDlss = _gpuTotal = _cpuDenoise = _cpuDlss = 0;
+@@ -174,6 +179,7 @@
+ 
+ void MetalFXDenoiserFeatureDx12::ReleaseDlss()
+ {
++    _upEval = nullptr;
+     _dlss.reset();
+     if (_dnColor) { _dnColor->Release(); _dnColor = nullptr; }
+     if (_dnDepth) { _dnDepth->Release(); _dnDepth = nullptr; }
+@@ -202,9 +208,11 @@
+ 
+ bool MetalFXDenoiserFeatureDx12::InitDlss(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters)
+ {
+-    if (NVNGXProxy::NVNGXModule() == nullptr)
++    const std::string up = Config::Instance()->MetalFXDenoiserUpscalerName();
++    _upName = up == "dlss" ? "DLSS Super Resolution" : up == "ffx" ? "FSR (FFX)" : "XeSS";
++    if (up == "dlss" && NVNGXProxy::NVNGXModule() == nullptr)
+         NVNGXProxy::InitNVNGX();
+-    if (NVNGXProxy::NVNGXModule() == nullptr)
++    if (up == "dlss" && NVNGXProxy::NVNGXModule() == nullptr)
+     {
+         LOG_ERROR("MetalFX denoiser + DLSS: no NGX proxy loaded (Libraries.NvngxPath, e.g. d4r\\nvngx.dll)");
+         return false;
+@@ -220,15 +228,28 @@
+         ReleaseDlss();
+         return false;
+     }
+-    _dlss = std::make_unique<DLSSFeatureDx12>(IFeature::GetNextHandleId(), InParameters);
+-    if (!_dlss->Init(Device, InCommandList, InParameters) || !_dlss->IsInited())
++    // the concrete type's EvaluateInternal (protected in IFeature_Dx12, public in each upscaler)
++    auto take = [this](auto feature)
++    {
++        auto* raw = feature.get();
++        _upEval = [raw](ID3D12GraphicsCommandList* c, NVSDK_NGX_Parameter* p) { return raw->EvaluateInternal(c, p); };
++        _dlss = std::move(feature);
++    };
++    const UINT id = IFeature::GetNextHandleId();
++    if (up == "dlss")
++        take(std::make_unique<DLSSFeatureDx12>(id, InParameters));
++    else if (up == "ffx")
++        take(std::make_unique<FFXFeatureDx12>(id, InParameters));
++    else
++        take(std::make_unique<XeSSFeatureDx12>(id, InParameters));
++    if (!_dlss->ModuleLoaded() || !_dlss->Init(Device, InCommandList, InParameters) || !_dlss->IsInited())
+     {
+-        LOG_ERROR("MetalFX denoiser + DLSS: creating the DLSS Super Resolution feature failed");
++        LOG_ERROR("MetalFX denoiser + {}: creating the upscaler failed", _upName);
+         ReleaseDlss();
+         return false;
+     }
+     _dnShaderState = false;
+-    LOG_INFO("MetalFX denoiser: the denoised image is upscaled by DLSS Super Resolution ({}x{} -> {}x{}, {} depth)", RenderWidth(),
++    LOG_INFO("MetalFX denoiser: the denoised image is upscaled by {} ({}x{} -> {}x{}, {} depth)", _upName, RenderWidth(),
+              RenderHeight(), DisplayWidth(), DisplayHeight(), hwDepth ? "the game's" : "converted");
+     return true;
+ }
+@@ -330,7 +351,7 @@
+                     const double t1 = NowMs();
+                     if (_tDlss)
+                         _tDlss->Start(InCommandList);
+-                    const bool ok = _dlss->EvaluateInternal(InCommandList, InParameters);
++                    const bool ok = _upEval(InCommandList, InParameters);
+                     if (_tDlss)
+                         _tDlss->End(InCommandList);
+                     _cpuDlss += NowMs() - t1;
+@@ -341,7 +362,7 @@
+                         _frameCount++;
+                         return true;
+                     }
+-                    LOG_ERROR("MetalFX denoiser: DLSS Super Resolution failed, upscaling with the MetalFX upscaler from now on");
++                    LOG_ERROR("MetalFX denoiser: {} failed, upscaling with the MetalFX upscaler from now on", _upName);
+                     ReleaseDlss();
+                     return MetalFXFeatureDx12::EvaluateInternal(InCommandList, InParameters);
+                 }
+--- a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
++++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.h
+@@ -4,6 +4,7 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ #include "MetalFXFeature_Dx12.h"
+ #include <upscalers/dlss/DLSSFeature_Dx12.h>
++#include <functional>
+ #include <memory>
+ #include <gpu_time/GpuTime_Dx12.h>
+ 
+@@ -19,13 +20,15 @@
+     bool EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
+     ~MetalFXDenoiserFeatureDx12();
+     std::optional<double> ReadUpscalerTime(void* commandQueue) override;
++    bool IsRayReconstruction() const override { return true; }
+ 
+   private:
+     bool FillDesc(NVSDK_NGX_Parameter* p, m4r_denoise_desc& d);
+     void Capture(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Parameter* p);
+     bool _denoise = false;   // the denoiser plan is loaded
+ 
+-    // [MetalFX] DenoiserDlss: the denoised image is upscaled by DLSS Super Resolution (the NGX proxy, e.g. d4r) instead of BBR.
++    // [MetalFX] DenoiserUpscaler (DenoiserDlss): the denoised image is upscaled by DLSS Super Resolution (the NGX proxy, e.g. d4r),
++    // FSR (FFX) or XeSS instead of BBR.
+     // m4r writes the denoised colour (and, for games without hardware depth, the depth in the game's convention) into these
+     // textures; the DLSS feature then runs on them with the game's motion vectors, exposure and jitter.
+     bool InitDlss(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters);
+@@ -36,7 +39,10 @@
+     std::unique_ptr<GpuTime_Dx12> _tDenoise, _tDlss;
+     double _gpuDenoise = 0, _gpuDlss = 0, _cpuDenoise = 0, _cpuDlss = 0, _gpuTotal = 0;
+     int _timeN = 0, _timeCalls = 0;
+-    std::unique_ptr<DLSSFeatureDx12> _dlss;
++    // the upscaler after the denoiser ([MetalFX] DenoiserUpscaler: DLSS through the NGX proxy, FFX = FSR 3.1/4, XeSS); null = BBR
++    std::unique_ptr<IFeature_Dx12> _dlss;
++    std::function<bool(ID3D12GraphicsCommandList*, NVSDK_NGX_Parameter*)> _upEval;   // its EvaluateInternal
++    std::string _upName;
+     ID3D12Resource* _dnColor = nullptr;   // RGBA16F, render size
+     ID3D12Resource* _dnDepth = nullptr;   // R32F, render size (only when the game has no hardware depth)
+     bool _dnShaderState = false;          // the textures are in the shader-resource state (DLSS read them last)

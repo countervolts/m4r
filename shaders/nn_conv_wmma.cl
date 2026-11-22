@@ -9,6 +9,20 @@
 typedef half half16 __attribute__((ext_vector_type(16)));
 typedef float float8 __attribute__((ext_vector_type(8)));
 
+#ifndef SOFTW
+#define SOFTW 0
+#endif
+#if SOFTW
+// GPUs without WMMA (RDNA2): the same products from DPP dot products (shaders/nn_dot.h wmma_soft, same bits); A (the pixels) is loaded
+// with the upper half-wave rotated by one row
+#include "nn_dot.h"
+#define WMMA(a, b, c) wmma_soft(a, b, c)
+#define AROW(l) wsoft_row(l)
+#else
+#define WMMA(a, b, c) __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c)
+#define AROW(l) ((l) & 15)
+#endif
+
 #define CIB ((CIN + 15) / 16)
 #define COB ((COUT + 15) / 16)
 
@@ -17,7 +31,7 @@ kernel void nn_conv(global const half* src, global half* dst, global const half*
     const uint l = __builtin_amdgcn_workitem_id_x();
     const int tx = __builtin_amdgcn_workgroup_id_x(), y = __builtin_amdgcn_workgroup_id_y(), ng = __builtin_amdgcn_workgroup_id_z();
     const int n = l & 15;
-    const int x = tx * 16 + n;   // A row = pixel; D row of accumulator i is pixel 2 * i + (l >> 4)
+    const int x = tx * 16 + AROW(l);   // A row = pixel; D row of accumulator i is pixel 2 * i + (l >> 4)
     float8 acc[NT];
 #pragma unroll
     for (int t = 0; t < NT; ++t) acc[t] = (float8)(0.0f);
@@ -45,7 +59,7 @@ kernel void nn_conv(global const half* src, global half* dst, global const half*
                     const int cob = ng * NT + t;
                     if (cob < COB) {
                         const half16 b = *(global const half16*)(wp + ((size_t)((((ky * K + kx) * CIB + cb) * COB + cob) * 16 + n)) * 16);
-                        acc[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, acc[t]);
+                        acc[t] = WMMA(a, b, acc[t]);
                     }
                 }
             }

@@ -1,0 +1,70 @@
+--- a/OptiScaler/upscalers/metalfx/m4r.h
++++ b/OptiScaler/upscalers/metalfx/m4r.h
+@@ -94,6 +94,9 @@
+  * (m4r_upscale_init sizes). Not implemented yet: the denoiser's own upscaling network (UBFNet) and V3 temporal stage. 0 = ok. */
+ M4R_API int m4r_denoise_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);
+ M4R_API int m4r_denoise(m4r_context* ctx, VkCommandBuffer cb, const m4r_denoise_desc* desc);
++/* 1 when the denoised image is already resolved to pixel centres (V3 as a 1:1 denoiser, M4R_V3_DENOISE=1): the upscaler after it
++ * must take it with zero jitter. 0 for the dn denoiser (its image keeps the frame's jitter). */
++M4R_API int m4r_denoise_output_dejittered(m4r_context* ctx);
+ /* debugging: the image of a texture of the denoiser plan (e.g. "denoised"), VK_NULL_HANDLE if there is none */
+ M4R_API VkImage m4r_denoise_texture(m4r_context* ctx, const char* name);
+ M4R_API int m4r_interpolate_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);
+--- a/OptiScaler/upscalers/metalfx/M4R_Proxy.h
++++ b/OptiScaler/upscalers/metalfx/M4R_Proxy.h
+@@ -20,6 +20,7 @@
+     using PFN_denoise_capture = decltype(&m4r_denoise_capture);
+     using PFN_denoise_init = decltype(&m4r_denoise_init);
+     using PFN_denoise = decltype(&m4r_denoise);
++    using PFN_denoise_output_dejittered = decltype(&m4r_denoise_output_dejittered);
+ 
+     struct Table
+     {
+@@ -36,6 +37,7 @@
+         PFN_denoise_capture denoiseCapture = nullptr;
+         PFN_denoise_init denoiseInit = nullptr;
+         PFN_denoise denoise = nullptr;
++        PFN_denoise_output_dejittered denoiseOutputDejittered = nullptr;   // optional (older m4r.dll: none)
+     };
+ 
+     static std::filesystem::path Dir() { return Util::DllPath().parent_path() / L"m4r"; }
+@@ -69,6 +71,7 @@
+         t.denoiseCapture = (PFN_denoise_capture) GetProcAddress(t.module, "m4r_denoise_capture");
+         t.denoiseInit = (PFN_denoise_init) GetProcAddress(t.module, "m4r_denoise_init");
+         t.denoise = (PFN_denoise) GetProcAddress(t.module, "m4r_denoise");
++        t.denoiseOutputDejittered = (PFN_denoise_output_dejittered) GetProcAddress(t.module, "m4r_denoise_output_dejittered");
+         if (!t.create || !t.upscale || !t.lastError)
+         {
+             LOG_ERROR("MetalFX: m4r.dll is missing exports");
+--- a/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
++++ b/OptiScaler/upscalers/metalfx/MetalFXDenoiserFeature_Dx12.cpp
+@@ -348,6 +348,17 @@
+                     InParameters->Set(NVSDK_NGX_Parameter_Color, (void*) _dnColor);
+                     if (_dnDepth)
+                         InParameters->Set(NVSDK_NGX_Parameter_Depth, (void*) _dnDepth);
++                    // m4r's V3 denoiser at 1:1 (M4R_V3_DENOISE=1) resolves the jitter itself: its image is at pixel centres, so the upscaler
++                    // gets zero jitter (the dn denoiser's image keeps the frame's jitter and the game's values go through)
++                    const bool dejit = m4r.denoiseOutputDejittered != nullptr && m4r.denoiseOutputDejittered(_ctx) != 0;
++                    float origJx = 0.0f, origJy = 0.0f;
++                    if (dejit)
++                    {
++                        InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_X, &origJx);
++                        InParameters->Get(NVSDK_NGX_Parameter_Jitter_Offset_Y, &origJy);
++                        InParameters->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, 0.0f);
++                        InParameters->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, 0.0f);
++                    }
+                     const double t1 = NowMs();
+                     if (_tDlss)
+                         _tDlss->Start(InCommandList);
+@@ -357,6 +368,11 @@
+                     _cpuDlss += NowMs() - t1;
+                     InParameters->Set(NVSDK_NGX_Parameter_Color, origColor);
+                     InParameters->Set(NVSDK_NGX_Parameter_Depth, origDepth);
++                    if (dejit)
++                    {
++                        InParameters->Set(NVSDK_NGX_Parameter_Jitter_Offset_X, origJx);
++                        InParameters->Set(NVSDK_NGX_Parameter_Jitter_Offset_Y, origJy);
++                    }
+                     if (ok)
+                     {
+                         _frameCount++;

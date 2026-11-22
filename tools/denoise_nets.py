@@ -9,7 +9,7 @@ usage: denoise_nets.py dbf <Resources dir> <out plan dir> <H> <W>     writes a p
        denoise_nets.py dbf-ref <Resources dir> <H> <W> <input.bin> <output.bin>   numpy reference of the same
 SPDX-License-Identifier: GPL-3.0-only
 """
-import os, shutil, subprocess, sys
+import os, re, shutil, subprocess, sys
 import numpy as np
 
 # (weights offset, bias offset, kernel, cin, cout) in the .dat; consecutive pairs are the 3x3 + 1x1 of one cell
@@ -117,26 +117,120 @@ def pack_wmma_weights(w, k, ci, co):
     return np.ascontiguousarray(out).tobytes()
 
 
-def wmma_kernel(p, defs):
-    """builds nn_conv_wmma.cl for one layer (LLVM, clang -x cl) into <p.out>/k and declares it in the plan; returns the kernel name"""
-    import hashlib, tempfile
+def nn_impl():
+    """how the convolutions run: 'wmma' (gfx11's WMMA, RDNA3 / 3.5), 'soft' (the WMMA kernels with each product as DPP dot products,
+    shaders/nn_dot.h wmma_soft) or 'dot' (lane-per-pixel dot products with scalar weights, shaders/nn_conv_dot.cl / nn_cell.cl DOT=1).
+    GPUs without gfx11 WMMA get 'dot' (faster than 'soft' on gfx1101 at RDNA2's issue rate: DBF cells 0.80 vs 1.45 ms, UBF convs
+    0.40 vs 0.67 at 720p -> 1440p); M4R_NN_IMPL=wmma|soft|dot overrides (all three give the same bits)"""
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
     sys.path.insert(0, root)
     from air import m4r_air
-    src = os.path.join(root, 'shaders', 'nn_conv_wmma.cl')
-    key = hashlib.sha256((open(src).read() + repr(sorted(defs.items())) + m4r_air.GPU).encode()).hexdigest()[:12]
-    name = 'nn_conv_wmma-' + key
+    if os.environ.get('M4R_NN_IMPL'):
+        return os.environ['M4R_NN_IMPL']
+    return 'wmma' if m4r_air.family() == 'gfx11' else 'dot'
+
+
+def use_dot():
+    return nn_impl() == 'dot'
+
+
+def cl_build(src, defs, out_ll):
+    """OpenCL C (shaders/*.cl) -> LLVM IR text for m4r_air.GPU"""
+    from air import m4r_air
+    sh = os.path.dirname(src)
+    subprocess.run(['clang', '-x', 'cl', '-cl-std=CL2.0', '--target=amdgcn-amd-amdhsa', f'-mcpu={m4r_air.GPU}', '-nogpulib', '-O3', f'-I{sh}',
+                    '-S', '-emit-llvm', src, '-o', out_ll] + [f'-D{k}={v}' for k, v in defs.items()], check=True)
+    return open(out_ll).read()
+
+
+def src_key(src, defs, gpu):
+    """cache key of a kernel built from src (and the headers it includes from shaders/) with defs"""
+    import hashlib
+    text = open(src).read()
+    for inc in sorted(set(re.findall(r'#include "([^"]+)"', text))):
+        text += open(os.path.join(os.path.dirname(src), inc)).read()
+    return hashlib.sha256((text + repr(sorted(defs.items())) + gpu).encode()).hexdigest()[:12]
+
+
+def dot_kernel(p, defs):
+    """builds nn_conv_dot.cl for one layer into <p.out>/k and declares it in the plan; returns the kernel name"""
+    import tempfile
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+    sys.path.insert(0, root)
+    from air import m4r_air
+    src = os.path.join(root, 'shaders', 'nn_conv_dot.cl')
+    name = 'nn_conv_dot-' + src_key(src, defs, m4r_air.GPU)
     if ('k', name) in p.kernels:
         return name
     os.makedirs(p.out + '/k', exist_ok=True)
     base = f'{p.out}/k/{name}'
     if not os.path.exists(base + '.hsaco'):
         with tempfile.TemporaryDirectory() as d:
-            ll = d + '/k.ll'
-            subprocess.run(['clang', '-x', 'cl', '-cl-std=CL2.0', '--target=amdgcn-amd-amdhsa', f'-mcpu={m4r_air.GPU}', '-nogpulib', '-O3',
-                            '-S', '-emit-llvm', src, '-o', ll] + [f'-D{k}={v}' for k, v in defs.items()], check=True)
-            text = open(ll).read()
+            text = cl_build(src, defs, d + '/k.ll')
         m4r_air.compile_ir(text, base + '.hsaco')
+        if hsaco_scratch(base + '.hsaco'):
+            raise RuntimeError(f'{name}: uses scratch ({defs})')
+        man = {'kernel': 'nn_conv', 'threadgroup': [32, 1, 1], 'kernarg_size': 64, 'grid_offset': 32, 'samplers': [],
+               'args': [dict(kind='buffer', location=i, offset=8 * i, name=n, access='read' if i != 1 else 'write')
+                        for i, n in enumerate(('src', 'dst', 'weights', 'bias'))]}
+        m4r_air.write_manifest(man, base)
+    p.kernels.add(('k', name)) if isinstance(p.kernels, set) else p.kernels.__setitem__(('k', name), name)
+    p.lines.append(f'kernel {name} k/{name}')
+    return name
+
+
+def dot_conv_pass(p, dat, L, idx, src, dst, Hin, Win, act, stride=1, pad=None):
+    wo, bo, k, ci, co = L
+    pad = (k - 1) // 2 if pad is None else pad
+    H, W = (Hin + 2 * pad - k) // stride + 1, (Win + 2 * pad - k) // stride + 1
+    w, b = layer(dat, L)
+    blob = pack_wmma_weights(w, k, ci, co)
+    p.buffer(f'w{idx}', len(blob), blob)
+    p.buffer(f'b{idx}', co * 2, dat[bo:bo + co * 2])
+    # output channels per wave: a multiple of 8 dividing cout rounded up to 8 (the packed weights are zero up to blocks of 16);
+    # MPX rows per lane (weight reuse) and as many channels as keep enough waves for the GPU (M4R_DOT_WAVES)
+    cop = (co + 7) // 8 * 8
+    mpx = int(os.environ.get('M4R_DOT_CMPX', '2'))
+    acc = int(os.environ.get('M4R_DOT_CACC', '64'))          # sums per lane: NC * MPX
+    cands = [c for c in range(8, cop + 1, 8) if cop % c == 0 and c * mpx <= acc] or [8]
+    want = int(os.environ.get('M4R_DOT_WAVES', '1024'))   # swept on gfx1101 (M4R_NN_IMPL=dot, VOPD off): 2 rows, 1024 waves
+    while True:
+        rows = ((W + 31) // 32) * ((H + mpx - 1) // mpx)
+        nc = next((c for c in reversed(cands) if rows * (cop // c) >= want), cands[0])
+        if rows * (cop // nc) >= want or mpx == 1:
+            break
+        mpx //= 2                                             # small layers: fewer rows per lane, more waves
+        cands = [c for c in range(8, cop + 1, 8) if cop % c == 0 and c * mpx <= acc] or [8]
+    if co % 8:   # all channels in one wave (its output goes out as one contiguous span, nn_conv_dot.cl)
+        nc = cop
+        while mpx > 1 and nc * mpx > acc:
+            mpx //= 2
+    name = dot_kernel(p, dict(W=W, H=H, WI=Win, HI=Hin, CIN=ci, COUT=co, K=k, ST=stride, PADV=pad, NC=nc, MPX=mpx, ACT=act))
+    p.lines.append(f'pass {name} threads {((W + 31) // 32) * 32} {(H + mpx - 1) // mpx} {cop // nc}')
+    for i, bn in enumerate((src, dst, f'w{idx}', f'b{idx}')):
+        p.lines.append(f'  buf {i} {bn}')
+
+
+def wmma_kernel(p, defs):
+    """builds nn_conv_wmma.cl for one layer (LLVM, clang -x cl) into <p.out>/k and declares it in the plan; returns the kernel name"""
+    import tempfile
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+    sys.path.insert(0, root)
+    from air import m4r_air
+    src = os.path.join(root, 'shaders', 'nn_conv_wmma.cl')
+    if nn_impl() == 'soft':
+        defs = dict(defs, SOFTW=1)
+    name = 'nn_conv_wmma-' + src_key(src, defs, m4r_air.GPU)
+    if ('k', name) in p.kernels:
+        return name
+    os.makedirs(p.out + '/k', exist_ok=True)
+    base = f'{p.out}/k/{name}'
+    if not os.path.exists(base + '.hsaco'):
+        with tempfile.TemporaryDirectory() as d:
+            text = cl_build(src, defs, d + '/k.ll')
+        m4r_air.compile_ir(text, base + '.hsaco')
+        if hsaco_scratch(base + '.hsaco'):
+            raise RuntimeError(f'{name}: uses scratch ({defs})')
         man = {'kernel': 'nn_conv', 'threadgroup': [32, 1, 1], 'kernarg_size': 64, 'grid_offset': 32, 'samplers': [],
                'args': [dict(kind='buffer', location=i, offset=8 * i, name=n, access='read' if i != 1 else 'write')
                         for i, n in enumerate(('src', 'dst', 'weights', 'bias'))]}
@@ -168,10 +262,14 @@ def conv_pass(p, dat, L, idx, src, dst, Hin, Win, stride=1, relu=True, pad=None,
     pad = ((k - 1) // 2 if stride == 1 else 2) if pad is None else pad
     if getattr(p, 'wmma', False):
         Ho, Wo = (Hin + 2 * pad - k) // stride + 1, (Win + 2 * pad - k) // stride + 1
-        # channel tiles per wave: 1 at low resolution (spread over waves), 2 above (measured on gfx1101: 4 was 2x slower on the
+        # channel tiles per wave: 1 below 10000 output pixels (spread over waves), 2 above (swept per mode on gfx1101: 10000 beat 40000 by 2-5% at
+        # Quality to Ultra Performance; 4 was 2x slower on the
         # 320x180 64->64 layers; results are identical for any value, only the split over waves changes)
-        nt = 1 if Ho * Wo < 40000 else min(2, (co + 15) // 16)
-        wmma_conv_pass(p, dat, L, idx, src, dst, Hin, Win, act, nt, stride, pad)
+        nt = 1 if Ho * Wo < int(os.environ.get('M4R_NT_PX', '10000')) else min(2, (co + 15) // 16)   # M4R_NT_PX: threshold experiment
+        if use_dot():
+            dot_conv_pass(p, dat, L, idx, src, dst, Hin, Win, act, stride, pad)
+        else:
+            wmma_conv_pass(p, dat, L, idx, src, dst, Hin, Win, act, nt, stride, pad)
         return Ho, Wo
     Ho, Wo = (Hin + 2 * pad - k) // stride + 1, (Win + 2 * pad - k) // stride + 1
     p.buffer(f'w{idx}', k * k * ci * co * 2, dat[wo:wo + k * k * ci * co * 2])
@@ -182,10 +280,201 @@ def conv_pass(p, dat, L, idx, src, dst, Hin, Win, stride=1, relu=True, pad=None,
     return Ho, Wo
 
 
-def dbf_net(p, dat, H, W, in_name='dbf_in', out_name='dbf_out'):
+def hsaco_scratch(path):
+    """private segment (scratch) bytes per lane of a code object's kernel"""
+    notes = subprocess.run(['llvm-readelf', '--notes', path], capture_output=True, text=True, check=True).stdout
+    m = re.search(r'\.private_segment_fixed_size:\s*(\d+)', notes)
+    return int(m.group(1)) if m else -1
+
+
+def cell_kernel(p, defs, spill_ok=True):
+    """builds shaders/nn_cell.cl for one DBFNet cell into <p.out>/k and declares it in the plan; returns (kernel name, threads per group),
+    or None (nothing declared) when the kernel still spills and spill_ok is false"""
+    import hashlib, tempfile
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+    sys.path.insert(0, root)
+    from air import m4r_air
+    src = os.path.join(root, 'shaders', 'nn_cell.cl')
+    if defs.get('DOT'):
+        nth = defs['TY'] // defs.get('MPX', 1) * 32 * defs.get('WC', 1)
+    else:
+        nth = (defs['TX'] // 16) * defs['TY'] // defs['MP'] * 32 * defs.get('WC', 1)
+    name = 'nn_cell-' + src_key(src, defs, m4r_air.GPU)
+    if ('k', name) in p.kernels:
+        return name, nth
+    os.makedirs(p.out + '/k', exist_ok=True)
+    base = f'{p.out}/k/{name}'
+    if not os.path.exists(base + '.hsaco'):
+        # a variant that spills (scratch) is rebuilt with less pipelining: PIPEU 1, then without the pipelined loop
+        tries = [dict(defs)]
+        if defs.get('DOT'):   # DOT: fewer fill loads in flight
+            tries += [dict(defs, FILLU=f) for f in (2, 1) if f < defs.get('FILLU', 8)]
+        else:
+            if defs.get('PIPEU', 1) > 1: tries.append(dict(defs, PIPEU=1))
+            tries.append(dict(defs, PIPE=0))
+        for dd in tries:
+            with tempfile.TemporaryDirectory() as d:
+                text = cl_build(src, dd, d + '/k.ll')
+            m4r_air.compile_ir(text, base + '.hsaco')
+            scratch = hsaco_scratch(base + '.hsaco')
+            if scratch == 0:
+                break
+            print(f'{name}: scratch {scratch} with PIPE={dd.get("PIPE", 1)} PIPEU={dd.get("PIPEU", 1)}', file=sys.stderr)
+        names = ('src', 'skip', 'dst', 'w1', 'b1', 'w2', 'b2', 'w3', 'b3')
+        tex = ('feat', 'noise', 'tw')   # OUTTEX: the network's output textures (MetalFX's dbfnetv1_output_channels done in the last cell)
+        n = len(names) + len(tex)
+        man = {'kernel': 'nn_cell', 'threadgroup': [nth, 1, 1], 'kernarg_size': 8 * n + 32, 'grid_offset': 8 * n, 'samplers': [],
+               'args': [dict(kind='buffer', location=i, offset=8 * i, name=nm, access='write' if nm == 'dst' else 'read') for i, nm in enumerate(names)]
+                       + ([dict(kind='texture', location=j, offset=8 * (len(names) + j), name=nm, access='write') for j, nm in enumerate(tex)]
+                          if defs.get('OUTTEX') else [])}
+        m4r_air.write_manifest(man, base)
+    if not spill_ok and hsaco_scratch(base + '.hsaco'):
+        for ext in os.listdir(p.out + '/k'):   # not part of the plan
+            if ext.startswith(name + '.'):
+                os.remove(f'{p.out}/k/{ext}')
+        return None
+    p.kernels.add(('k', name)) if isinstance(p.kernels, set) else p.kernels.__setitem__(('k', name), name)
+    p.lines.append(f'kernel {name} k/{name}')
+    return name, nth
+
+
+# tile per cell size (TX, TY, MP): small levels get small tiles so that the GPU has enough workgroups (M4R_CELL_TILE=TX,TY,MP overrides all)
+def cell_tile(H, W):
+    if os.environ.get('M4R_CELL_TILE'):
+        return tuple(map(int, os.environ['M4R_CELL_TILE'].split(',')))
+    px = H * W
+    return (32, 4, 2) if px >= 40000 else (16, 4, 1) if px >= 10000 else (16, 2, 1)
+
+
+def dbf_net_fused(p, dat, H, W, in_name='dbf_in', out_name='dbf_out', out_tex=None, in_stride=None):
+    """DBFNet as 7 fused cells (shaders/nn_cell.cl), bit-identical to the layer-by-layer passes of dbf_net. out_tex = (feat, noise, tw, width,
+    height): the last cell writes MetalFX's three output textures itself (what dbfnetv1_output_channels does) instead of out_name"""
+    P = DBF
+    for i, L in enumerate(P):
+        w, b = layer(dat, L)
+        blob = pack_wmma_weights(w, L[2], L[3], L[4])
+        p.buffer(f'w{i}', len(blob), blob)
+        p.buffer(f'b{i}', L[4] * 2, dat[L[1]:L[1] + L[4] * 2])
+    upmix = int(os.environ.get('M4R_UPMIX', '1'))
+    fuse_mask = int(os.environ.get('M4R_FUSE_CELLS', '127'))   # experiment: bit k = cell k fused, else the old layer passes
+    sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'shaders')
+    ncell = [0]
+    def cell(mode, src, skip, dst, h, w, i, last=False, sout=None):
+        cin, c1, c2 = P[i][3], P[i][4], P[i + 1][4]
+        c3 = P[i + 2][4] if last else 0
+        cout = c3 or c2
+        k = ncell[0]; ncell[0] += 1
+        otex = out_tex if last and out_tex else None
+        if not otex:
+            p.buffer(dst, h * w * (sout or cout) * 2)
+        if not fuse_mask >> k & 1:
+            x = src
+            if mode == 1:
+                x = f'xp{k}'; p.buffer(x, h * w * cin * 2)
+                p.glsl('nn_pool', sh + '/nn_pool.comp'); p.run('nn_pool', w * cin // 4, h, [src, x], [w, h, cin])
+            elif mode == 2:
+                x = f'xu{k}'; p.buffer(x, h * w * cin * 2)
+                p.glsl('nn_upadd', sh + '/nn_upadd.comp'); p.run('nn_upadd', w * cin // 4, h, [src, skip, x], [w, h, cin])
+            p.buffer(f'xa{k}', h * w * c1 * 2); conv_pass(p, dat, P[i], f'{i}u', x, f'xa{k}', h, w)
+            if last:
+                p.buffer(f'xb{k}', h * w * c2 * 2); conv_pass(p, dat, P[i + 1], f'{i + 1}u', f'xa{k}', f'xb{k}', h, w)
+                conv_pass(p, dat, P[i + 2], f'{i + 2}u', f'xb{k}', dst, h, w, relu=False)
+            else:
+                conv_pass(p, dat, P[i + 1], f'{i + 1}u', f'xa{k}', dst, h, w)
+            return
+        if use_dot():
+            # DOT: wave = 32 pixels of a row, TY rows per workgroup, WC waves per row splitting the output channels (small cells: more
+            # waves in flight); swept on gfx1101 with M4R_NN_DOT=1
+            # (swept on gfx1101 with M4R_NN_IMPL=dot and VOPD off, i.e. RDNA2's issue rate): MPX pixels per lane = reuse of each scalar weight
+            # load, the cells' limit (4 on the 64-channel cells, 2 on the 32-channel ones and the smallest), at most 64 sums per lane
+            # (~91 VGPRs) by splitting the output channels over WC waves, 8 of them below 20000 pixels (more waves in flight)
+            ch = 4
+            mpx = 4 if c1 >= 64 and h * w >= 5000 else 2
+            mpx = int(os.environ.get(f'M4R_DOT_MPX{k}', os.environ.get('M4R_DOT_MPX', mpx)))
+            ty = 4 if h * w >= 40000 else 2
+            ty = int(os.environ.get(f'M4R_DOT_TY{k}', os.environ.get('M4R_DOT_TY', ty)))
+            ty = (max(ty, mpx) + mpx - 1) // mpx * mpx
+            wcs = max(1, c1 * mpx // int(os.environ.get('M4R_DOT_ACC', '64')))
+            if h * w < 20000:
+                wcs = max(wcs, 8)
+            while wcs > 1 and (c1 % (wcs * ch) or c2 % (wcs * ch) or c3):
+                wcs //= 2
+            wcs = int(os.environ.get(f'M4R_CELL_WC{k}', os.environ.get('M4R_CELL_WC', wcs)))
+            defs = dict(DOT=1, CH=ch, WC=wcs, W=w, H=h, MODE=mode, CIN=cin, SIN=(in_stride if (mode == 0 and in_stride) else cin), C1=c1, C2=c2, C3=c3,
+                        SOUT=sout or cout, TX=32, TY=ty, MP=1, MPX=mpx,
+                        UPMIX=upmix, FILLU=int(os.environ.get('M4R_DOT_FILLU', '2')))
+            for env in ('M4R_CELL_DEFS', f'M4R_CELL_DEFS{k}'):
+                defs.update({a: int(v) if v.lstrip('-').isdigit() else v for a, v in (kv.split('=', 1) for kv in os.environ.get(env, '').split(';') if kv)})
+            if otex:
+                defs.update(OUTTEX=1, TXW=otex[3], TXH=otex[4])
+            name, nth = cell_kernel(p, defs)
+            if hsaco_scratch(f'{p.out}/k/{name}.hsaco'):   # RDNA2 cannot run kernels with scratch (vkhip)
+                raise RuntimeError(f'{name}: uses scratch ({defs})')
+            p.lines.append(f'pass {name} threads {((w + 31) // 32) * nth} {(h + defs["TY"] - 1) // defs["TY"]} 1')
+            args = (src, skip or src, src if otex else dst, f'w{i}', f'b{i}', f'w{i + 1}', f'b{i + 1}', f'w{i + 2}' if last else f'w{i + 1}', f'b{i + 2}' if last else f'b{i + 1}')
+            for kk, bn in enumerate(args):
+                p.lines.append(f'  buf {kk} {bn}')
+            if otex:
+                for j in range(3):
+                    p.lines.append(f'  tex {j} {otex[j]}')
+            return
+        tile = cell_tile(h, w)
+        if cin >= 64 and tile[2] > 1 and not os.environ.get('M4R_CELL_TILE'):
+            tile = (16, 4, 1)   # 64 -> 64 3x3 cells: 1 pixel group per wave is faster (measured 720p and 2560x1440, with the pipelined loop)
+        if os.environ.get(f'M4R_CELL_TILE{k}'):   # per-cell override (experiments)
+            tile = tuple(map(int, os.environ[f'M4R_CELL_TILE{k}'].split(',')))
+        # channel split across waves for the small cells (measured on gfx1101: 4 below 5000 pixels, 2 below 10000; exact either way)
+        wcs = 4 if h * w < 5000 else 2 if h * w < 10000 else 1
+        cb1 = (c1 + 15) // 16
+        while wcs > 1 and (cb1 % wcs or c3):
+            wcs //= 2
+        wcs = int(os.environ.get(f'M4R_CELL_WC{k}', os.environ.get('M4R_CELL_WC', wcs)))   # experiments
+        def cell_defs(tx, ty, mp):
+            # unroll of the pipelined 3x3 step loop (measured 720p and 2560x1440): 6 on the 2-pixel-group cells (cells 1 and 6 faster, 0 the
+            # same), 4 on the others (6 and 8 slower); a variant that spills falls back to less (cell_kernel)
+            pipeu = 6 if mp > 1 else 4
+            defs = dict(WC=wcs, W=w, H=h, MODE=mode, CIN=cin, SIN=(in_stride if (mode == 0 and in_stride) else cin), C1=c1, C2=c2, C3=c3, SOUT=sout or cout, TX=tx, TY=ty, MP=mp, UPMIX=upmix,
+                        PIPEU=pipeu, TAPU=int(os.environ.get('M4R_TAPU', '1')), CBU=int(os.environ.get('M4R_CBU', '1')))
+            for env in ('M4R_CELL_DEFS', f'M4R_CELL_DEFS{k}'):   # experiments (all cells / cell k)
+                defs.update({a: int(v) if v.lstrip('-').isdigit() else v for a, v in (kv.split('=', 1) for kv in os.environ.get(env, '').split(';') if kv)})
+            if otex:
+                defs.update(OUTTEX=1, TXW=otex[3], TXH=otex[4])
+            if nn_impl() == 'soft':
+                defs['SOFTW'] = 1
+            return defs
+        # a 2-pixel-group tile that spills even without pipelining (cell 4 at 2560x1440) is slower than the 1-group tile without scratch
+        r = cell_kernel(p, cell_defs(*tile), spill_ok=tile[2] == 1)
+        if r is None:
+            tile = (16, 4, 1)
+            r = cell_kernel(p, cell_defs(*tile))
+        name, nth = r
+        tx, ty, mp = tile
+        p.lines.append(f'pass {name} threads {((w + tx - 1) // tx) * nth} {(h + ty - 1) // ty} 1')
+        args = (src, skip or src, src if otex else dst, f'w{i}', f'b{i}', f'w{i + 1}', f'b{i + 1}', f'w{i + 2}' if last else f'w{i + 1}', f'b{i + 2}' if last else f'b{i + 1}')
+        for k, bn in enumerate(args):
+            p.lines.append(f'  buf {k} {bn}')
+        if otex:
+            for j in range(3):
+                p.lines.append(f'  tex {j} {otex[j]}')   # texture locations count separately from buffers
+    h1, w1, h2, w2, h3, w3 = H // 2, W // 2, H // 4, W // 4, H // 8, W // 8
+    cell(0, in_name, None, 's0', H, W, 0)
+    cell(1, 's0', None, 's1', h1, w1, 2)
+    cell(1, 's1', None, 's2', h2, w2, 4)
+    cell(1, 's2', None, 'bott', h3, w3, 6)
+    cell(2, 'bott', 's2', 'd2', h2, w2, 8)
+    cell(2, 'd2', 's1', 'd1', h1, w1, 10)
+    cell(2, 'd1', 's0', out_name, H, W, 12, last=True, sout=7)
+
+
+def dbf_net(p, dat, H, W, in_name='dbf_in', out_name='dbf_out', out_tex=None, in_stride=None):
+    """in_stride: halves per input pixel when the producer pads the 13 channels (m4r's LOWRES writes 16)"""
     """appends the DBFNet passes to plan generator p (needs buffer(name, size[, blob]), glsl(name, src), run(kernel, w, h, bufs, consts));
     in_name is [H][W][13] f16 (NHWC), out_name [H][W][7]; H and W multiples of 8"""
     assert H % 8 == 0 and W % 8 == 0
+    if getattr(p, 'wmma', False) and not os.environ.get('M4R_DBF_UNFUSED'):
+        dbf_net_fused(p, dat, H, W, in_name, out_name, out_tex, in_stride)
+        return bool(out_tex)
+    assert not out_tex, 'out_tex needs the fused cells'
     sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'shaders')
     P = DBF
     def buf(name, h, w, c):

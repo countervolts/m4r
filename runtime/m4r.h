@@ -63,6 +63,10 @@ typedef struct m4r_denoise_desc {
      * (hardware_depth = 0) depth_out (R32F, render size) receives the depth in the game's own projection convention
      * (z * [2][2] + [3][2]) / (z * [2][3] + [3][3]), sky = the far value, for that upscaler. */
     m4r_image denoised_out, depth_out;
+    /* Opt-in: run MetalFX's bilateral filter on the raw hardware exp/log/sqrt/pow instructions (what Metal's fast:: functions mean) instead
+     * of LLVM's strict lowering: about 2x faster filter (0.25 -> 0.13 ms per pass at 1280x720), not bit-identical (see docs/metalfx-denoiser.md).
+     * Also switched on by the environment variable M4R_FAST_MATH=1. */
+    int fast_math;
 } m4r_denoise_desc;
 
 /* Frame generation at present time. The finished frame (backbuffer, display size) and this frame's render-size depth
@@ -90,6 +94,9 @@ M4R_API int m4r_denoise_capture(m4r_context* ctx, VkCommandBuffer cb, const m4r_
  * (m4r_upscale_init sizes). Not implemented yet: the denoiser's own upscaling network (UBFNet) and V3 temporal stage. 0 = ok. */
 M4R_API int m4r_denoise_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);
 M4R_API int m4r_denoise(m4r_context* ctx, VkCommandBuffer cb, const m4r_denoise_desc* desc);
+/* 1 when the denoised image is already resolved to pixel centres (V3 as a 1:1 denoiser, M4R_V3_DENOISE=1): the upscaler after it
+ * must take it with zero jitter. 0 for the dn denoiser (its image keeps the frame's jitter). */
+M4R_API int m4r_denoise_output_dejittered(m4r_context* ctx);
 /* debugging: the image of a texture of the denoiser plan (e.g. "denoised"), VK_NULL_HANDLE if there is none */
 M4R_API VkImage m4r_denoise_texture(m4r_context* ctx, const char* name);
 M4R_API int m4r_interpolate_init(m4r_context* ctx, uint32_t out_w, uint32_t out_h, uint32_t in_w, uint32_t in_h);

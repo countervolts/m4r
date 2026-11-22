@@ -11,6 +11,10 @@ SPDX-License-Identifier: GPL-3.0-only
 import argparse, hashlib, json, os, struct, sys
 import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Metal's fast:: exp / log / sqrt / pow run on the raw hardware instructions; the translator's default lowering is LLVM's strict one
+# (correctly rounded sqrt, extended-precision exp/log, range and denormal scaling around exp2/log2), which makes Apple's bilateral
+# filter about 2x slower. Runtime plans hold both bilateral variants (Gen.kernel(fast=True) is the raw one, air/intrinsics.py fast_raw);
+# the strict one is the default and the raw one is opt-in (m4r_denoise_desc.fast_math, env M4R_FAST_MATH=1, OptiScaler [MetalFX] FastMath).
 sys.path.insert(0, ROOT); sys.path.insert(0, os.path.join(ROOT, 'tools'))
 from air import m4r_air, metallib
 import denoise_nets
@@ -26,7 +30,7 @@ class Gen:
         os.makedirs(out + '/k', exist_ok=True); os.makedirs(out + '/blobs', exist_ok=True)
         self.mtl = open(res + '/default.metallib', 'rb').read()
         self.lib = metallib.parse(self.mtl)
-        self.lines = []; self.kernels = {}; self.src = {}; self.wmma = not os.environ.get('M4R_NO_WMMA')   # WMMA convs (shaders/nn_conv_wmma.cl); M4R_NO_WMMA=1: plain GLSL convs
+        self.lines = []; self.serial = False; self.kernels = {}; self.src = {}; self.wmma = not os.environ.get('M4R_NO_WMMA')   # WMMA convs (shaders/nn_conv_wmma.cl); M4R_NO_WMMA=1: plain GLSL convs
         self.res = res
         self.dat = {n: open(f'{res}/emit_{n}net_v3_2_constants.dat', 'rb').read() for n in ('dbf', 'ubf')}
 
@@ -36,15 +40,30 @@ class Gen:
             self.src[fn] = m4r_air.to_text(metallib.bitcode(self.mtl, self.lib, f))
         return self.src[fn]
 
-    def kernel(self, fn, consts, tg):
+    def kernel(self, fn, consts, tg, fast=False):
         h = hashlib.sha256(self.mtl).hexdigest()[:16]
         key = m4r_air.specialization_key(fn, {k: str(v) for k, v in consts.items()}, list(tg), h)
-        name = f'{fn}-{key}'
+        name = f'{fn}-{key}' + ('f' if fast else '')
+        if fn + ':' in os.environ.get('M4R_CPOL', ''):   # cache-policy experiments (m4r_air): a separate kernel
+            name += '-c' + hashlib.sha256(os.environ['M4R_CPOL'].encode()).hexdigest()[:6]
         if name not in self.kernels:
             base = f'{self.out}/k/{name}'
             if not os.path.exists(base + '.hsaco'):
-                ir, man = m4r_air.translate(self.source(fn), fn, consts, list(tg))
-                m4r_air.compile_ir(ir, base + '.hsaco')
+                saved = os.environ.get('M4R_FAST_MATH'); saved_llc = os.environ.get('M4R_LLC_FLAGS')
+                if fast: os.environ['M4R_FAST_MATH'] = '1'
+                else: os.environ.pop('M4R_FAST_MATH', None)
+                if fn == 'bilateral' and saved_llc is None:
+                    # the bilateral filter is ALU-bound: LLVM's iterative-ilp scheduler gives it 9% fewer vector instructions and a 25% faster
+                    # fast variant (whole denoiser -0.9% strict, -2.5% fast); code generation only, the output is bit-identical
+                    os.environ['M4R_LLC_FLAGS'] = '--amdgpu-sched-strategy=iterative-ilp'
+                try:
+                    ir, man = m4r_air.translate(self.source(fn), fn, consts, list(tg))
+                    m4r_air.compile_ir(ir, base + '.hsaco')
+                finally:
+                    if saved is None: os.environ.pop('M4R_FAST_MATH', None)
+                    else: os.environ['M4R_FAST_MATH'] = saved
+                    if saved_llc is None: os.environ.pop('M4R_LLC_FLAGS', None)
+                    else: os.environ['M4R_LLC_FLAGS'] = saved_llc
                 m4r_air.write_manifest(man, base)
             self.kernels[name] = fn
             self.lines.append(f'kernel {name} k/{name}')
@@ -57,8 +76,13 @@ class Gen:
         else:
             self.lines.append(f'buffer {name} {max(16, int(size))}')
 
+    # textures that measured faster with DCC (lossless colour compression; RADV gives it to colour-attachment images, runtime/plan.cpp `dcc`):
+    # the motion copy and the R8 masks, gfx1101 (DLAA -1%, other modes neutral); everything compressed was slower below DLAA
+    DCC = {'int_motion', 'mm0', 'mm1', 'mmr', 'shin', 'bw0', 'bw1'}
+
     def texture(self, name, fmt, w, h):
-        self.lines.append(f'texture {name} {fmt} {w} {h}')
+        dcc = name in self.DCC and not os.environ.get('M4R_PLAN_NO_DCC')
+        self.lines.append(f'texture {name} {fmt} {w} {h}' + (' dcc' if dcc else ''))
 
     def glsl(self, name, src, lx=8, ly=8):
         if ('glsl', name) not in self.kernels:
@@ -76,17 +100,88 @@ class Gen:
         for i, c in enumerate(consts):
             self.lines.append(f'  bytes {8 + i} {int(c).to_bytes(4, "little").hex()}')
 
-    def run_k(self, fn, consts, tg, grid, binds, only=None, groups=False):
+    def run_k(self, fn, consts, tg, grid, binds, only=None, groups=False, fast=False):
         for kv in filter(None, os.environ.get('M4R_FC', '').split(',')):   # experiments: M4R_FC=name=0|1,... overrides function constants
             n, v = kv.split('=')
             if n in consts:
                 consts = dict(consts, **{n: bool(int(v))})
-        k = self.kernel(fn, consts, tg)
+        k = self.kernel(fn, consts, tg, fast)
         self.lines.append(f'pass {k} {"groups" if groups else "threads"} {grid[0]} {grid[1]} {grid[2]}')
         if only:
             self.lines.append('  only ' + only)
         for b in binds:
             self.lines.append('  ' + b)
+
+    def aux_kernel(self, which, W, H, tex_args, buf_args, extra=None):
+        """One of shaders/nn_aux.cl's kernels (PREP, TAIL1, TAIL2: OpenCL C through clang, images read and written directly) for a W x H image;
+        returns the kernel name. Arguments in order: the textures (their descriptor records), then the parameter buffers."""
+        import hashlib, subprocess, tempfile
+        src = os.path.join(ROOT, 'shaders', 'nn_aux.cl')
+        defs = {'W': W, 'H': H, 'DIV(a,b)': '((a)/(b))', 'DIV9(a)': '((a)/9.0f)', 'DIVT(a,b)': '((a)/(b))', 'SMOOTHSTEP1(t)': '(1.0f-(t)*(t)*(3.0f-2.0f*(t)))', 'MIX(a,b,t)': 'fma((b)-(a),(t),(a))', 'FMA(a,b,c)': 'fma(a,b,c)'}
+        defs.update(extra or {})
+        defs.update({k: v for k, v in (kv.split('=', 1) for kv in os.environ.get('M4R_AUX_DEFS', '').split(';') if kv)})   # experiments
+        key = hashlib.sha256((open(src).read() + repr(sorted(defs.items())) + which + m4r_air.GPU).encode()).hexdigest()[:12]
+        name = f'nn_aux_{which.lower()}-{key}'
+        if ('aux', name) not in self.kernels:
+            base = f'{self.out}/k/{name}'
+            if not os.path.exists(base + '.hsaco'):
+                with tempfile.TemporaryDirectory() as d:
+                    ll = d + '/k.ll'
+                    subprocess.run(['clang', '-x', 'cl', '-cl-std=CL2.0', '--target=amdgcn-amd-amdhsa', f'-mcpu={m4r_air.GPU}', '-nogpulib', '-O3',
+                                    '-Xclang', '-target-feature', '-Xclang', '+extended-image-insts', '-S', '-emit-llvm',
+                                    src, '-o', ll, f'-D{which}'] + [f'-D{k}={v}' for k, v in defs.items()], check=True)
+                    text = open(ll).read()
+                m4r_air.compile_ir(text, base + '.hsaco')
+                args = [dict(kind='texture', location=i, offset=8 * i, name=n, access='write') for i, n in enumerate(tex_args)]
+                args += [dict(kind='buffer', location=len(tex_args) + j, offset=8 * (len(tex_args) + j), name=n, access='read') for j, n in enumerate(buf_args)]
+                n = len(args)
+                ts = int(defs.get('TS', 16)) if which == 'TAILF' else 8   # TAILF: TS x TS groups (shaders/nn_aux.cl)
+                # LOWRES samples the history like Apple's lowres_signals: linear, clamp to edge, normalised coordinates
+                smp = [{'global': '__m4r_sampler_0', 'state': [34901797601020489, 0]}] if which == 'LOWRES' else []
+                man = {'kernel': 'nn_' + which.lower(), 'threadgroup': [ts, ts, 1], 'kernarg_size': 8 * n + 16, 'grid_offset': 8 * n, 'samplers': smp, 'args': args}
+                m4r_air.write_manifest(man, base)
+            self.kernels[('aux', name)] = name
+            self.lines.append(f'kernel {name} k/{name}')
+        return name
+
+    def bilat_kernel(self, W, H, it):
+        """shaders/nn_bilat.cl (MetalFX's bilateral pass rewritten, FastMath form) for a W x H image and iteration it; returns the name"""
+        import subprocess, tempfile
+        src = os.path.join(ROOT, 'shaders', 'nn_bilat.cl')
+        defs = {'W': W, 'H': H, 'IT': it}
+        defs.update({k: v for k, v in (kv.split('=', 1) for kv in os.environ.get('M4R_BILAT_DEFS', '').split(';') if kv)})   # experiments
+        key = hashlib.sha256((open(src).read() + repr(sorted(defs.items())) + m4r_air.GPU).encode()).hexdigest()[:12]
+        name = f'nn_bilat-{key}'
+        if ('bilat', name) not in self.kernels:
+            base = f'{self.out}/k/{name}'
+            if not os.path.exists(base + '.hsaco'):
+                with tempfile.TemporaryDirectory() as d:
+                    ll = d + '/k.ll'
+                    subprocess.run(['clang', '-x', 'cl', '-cl-std=CL2.0', '--target=amdgcn-amd-amdhsa', f'-mcpu={m4r_air.GPU}', '-nogpulib', '-O3',
+                                    '-Xclang', '-target-feature', '-Xclang', '+extended-image-insts', '-S', '-emit-llvm', src, '-o', ll]
+                                   + [f'-D{k}={v}' for k, v in defs.items()], check=True)
+                    text = open(ll).read()
+                m4r_air.compile_ir(text, base + '.hsaco')
+                names = ['color', 'normal_roughness', 'out', 'shininess', 'noise', 'features', 'depth']
+                args = [dict(kind='texture', location=i, offset=8 * i, name=n, access='write' if n == 'out' else 'read') for i, n in enumerate(names)]
+                # Apple's sampler states: features / noise linear normalised clamp to edge, shininess nearest normalised clamp to edge
+                man = {'kernel': 'nn_bilat', 'threadgroup': [8, 8, 1], 'kernarg_size': 8 * len(names) + 32, 'grid_offset': 8 * len(names),
+                       'samplers': [{'global': '__m4r_sampler_0', 'state': [34901797601020489, 0]},
+                                    {'global': '__m4r_sampler_1', 'state': [34901797601017929, 0]}], 'args': args}
+                m4r_air.write_manifest(man, base)
+            self.kernels[('bilat', name)] = name
+            self.lines.append(f'kernel {name} k/{name}')
+        return name
+
+    def aux_pass(self, which, W, H, tex_binds, buf_binds, only=None):
+        name = self.aux_kernel(which, W, H, tex_binds, buf_binds)
+        self.lines.append(f'pass {name} threads {W} {H} 1')
+        if only:
+            self.lines.append('  only ' + only)
+        for i, n in enumerate(tex_binds):
+            self.lines.append(f'  tex {i} {n}')
+        for j, n in enumerate(buf_binds):
+            self.lines.append(f'  buf {len(tex_binds) + j} {n}')
 
     def save(self):
         names = [l.split()[1] for l in self.lines if l.split(' ', 1)[0] in ('buffer', 'texture')]
@@ -94,7 +189,9 @@ class Gen:
         assert not dup, f'buffers/textures declared twice (they would share memory under different sizes): {dup}'
         decl = [l for l in self.lines if l.split(' ', 1)[0] in ('buffer', 'texture', 'kernel', 'glsl')]
         rest = [l for l in self.lines if l.split(' ', 1)[0] not in ('buffer', 'texture', 'kernel', 'glsl')]
-        open(self.out + '/plan.txt', 'w').write('\n'.join([f'gpu {m4r_air.GPU}'] + decl + rest) + '\n')
+        # runtime denoiser plans run in plan order (`serial`): the dependency levels measured 1.5-2.5% slower in every mode
+        head = [f'gpu {m4r_air.GPU}'] + (['serial'] if self.serial else [])
+        open(self.out + '/plan.txt', 'w').write('\n'.join(head + decl + rest) + '\n')
 
 
 def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
@@ -105,12 +202,31 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
     # persistent state and intermediates (BFNet / BRNet_v3 constructors)
     g.buffer('exp0', 2, h16(1.0)); g.buffer('exp1', 2, h16(1.0)); g.buffer('hinv', 16); g.buffer('reset', 16); g.buffer('preexp', 16)
     g.buffer('dbf_params', 40); g.buffer('refl_params', 224)
-    g.buffer('dbf_in', tw * th * ROW)
+    g.buffer('dbf_in', tw * th * 32)   # 26 bytes per pixel in Apple's layout; m4r's LOWRES pads to 32
     g.texture('int_motion', 'R16G16_SFLOAT', iw, ih); g.texture('int_depth', 'R32_SFLOAT', iw, ih)
     # BFNet +0xa8: the previous frame's colour (texPrevInputFrame) and the first a-trous iteration's output (history_tex): one texture
     g.texture('hist', 'R16G16B16A16_SFLOAT', W, H)
     g.texture('mm0', 'R8_UNORM', W, H); g.texture('mm1', 'R8_UNORM', W, H)
-    if runtime:
+    fused = runtime and stage == 'D' and not os.environ.get('M4R_PLAN_OLD_AUX')
+    lowres_fused = fused and not os.environ.get('M4R_PLAN_OLD_LOWRES')
+    if lowres_fused:
+        # PREP and Apple's dbfnetv1_lowres_signals as one pass (shaders/nn_aux.cl LOWRES), after the exposure pass below; the hardware depth
+        # it makes goes straight into int_depth (Apple's kernel copied the depth there), so there is no depth_hw
+        g.texture('roughness', 'R16_SFLOAT', iw, ih); g.texture('spechit', 'R32_SFLOAT', 1, 1)
+        g.texture('color_exp', 'R16G16B16A16_SFLOAT', iw, ih)
+        g.texture('nrm_fix', 'R16G16B16A16_SFLOAT', iw, ih)   # the game's normals at unit length (shaders/nn_aux.cl LOWRES)
+        g.texture('nrm_px', 'R16G16B16A16_SFLOAT', iw, ih)    # per-pixel unit normal + roughness for the bilateral passes (NSMOOTH)
+        g.buffer('prep_par', 64)
+    elif fused:
+        # m4r's stages around the denoiser as image-reading kernels (shaders/nn_aux.cl): no staging copies. PREP: roughness = normals.w, colour
+        # * exposure, linear depth -> hardware depth (+ the game's convention for the upscaler); the texture names ending in _game are the
+        # game's own images, the Apple passes read 'color' and 'depth', which the run time points at the converted ones when there are any
+        g.texture('roughness', 'R16_SFLOAT', iw, ih); g.texture('spechit', 'R32_SFLOAT', 1, 1)
+        g.texture('depth_hw', 'R32_SFLOAT', iw, ih); g.texture('color_exp', 'R16G16B16A16_SFLOAT', iw, ih)
+        g.buffer('prep_par', 64)
+        g.aux_pass('PREP', iw, ih, ['normals', 'roughness', 'color_game', 'exposure_game', 'color_exp', 'depth_game', 'depth_hw', 'depth_k'],
+                   ['prep_par'], only='prep')
+    elif runtime:
         # the game's normals carry roughness in alpha (pass 0): m4r copies the normals to nrm_raw, this pass extracts alpha into
         # rough_raw, m4r copies that into the roughness texture; specular hit distance is not read (spec_hit_dist_enabled false)
         g.buffer('nrm_raw', iw * ih * 8); g.buffer('rough_raw', iw * ih * 2)
@@ -145,8 +261,21 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
             only='autoexp', groups=True)
     g.run_k('exposure_texture_to_buffer', {}, (32, 1, 1), (1, 1, 1),
             ['tex 0 exposure', 'buf 0 exp0|exp1', 'buf 1 exp1|exp0', 'buf 2 hinv', 'buf 3 reset'], only='!autoexp')
+    if fused and not lowres_fused and g.serial and not os.environ.get('M4R_PLAN_NO_OVERLAP'):
+        g.lines.append('  overlap')   # one thread, independent of PREP: shares its barrier
     # BFNet_v1_Filter::encodePre: dbfnetv1_lowres_signals
-    g.run_k('dbfnetv1_lowres_signals', {'is_tensor_layout_nchw': False, 'spec_hit_dist_enabled': False, 'new_overshoot_clamp': False},
+    if lowres_fused:
+        tex = ['normals', 'motion', 'color_game', 'exposure_game', 'color_exp', 'depth_game', 'int_depth', 'depth_k', 'int_motion', 'specular',
+               'hist', 'mm0|mm1', 'roughness', 'nrm_fix', 'nrm_px']
+        bufs = ['prep_par', 'dbf_params', 'exp0|exp1', 'preexp', 'dbf_in']
+        # NSMOOTH: reproject_warp compares depth-aware 3x3-mean normals (shaders/nn_aux.cl; M4R_PLAN_NO_NSMOOTH=1 = per-pixel unit normals)
+        extra = {'TSTRIDE': 16} if g.wmma else {}
+        extra['NSMOOTH'] = 0 if os.environ.get('M4R_PLAN_NO_NSMOOTH') else 1
+        name = g.aux_kernel('LOWRES', iw, ih, tex, bufs, extra=extra)
+        g.lines.append(f'pass {name} threads {tw} {th} 1')
+        g.lines += [f'  tex {i} {n}' for i, n in enumerate(tex)] + [f'  buf {len(tex) + j} {n}' for j, n in enumerate(bufs)]
+    else:
+      g.run_k('dbfnetv1_lowres_signals', {'is_tensor_layout_nchw': False, 'spec_hit_dist_enabled': False, 'new_overshoot_clamp': False},
           (8, 8, 1), (tw, th, 1),
           ['tex 0 normals', 'tex 1 motion', 'tex 2 depth', 'tex 3 int_motion', 'tex 4 int_depth', 'tex 5 color', 'tex 6 hist',
            'tex 7 specular', 'tex 8 diffuse', 'tex 9 roughness', 'tex 10 spechit', 'tex 11 mm0|mm1', 'tex 12 mm1|mm0',
@@ -154,6 +283,7 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
     # BRNet_v3_Filter::encodeMidForDenoise (DMidProcessing, before BFNet's reproject): dilate the flow, splat it, and compare: flowDiff
     # (BFNet's flow_diff_tex) and the motion-reduced mirror mask (BFNet +0xe8, the bilateral's mirrorMask). Reversed depth skips the
     # forward-z init; flow_splat_reverse_depth follows the depth convention. bytes(2) of flow_splat in the host code has no kernel argument.
+    flow_mark = len(g.lines)
     rev = 1  # TODO runtime: both conventions (plans exist per convention like bbr's)
     g.texture('flowd', 'R16G16_SFLOAT', iw, ih); g.texture('splat', 'R16G16_SFLOAT', iw, ih)
     g.texture('flowdiff', 'R16_SFLOAT', W, H); g.texture('mmr', 'R8_UNORM', W, H)
@@ -167,8 +297,31 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
             ['tex 0 flowd', 'tex 1 splat', 'tex 2 flowdiff', 'tex 3 mm0|mm1', 'tex 4 mm1|mm0', 'tex 5 mmr', 'buf 1 bparams'])
     if stage < 'C':
         return dict(W=W, H=H, tw=tw, th=th)
+    # The flow chain does not depend on the network and the network not on it: in runtime plans with the fused cells each of its four passes
+    # runs beside one of the first four cells (`overlap`: no barrier between the two; the next barrier covers both), so the small flow kernels
+    # fill the GPU while a cell runs. M4R_PLAN_NO_OVERLAP=1 keeps them in a block before the network.
+    flow = g.lines[flow_mark:]; del g.lines[flow_mark:]
+    g.lines += [l for l in flow if l.split(' ', 1)[0] in ('buffer', 'texture', 'kernel', 'glsl')]
+    flow_blocks = []
+    for l in flow:
+        if l.startswith('pass '):
+            flow_blocks.append([l])
+        elif l.startswith('  ') and flow_blocks:
+            flow_blocks[-1].append(l)
+    net_mark = len(g.lines)
     # DNet: DBFNet (cells E1-E4, D1-D3), NHWC, rowBytes 26 in / 14 out
-    denoise_nets.dbf_net(g, g.dat['dbf'], th, tw, 'dbf_in', 'dbf_out')
+    # stage D with the fused cells: the network's last cell writes MetalFX's output textures itself (dbfnetv1_output_channels' job; exact),
+    # M4R_PLAN_OUTCH=1 keeps Apple's pass
+    out_tex = None
+    if stage >= 'D' and g.wmma and not os.environ.get('M4R_DBF_UNFUSED') and not os.environ.get('M4R_PLAN_OUTCH'):
+        out_tex = ('dbf_feat', 'dbf_noise', 'dbf_tw', W // 2, H // 2)
+    net_textures = denoise_nets.dbf_net(g, g.dat['dbf'], th, tw, 'dbf_in', 'dbf_out', out_tex, in_stride=16 if lowres_fused and g.wmma else None)
+    cells = [i for i in range(net_mark, len(g.lines)) if g.lines[i].startswith('pass nn_cell')]
+    if runtime and g.serial and len(cells) >= len(flow_blocks) + 1 and not os.environ.get('M4R_PLAN_NO_OVERLAP'):
+        for k in reversed(range(len(flow_blocks))):   # flow pass k right after cell k (before cell k + 1)
+            g.lines[cells[k + 1]:cells[k + 1]] = flow_blocks[k] + ['  overlap']
+    else:
+        g.lines[net_mark:net_mark] = [l for b in flow_blocks for l in b]
     if stage < 'D':
         return dict(W=W, H=H, tw=tw, th=th)
     hw, hh = W // 2, H // 2
@@ -190,55 +343,116 @@ def build(g, iw, ih, stage, runtime=False, ow=None, oh=None):
     for n in ('dbf_params_out', 'rw_ms', 'rw_pj', 'rw_cj'):
         g.buffer(n, 40)
     # DPostProcessing: BFNet_v1_Filter::encodePost (dbfnetv1_output_channels)
-    g.run_k('dbfnetv1_output_channels', {'is_tensor_layout_nchw': False}, (8, 8, 1), (hw, hh, 1),
+    if not net_textures:
+        g.run_k('dbfnetv1_output_channels', {'is_tensor_layout_nchw': False}, (8, 8, 1), (hw, hh, 1),
             ['buf 0 dbf_params_out', 'buf 1 dbf_out', 'tex 0 dbf_feat', 'tex 1 dbf_noise', 'tex 2 dbf_tw'])
-    # DMid: BFNet_v1_Filter::encodeMid (reproject_warp)
+    # DMid: BFNet_v1_Filter::encodeMid (reproject_warp). It reads none of the network's outputs (only the flow chain's and the inputs), so in
+    # runtime plans with the fused cells it runs beside one of the network's cells (`overlap`, M4R_WARP_CELL=<cell index>, -1 = after the network)
+    warp_mark = len(g.lines)
     g.run_k('reproject_warp', {'bfnet1_enabled': True}, (8, 8, 1), (W, H, 1),
-            ['tex 0 color', 'tex 1 warp_color', 'tex 2 warp_prev', 'tex 3 normals', 'tex 4 int_depth', 'tex 5 specular',
+            ['tex 0 color', 'tex 1 warp_color', 'tex 2 warp_prev', 'tex 3 ' + ('nrm_fix' if lowres_fused else 'normals'), 'tex 4 int_depth', 'tex 5 specular',
              'tex 6 diffuse', 'tex 7 roughness', 'tex 8 nr0|nr1', 'tex 9 nr1|nr0', 'tex 10 int_motion', 'tex 11 hist',
              'tex 14 shin', 'tex 15 fc1|fc0', 'tex 16 fc0|fc1', 'tex 17 flowdiff', 'tex 18 spec_mvec', 'tex 21 rm0|rm1',
              'tex 22 boost', 'tex 23 rm1|rm0', 'tex 24 dy0|dy1', 'tex 25 dy1|dy0',
              'buf 0 rw_ms', 'buf 1 rw_pj', 'buf 2 rw_cj', 'buf 3 exp0|exp1', 'buf 4 exp1|exp0', 'buf 5 preexp', 'buf 6 reset'])
+    # the warp in row bands (`band k n`, the same pixels as one dispatch), band k beside cell warp_cells[k]
+    warp_cells = [int(c) for c in os.environ.get('M4R_WARP_CELLS', '6').split(',') if c]
+    if runtime and g.serial and net_textures and warp_cells and not os.environ.get('M4R_PLAN_NO_OVERLAP'):
+        block = g.lines[warp_mark:]; del g.lines[warp_mark:]
+        g.lines += [l for l in block if not (l.startswith('pass ') or l.startswith('  '))]   # its declarations stay
+        block = [l for l in block if l.startswith('pass ') or l.startswith('  ')]
+        for k in reversed(range(len(warp_cells))):
+            cells = [i for i in range(net_mark, len(g.lines)) if g.lines[i].startswith('pass nn_cell')]
+            nxt = next((i for i in range(cells[warp_cells[k]] + 1, len(g.lines)) if g.lines[i].startswith('pass ')), len(g.lines))
+            g.lines[nxt:nxt] = block + ['  overlap'] + ([f'  band {k} {len(warp_cells)}'] if len(warp_cells) > 1 else [])
     # BFNet_v1_Filter::encodeAtrous: temporal blend, four a-trous iterations, remodulation
     g.run_k('reproject_blend', {'bfnet1_enabled': True}, (8, 8, 1), (W, H, 1),
             ['tex 0 warp_color', 'tex 1 warp_prev', 'tex 2 warp_color', 'tex 3 bw1|bw0', 'tex 22 boost', 'tex 5 dbf_tw',
              'tex 6 fc0|fc1', 'tex 7 dy0|dy1'])
+    # with NSMOOTH the bilateral passes read the per-pixel normals LOWRES writes (nrm_px), not reproject_warp's (smoothed) normal_roughness
+    bil_nr = 'nrm_px' if lowres_fused and not os.environ.get('M4R_PLAN_NO_NSMOOTH') else 'nr1|nr0'
     srcs = ['warp_color', 'hist', 'warp_color', 'warp_prev']; dsts = ['hist', 'warp_color', 'warp_prev', 'warp_color']
-    if runtime and not os.environ.get('M4R_PLAN_NO_MIRROR'):
+    finals = ['warp_color', 'hist', 'warp_color', 'warp_prev', 'warp_color']
+    # fused tail (shaders/nn_aux.cl TAILF): the remodulations, mirror gate, despeckle and exposure undo in one pass after the filter. It reads the
+    # temporal blend (warp_color) after the bilateral passes, so they write bA / bB instead of warp_color (hist stays the first pass's output:
+    # it is next frame's history). M4R_PLAN_OLD_TAIL=1: the four separate passes.
+    tailf = fused and not os.environ.get('M4R_PLAN_OLD_TAIL')
+    if tailf:
+        g.texture('bA', 'R16G16B16A16_SFLOAT', W, H); g.texture('bB', 'R16G16B16A16_SFLOAT', W, H)
+        srcs = ['warp_color', 'hist', 'bA', 'bB']; dsts = ['hist', 'bA', 'bB', 'bA']
+        finals = ['warp_color', 'hist', 'bA', 'bB', 'bA']
+    if fused and os.environ.get('M4R_PLAN_NO_MIRROR'):
+        g.texture('denoised_t', 'R16G16B16A16_SFLOAT', iw, ih)
+    if runtime and not tailf and not os.environ.get('M4R_PLAN_NO_MIRROR'):
         # mirror gating (m4r, not MetalFX; shaders/nn_mirror.comp): the temporal blend alone, remodulated like the final colour, into
         # denoised_t before the bilateral passes overwrite it (flag mirrort, on for the frame); m4r then blends it into the filtered
         # result on mirror-like pixels (flag mirrorb, set for that one pass)
         g.texture('denoised_t', 'R16G16B16A16_SFLOAT', iw, ih)
-        g.buffer('mir_den', iw * ih * 8); g.buffer('mir_t', iw * ih * 8); g.buffer('mir_par', 16)
+        if not fused:
+            g.buffer('mir_den', iw * ih * 8); g.buffer('mir_t', iw * ih * 8); g.buffer('mir_par', 16)
         g.run_k('denoiser_between_processing', {'bfnet1_enabled': True, 'str_mask_enabled': False, 'compose_buffer_enabled': False},
                 (8, 8, 1), (W, H, 1),
                 ['tex 0 warp_color', 'tex 1 color', 'tex 4 shin', 'tex 5 denoised_t', 'tex 6 specular', 'tex 7 diffuse', 'tex 8 roughness',
                  'tex 9 dbf_tw', 'buf 10 exp0|exp1', 'buf 11 preexp'], only='mirrort')
-        g.glsl('nn_mirror', os.path.join(ROOT, 'shaders', 'nn_mirror.comp'))
-        g.run('nn_mirror', iw, ih, ['mir_den', 'mir_t', 'rough_raw', 'mir_par'], [iw, ih], only='mirrorb')
+        if not fused:
+            g.glsl('nn_mirror', os.path.join(ROOT, 'shaders', 'nn_mirror.comp'))
+            g.run('nn_mirror', iw, ih, ['mir_den', 'mir_t', 'rough_raw', 'mir_par'], [iw, ih], only='mirrorb')
     iters = int(os.environ.get('M4R_PLAN_ITERS', '4'))   # experiment: fewer a-trous iterations (the filter's result is in finals[iters])
-    finals = ['warp_color', 'hist', 'warp_color', 'warp_prev', 'warp_color']
     for i in range(iters):
         m = 4 << i
-        g.run_k('bilateral', {'bfnet1_enabled': True, 'spec_hit_dist_enabled': False}, (8, 8, 1),
-                ((W + m - 1) // m * m, (H + m - 1) // m * m, 1),
-                [f'tex 0 {srcs[i]}', 'tex 1 nr1|nr0', f'tex 2 {dsts[i]}', 'tex 3 shin', 'tex 4 dbf_noise', 'tex 5 dbf_feat',
-                 'tex 6 int_depth', 'tex 7 mmr',
-                 'bytes 0 ' + struct.pack('<4I', 1 << i, i, (~(-1 << i)) & 0xffffffff, (-4 << i) & 0xffffffff).hex(),
-                 'bytes 1 ' + struct.pack('<I', i).hex(), 'buf 2 reset'], only='!atr3' if runtime and iters == 4 and i == 3 else None)
-    # runtime plans: the fourth (32 px) bilateral pass is skipped when the run-time flag atr3 is set (M4R_ATROUS_ITERS=3: about -0.5 ms at
-    # 720p); the remodulation then reads the third pass's result. With the flag clear (the default everywhere) it is MetalFX's four passes.
+        for fast in ((False, True) if runtime else (False,)):
+            # runtime plans: both bilateral variants (strict / raw fast math), the run time sets one of sm, fm (passes 1-2), sm3, fm3 (pass 3),
+            # sm4, fm4 (pass 4); the number of passes is 2, 3 (default) or 4
+            only = None
+            if runtime and iters == 4:
+                only = ('fm' if fast else 'sm') + ('3' if i == 2 else '4' if i == 3 else '')
+            if fast and not os.environ.get('M4R_PLAN_APPLE_BILAT'):
+                # FastMath variant: m4r's rewrite of the pass (shaders/nn_bilat.cl: shared-memory taps instead of lane shuffles)
+                k = g.bilat_kernel(W, H, i)
+                sx = 1 << i
+                g.lines.append(f'pass {k} groups {(W + 8 * sx - 1) // (8 * sx) * sx} {(H + 8 * sx - 1) // (8 * sx) * sx} 1')
+                if only:
+                    g.lines.append('  only ' + only)
+                for j, t in enumerate((srcs[i], bil_nr, dsts[i], 'shin', 'dbf_noise', 'dbf_feat', 'int_depth')):
+                    g.lines.append(f'  tex {j} {t}')
+                continue
+            g.run_k('bilateral', {'bfnet1_enabled': True, 'spec_hit_dist_enabled': False}, (8, 8, 1),
+                    ((W + m - 1) // m * m, (H + m - 1) // m * m, 1),
+                    [f'tex 0 {srcs[i]}', 'tex 1 ' + bil_nr, f'tex 2 {dsts[i]}', 'tex 3 shin', 'tex 4 dbf_noise', 'tex 5 dbf_feat',
+                     'tex 6 int_depth', 'tex 7 mmr',
+                     'bytes 0 ' + struct.pack('<4I', 1 << i, i, (~(-1 << i)) & 0xffffffff, (-4 << i) & 0xffffffff).hex(),
+                     'bytes 1 ' + struct.pack('<I', i).hex(), 'buf 2 reset'], only=only, fast=fast)
+    # runtime plans hold all four bilateral passes; the run time runs the first 2, 3 (default) or 4 of them (flags sm3 / fm3 / sm4 / fm4) and
+    # the remodulation reads the result of the last one that ran (flags it2 / it3 / it4). A pass costs 0.25 ms strict, 0.13 ms fast at 1280x720.
     def between(src, only=None):
         g.run_k('denoiser_between_processing', {'bfnet1_enabled': True, 'str_mask_enabled': False, 'compose_buffer_enabled': False},
                 (8, 8, 1), (W, H, 1),
                 ['tex 0 ' + src, 'tex 1 color', 'tex 4 shin', 'tex 5 denoised', 'tex 6 specular', 'tex 7 diffuse', 'tex 8 roughness',
                  'tex 9 dbf_tw', 'buf 10 exp0|exp1', 'buf 11 preexp'], only=only)
-    if runtime and iters == 4:
-        between(finals[4], '!atr3')
-        between(finals[3], 'atr3')
+    if tailf:
+        g.buffer('tailf_par', 32)   # TailFPar (shaders/nn_aux.cl), 32 bytes
+        # mir_hist: the mirror accumulation's history (TAILF flag 64, m4r): the result of the previous frames, render size
+        g.texture('mir_hist', 'R16G16B16A16_SFLOAT', iw, ih)
+        # pxh0/pxh1: per-pixel running mean luminance (TAILF flag 512, m4r), ping-pong (neighbours read the previous frame's)
+        g.texture('pxh0', 'R32_SFLOAT', iw, ih); g.texture('pxh1', 'R32_SFLOAT', iw, ih)
+        for it in ((4, 3, 2) if iters == 4 else (iters,)):
+            g.aux_pass('TAILF', iw, ih, ['warp_color', finals[it], 'specular', 'diffuse', 'roughness', 'exposure_game', 'denoised', 'tail_k',
+                                         'mir_hist', 'int_motion', 'pxh1|pxh0', 'pxh0|pxh1'], ['tailf_par'], only=f'it{it}' if iters == 4 else None)
+    elif runtime and iters == 4:
+        between(finals[4], 'it4')
+        between(finals[3], 'it3')
+        between(finals[2], 'it2')
     else:
         between(finals[iters])
-    if runtime:
+    if tailf:
+        pass
+    elif fused:
+        # TAIL1: the mirror gate (temporal-only result blended in on mirror-like pixels) into mir_img; TAIL2: despeckle + exposure undo, stored into
+        # 'denoised' and, for an upscaler that takes the image straight from m4r, into tail_k
+        g.texture('mir_img', 'R16G16B16A16_SFLOAT', iw, ih); g.buffer('tail1_par', 16); g.buffer('tail2_par', 16)
+        g.aux_pass('TAIL1', iw, ih, ['denoised', 'denoised_t', 'roughness', 'mir_img'], ['tail1_par'], only='tail')
+        g.aux_pass('TAIL2', iw, ih, ['mir_img', 'exposure_game', 'denoised', 'tail_k'], ['tail2_par'], only='tail')
+    elif runtime:
         # m4r's own passes on the denoised colour (not MetalFX): m4r copies 'denoised' out to buffers, runs these, copies den_cl back.
         # The interim firefly clamp (only despeckle, den_raw -> den_cl) on both paths (before V3 it cuts the puddle grain V3 leaves,
         # capture m: -26%; M4R_PLAN_NO_V3_DESPECKLE=1 at plan time leaves it out of V3 plans); the
@@ -427,6 +641,7 @@ def main():
     if a.capture:
         o = dict(l.split(None, 1) for l in open(f'{a.capture}/rr-{a.first}.txt') if l.startswith('output'))
         ow, oh = map(int, o['output'].split())
+    g.serial = bool(a.runtime) and not os.environ.get('M4R_PLAN_NO_SERIAL')
     sz = build(g, iw, ih, a.stage, a.runtime, ow, oh)
     g.save()
     if a.capture:

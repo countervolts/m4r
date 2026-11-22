@@ -562,6 +562,41 @@ def translate(text, kernel, constants, tg, wave='auto', widen=False):
                     if dm and not re.search(r'^declare [^\n]*@air\.sample_texture_2d_bicubic' + re.escape(sfx) + r'\(', text, re.M):
                         text = text[:dm.end()] + '\n' + dm.group(0).replace('@air.sample_texture_2d' + sfx, '@air.sample_texture_2d_bicubic' + sfx) + text[dm.end():]
 
+    # 2a. cache-policy experiments (M4R_CPOL="kernel:N=bits,N=bits;kernel2:..."): the texture reads, samples and writes of the kernel's
+    # IR argument %N get the gfx11 cache-policy bits (1 glc, 2 slc = L2 stream, 4 dlc = no Infinity Cache allocation); hints only, the
+    # results are the same
+    for ent in filter(None, os.environ.get('M4R_CPOL', '').split(';')):
+        kn, _, lst = ent.partition(':')
+        if kn != kernel:
+            continue
+        for item in filter(None, lst.split(',')):
+            an, bits = item.split('=')
+            sfxs = set()
+            def ren(m):
+                sfxs.add((m.group(1), m.group(2)))
+                return f'@air.{m.group(1)}{m.group(2)}.cpol{bits}({m.group(3)}%{an},'
+            text = re.sub(r'@air\.((?:read|sample|write)_texture_2d)((?:\.[\w]+)*)\(([^%]*)%' + re.escape(an) + ',', ren, text)
+            for base, sfx in sfxs:
+                dm = re.search(r'^declare [^\n]*@air\.' + base + re.escape(sfx) + r'\([^\n]*$', text, re.M)
+                nn = f'@air.{base}{sfx}.cpol{bits}('
+                if dm and not re.search(r'^declare [^\n]*' + re.escape(nn), text, re.M):
+                    text = text[:dm.end()] + '\n' + dm.group(0).replace(f'@air.{base}{sfx}(', nn) + text[dm.end():]
+
+    # 2b. fast-math tier (plan-time M4R_FAST_MATH, pow): fast_pow with a constant exponent 2 is a multiplication, with a constant base 2 an
+    # exp2. The lowering of fast_pow (intrinsics.fpow) is written once per function and cannot see the constant, so each call costs a
+    # log and an exp (four of each for a float4): the bilateral filter has one scalar and one float4 pow(x, 2), a third of its transcendentals.
+    if intrinsics.fast_raw('pow'):
+        text = re.sub(r'^(\s*%[\w.]+ = )(?:tail )?call (?:fast )?float @air\.fast_pow\.f32\(float (%[\w.]+), float 2\.000000e\+00\)[^\n]*$',
+                      r'\1fmul fast float \2, \2', text, flags=re.M)
+        text = re.sub(r'^(\s*%[\w.]+ = )(?:tail )?call (?:fast )?<4 x float> @air\.fast_pow\.v4f32\(<4 x float> (%[\w.]+), '
+                      r'<4 x float> (?:<float 2\.000000e\+00, float 2\.000000e\+00, float 2\.000000e\+00, float 2\.000000e\+00>|'
+                      r'splat \(float 2\.000000e\+00\))\)[^\n]*$',   # LLVM 23 prints the constant vector as splat (...)
+                      r'\1fmul fast <4 x float> \2, \2', text, flags=re.M)
+        text, n2 = re.subn(r'^(\s*%[\w.]+ = )(?:tail )?call (?:fast )?float @air\.fast_pow\.f32\(float 2\.000000e\+00, float (%[\w.]+)\)[^\n]*$',
+                           r'\1call fast float @llvm.amdgcn.exp2.f32(float \2)', text, flags=re.M)
+        if n2 and 'declare float @llvm.amdgcn.exp2.f32' not in text:
+            text += '\ndeclare float @llvm.amdgcn.exp2.f32(float)\n'
+
     # 3. strip AIR named metadata (refers to old types); keep numbered nodes
     text = re.sub(r'^(!\d+) = !\{!"air\.sampler_state"[^\n]*$', r'\1 = !{}', text, flags=re.M)
     # lifetime markers are hints only, and LLVM requires them on an alloca (ours are behind a cast)
@@ -884,6 +919,46 @@ def translate(text, kernel, constants, tg, wave='auto', widen=False):
     return text, manifest
 
 
+def opt_flags():
+    """Extra opt options from M4R_OPT_FLAGS (space separated), e.g. -unroll-threshold=1000: optimisation choices only, the kernel computes
+    the same values"""
+    return os.environ.get('M4R_OPT_FLAGS', '').split()
+
+
+def llc_flags():
+    """Extra llc options from M4R_LLC_FLAGS (space separated), e.g. --amdgpu-sched-strategy=iterative-ilp: code generation only, no change
+    to the arithmetic. The plan generators set it per kernel."""
+    return os.environ.get('M4R_LLC_FLAGS', '').split()
+
+
+def expand_bool_vector_bitcasts(text):
+    """`%r = bitcast <N x i1> %v to iN` (what InstCombine makes of Metal's any() / all() on vector comparisons) as extracts, shifts and ors.
+    The AMDGPU backend lowers that bitcast through a stack temporary: an unused 8-byte private segment in the kernel descriptor, which
+    RDNA2 kernels may not have here (vkhip, no architected flat scratch). Same value, no stack."""
+    def rep(m):
+        ind, r, n, v = m.group(1), m.group(2), int(m.group(3)), m.group(4)
+        t = f'i{n}'
+        tag = 'm4r.bv' + re.sub(r'[^A-Za-z0-9_]', '_', r[1:])
+        out, acc = [], None
+        for k in range(n):
+            out.append(f'{ind}%{tag}.e{k} = extractelement <{n} x i1> {v}, i64 {k}')
+            out.append(f'{ind}%{tag}.z{k} = zext i1 %{tag}.e{k} to {t}')
+            x = f'%{tag}.z{k}'
+            if k:
+                out.append(f'{ind}%{tag}.s{k} = shl {t} {x}, {k}')
+                x = f'%{tag}.s{k}'
+            if acc is None:
+                acc = x
+            else:
+                nm = r if k == n - 1 else f'%{tag}.o{k}'
+                out.append(f'{ind}{nm} = or {t} {acc}, {x}')
+                acc = nm
+        if n == 1:
+            out.append(f'{ind}{r} = or {t} {acc}, 0')
+        return '\n'.join(out)
+    return re.sub(r'^(\s*)(%[-\w.$]+) = bitcast <(\d+) x i1> (%[-\w.$]+) to i\3$', rep, text, flags=re.M)
+
+
 def compile_ir(text, out_path, mcpu=None, wave=32, keep=None, opt_level='3'):
     mcpu = mcpu or GPU
     if re.match(r'; m4r\.wave 64\n', text):   # translate() chose wave64 for this kernel
@@ -894,14 +969,19 @@ def compile_ir(text, out_path, mcpu=None, wave=32, keep=None, opt_level='3'):
         if keep:
             open(keep + '.amdgpu.ll', 'w').write(text)
         run(['llvm-as', ll, '-o', bc])
-        run(['opt', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr={target_features(wave)}', bc, '-o', bc])
+        run(['opt', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr={target_features(wave)}'] + opt_flags() + [bc, '-o', bc])
         dis = run(['llvm-dis', bc, '-o', '-']).decode()
         if 'llvm.global_ctors' in dis and re.search(r'@llvm\.global_ctors = appending global \[[1-9]', dis):
             raise RuntimeError('static initialiser of function constants was not folded')
+        fixed = expand_bool_vector_bitcasts(dis)
+        if fixed != dis:
+            dis = fixed
+            open(ll, 'w').write(dis)
+            run(['llvm-as', ll, '-o', bc])
         if keep:
             open(keep + '.opt.ll', 'w').write(dis)
-        run(['llc', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr={target_features(wave)}',
-             '-filetype=obj', bc, '-o', obj])
+        run(['llc', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}', f'-mattr={target_features(wave)}'] + llc_flags() +
+            ['-filetype=obj', bc, '-o', obj])
         if keep:
             open(keep + '.s', 'wb').write(run(['llc', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}',
                                                 f'-mattr={target_features(wave)}', bc, '-o', '-']))

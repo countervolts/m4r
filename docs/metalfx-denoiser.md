@@ -280,3 +280,183 @@ Things tried before it that did not help and why (2026-11-20): DLSS K (d4r) on t
 or on V3 run at 1:1 (softest of all); V3 1:1 into BBR (same); repeated first-stage passes (<1% fewer speckles); RCAS sharpening
 (rejected); injecting reflection motion vectors for puddles (V3's lag did not follow them); physically plausible puddle albedo
 (the first stage then smears reflections and brightens them ~45%).
+
+## Denoiser speed (2026-11-20)
+
+Measured on Alan Wake 2 frames (resampled to each mode's render size), 2560x1440 output, RX 7700 XT, GPU time of m4r_denoise (Vulkan timestamps
+inside its own command buffer, `M4R_TIME=<file>`), K mode (the caller upscales), game closed.
+
+| mode | render | original (4 passes, strict) | default now (3 passes, strict) | `FastMath` (opt-in) | `FastMath` + `M4R_ATROUS_ITERS=2` |
+|---|---|---:|---:|---:|---:|
+| DLAA | 2560x1440 | 17.89 ms | 13.66 ms | 10.43 ms | 9.57 ms |
+| Quality | 1706x960 | 7.26 ms | 5.63 ms | 4.18 ms | 3.79 ms |
+| Balanced | 1505x847 | 5.58 ms | 4.30 ms | 3.18 ms | 2.89 ms |
+| Performance | 1280x720 | 4.03 ms | 3.10 ms | 2.29 ms | 2.07 ms |
+| Ultra Performance | 853x480 | 1.87 ms | 1.41 ms | 1.05 ms | 0.95 ms |
+
+Exact (bit-identical) speedups in the default (latest first): the stages around the denoiser that are not MetalFX's (roughness, exposure
+scaling, depth conversion, mirror gate, despeckle, exposure undo) are OpenCL kernels that read and write the game's images directly
+(`shaders/nn_aux.cl`: PREP before the Apple chain, TAIL1 and TAIL2 after it) instead of staging everything through buffer copies, which removed about
+15 dispatches and copies per frame (Performance -0.26 ms, 8%; on Cyberpunk the mirror gate differs from the old shader by 1 fp16 ulp in ~10 pixels per
+frame, none on Alan Wake 2); the DBF convolutions split their output channels over waves from 10000 output pixels (was 40000: Ultra Performance -5%,
+Quality -3%; `M4R_NT_PX`); and three bilateral passes instead of four, `serial` plans (the dependency-level schedule measured
+1.5-2.5% slower than plan order in every mode; plan line `serial`, `M4R_LEVEL_SCHEDULE=1` restores levels), and `--amdgpu-sched-strategy=iterative-ilp`
+for the bilateral kernel (9% fewer vector instructions; code generation only). The remaining per-dispatch overhead is about 15 us over ~50 dispatches.
+
+**FastMath (opt-in: `[MetalFX] FastMath=true`, or `M4R_FAST_MATH=1`).** Apple's bilateral filter calls Metal's `fast_exp`, `fast_log`,
+`fast_sqrt` and `fast_pow`, which are the raw hardware instructions (v_exp_f32 and friends). The translator's default lowering is
+LLVM's strict one (correctly rounded sqrt, extended-precision exp/log, range and denormal scaling around exp2/log2), which is more
+accurate than Metal's and about twice as slow here: the filter goes from 0.25 to 0.13 ms per pass at 1280x720 (`air/intrinsics.py`
+`fast_raw`). Runtime plans hold both bilateral kernels (the other kernels moved by under 2% and stay strict); the default is the strict
+one and is byte-identical to what ran before. In d4r's terms (docs/approximations.md there) this is not an approximation of the model
+(same formula and format, the instruction Apple's source asks for) but it is not bit-exact either; d4r also keeps its LLVM fast-math
+switch opt-in.
+
+FastMath also rewrites `fast_pow(x, 2)` to a multiplication and `fast_pow(2, x)` to an exp2 at the call site (the lowering is written once per
+function and cannot see the constant; air/m4r_air.py, plan-time, fast variant only): 25 fewer exp and log per pixel, -1.7%, no change in the output.
+
+As displayed (8-bit, tonemapped), fast against strict differs in 0.03-0.2% of the values, never by more than 1 level of 255, PSNR 75-83 dB
+(90-120 dB in linear light).
+
+How different: one bilateral pass on identical inputs is 99.99% bit-identical, at most 1 fp16 ulp, mean relative difference 1e-7. The
+temporal history recirculates the tiny differences into a steady floor: after a few frames of the recurrent pipeline 92% of the denoised
+fp16 values are identical, 98% within 1 ulp, mean relative difference 7e-5, 99.9th percentile 0.2%, worst pixel about 1%; flat over a
+24-frame replay (no drift).
+
+Tried without a gain (all exact, reverted or not kept): lowering the bilateral kernel's nearest-filter samples to clamped texel fetches
+(15 -> 6 sampler samples, 0% faster), compute-only barriers between passes (0%), llc scheduler options on the bilateral kernel (best 2.3%),
+true 16-bit registers (+1%, slower), wave64 (the kernel is written for 32-wide simdgroups and does not compile as wave64). Remaining cost
+is the DBF network (about 0.8 ms of 21 small dispatches at 720p), the three bilateral passes, and per-dispatch overhead (about 0.8 ms
+between the sum of isolated kernel times and the whole run). The aux stages (despeckle, mirror gate, exposure scaling) cost 0.3 ms in total.
+
+**Stage profiler (`M4R_STAGE_PROFILE=<file>`).** m4r_denoise writes a GPU timestamp after every pass and after each copy section (a serial plan, so the
+time between two stamps is the barrier, ramp and work of the stage that ended at the second); the mean per stage over ~295 frames is written at call
+300. It adds about 0.17 ms at Performance (0.06 at Ultra Performance, about 1% at DLAA). Isolated per-pass timing undercounts: inside the real run the
+strict bilateral filter costs about 0.49 ms per pass at 1280x720, not the 0.25 ms an isolated run shows.
+
+Per-stage time at 2560x1440 output (Alan Wake 2 frames, K mode), default (3 bilateral passes, strict math), ms:
+
+| stage | DLAA | Quality | Balanced | Performance | Ultra Perf |
+|---|---:|---:|---:|---:|---:|
+| Input prep (roughness, exposure, depth conversion) | 1.06 | 0.35 | 0.27 | 0.18 | 0.09 |
+| Guide signals (dbfnetv1_lowres_signals) | 1.05 | 0.54 | 0.40 | 0.25 | 0.08 |
+| Flow chain (dilate, splat, diff) | 0.33 | 0.18 | 0.17 | 0.16 | 0.07 |
+| DBF network (21 dispatches) | 3.93 | 1.55 | 1.24 | 0.92 | 0.48 |
+| Temporal reprojection (warp, blend) | 1.41 | 0.61 | 0.45 | 0.32 | 0.15 |
+| Bilateral filter (3 passes) | 5.86 | 2.61 | 2.04 | 1.47 | 0.67 |
+| Remodulation | 0.51 | 0.14 | 0.11 | 0.06 | 0.02 |
+| Mirror gate | 0.63 | 0.15 | 0.12 | 0.09 | 0.04 |
+| Despeckle | 0.62 | 0.10 | 0.08 | 0.06 | 0.03 |
+| Exposure undo | 0.28 | 0.06 | 0.05 | 0.04 | 0.02 |
+| Hand-off copy to the upscaler | 0.14 | 0.03 | 0.02 | 0.02 | 0.01 |
+| total (profiled) | 15.82 | 6.31 | 4.93 | 3.56 | 1.66 |
+
+With `FastMath`, the bilateral filter drops to 2.63 / 1.16 / 0.91 / 0.66 / 0.31 ms and the other rows do not move (totals 12.57 / 4.87 / 3.80 / 2.75 / 1.30).
+
+## GPUs without WMMA: RDNA2 (2026-11-21)
+
+The network kernels (`shaders/nn_cell.cl`, `nn_conv_wmma.cl`) use gfx11's `v_wmma_f32_16x16x16_f16`. `tools/denoise_nets.py nn_impl()`
+picks how the convolutions run: `wmma` on RDNA3 / 3.5, `dot` everywhere else, `M4R_NN_IMPL=wmma|soft|dot` at plan time overrides.
+All three give the same bits: WMMA equals the chain of `v_dot2_f32_f16` over k in increasing order starting from C (docs/mxu.md), and
+both other paths compute exactly that chain per accumulator (zero-padded input channels skipped: their products are exact zeros).
+
+- `dot` (default without WMMA): lane = pixel, weights the same for every lane, so they are scalar loads and `v_dot2c_f32_f16` reads
+  them from SGPRs (`shaders/nn_dot.h DOT_BLOCK`; `nn_cell.cl` with `DOT=1`, `nn_conv_dot.cl`). The limit is the weight stream through
+  the scalar cache (a 64->64 3x3 layer is 73 KB, the scalar cache 16 KB; scalar loads complete out of order, so only one chunk can be
+  in flight): each lane computes MPX pixels (rows) so every weight load serves MPX of them (4 on the 64-channel cells, 2 elsewhere),
+  at most 64 sums per lane (~91 VGPRs) by splitting output channels over WC waves (8 on cells below 20000 pixels), chunks of 4
+  channels. The UBF head (44 channels) writes through shared memory (lane-per-pixel 2-byte stores 88 bytes apart did not coalesce).
+  Compiler traps, all handled in `nn_dot.h`: LLVM hoists every scalar load of an unrolled block to its top (SGPR spills -> scratch;
+  scheduling barriers + an opaque asm zero per chunk address against the load-store vectorizer), sinks the last products into the
+  guarded store block (`PIN`), and unrolls the tile fill (`FILL_LOOP`, DOT only).
+- `soft`: the WMMA kernels with each product as 64 `v_dot2c_f32_f16_dpp row_share` (`wmma_soft`, as the AIR translator's RDNA2 path;
+  A loaded with the upper half-wave rotated by one row). Slower than `dot` here; kept for A/B on RDNA2 hardware.
+
+Speed on the RX 7700 XT, Cyberpunk 1280x720 -> 2560x1440, DBF cells / UBF convs (ms): WMMA 0.38 / 0.35; `dot` 0.70 / 0.39, and
+0.80 / 0.40 with VOPD off (`M4R_LLC_FLAGS=--amdgpu-enable-vopd=0`: RDNA2 cannot dual-issue, so this is the proxy for RDNA2's issue
+rate; ~1.6x WMMA, under the 2x of WMMA's fp16 rate over plain dot2); `soft` 1.45 / 0.67. Bit-identical to the WMMA plans on captures
+cp2077-m (720p) and cp2077-n (853x480), offline (dbf_feat/noise/tw, denoised, v3out, 6 frames) and through `run_denoise_api`.
+
+Also needed for RDNA2 at all: three of Apple's kernels (`luma_log_sum_denoiser`, `reproject_warp`, `dbfnetv1_lowres_signals`) had an
+8-byte private segment that no instruction uses (InstCombine turns any()/all() on vector compares into `bitcast <N x i1> to iN`, which
+the backend lowers through a stack temporary); vkhip refuses scratch on RDNA2. `air/m4r_air.py expand_bool_vector_bitcasts` rewrites
+those bitcasts after `opt` (same value). The gfx1030 1280x720 -> 2560x1440 runtime plan: 45 kernels, none with scratch, all parse in
+`tests/vkhip_parse`. Not run on RDNA2 hardware.
+
+Inline-asm pitfall (found here, also fixed in `air/intrinsics.py _wmma_soft`): asm whose outputs are written before all inputs are read
+needs early-clobber outputs (`=&v` / `+&v`); otherwise LLVM may put an input and an output with the same value (zero padding and a
+zero start) in one register. It zeroed outputs of UBF's first layer in the soft path; the AIR path's outputs did not change on the BBR
+motion fixture (8 frames, soft = native), but its code did in 10 int8 kernels.
+
+## Non-unit normals threw the history away (Control, 2026-11-21)
+
+Symptom: in Control the MetalFX denoiser stayed nearly as noisy as a single frame. Offline (capture `control-b`, 1280x720, camera
+still) the per-pixel running count `reproject_warp` keeps in `running_mean.z` had a median of 1.9 after 12 frames and 47% of the
+pixels never got past 1.5: the history was rejected almost everywhere, every frame.
+
+Cause: about 40% of Control's normals (`R8G8B8A8_SNORM`, world space, roughness in w) are not unit length (0.72-0.78). Each history
+tap in `reproject_warp` is weighted by `pow(max(dot(n, n_prev), 0), 128)` (with the bilinear, flow-difference, motion/roughness,
+roughness-difference and demodulation-Y terms) and dropped below 0.01; the kernel normalises the normal only when its length is in
+(0.99, 1.005) and stores it as it is otherwise, so two 0.75-long normals give at most 0.56^128 = 0. Alan Wake 2 and Cyberpunk give
+unit normals (RGBA16F), so they never hit this. (Not a cause, for the record: `fc` stays at 1 by design: `reproject_warp` writes the
+weighted mean of the previous `fc`, `reproject_blend` adds `clamp(sigmoid(tw) + valid * boost, 0, 0.95)`, and DBFNet's temporal
+weight logits are about -21..-26 on every capture; the accumulation runs through the running count and the boost.)
+
+Fix (m4r, not MetalFX): `nn_aux.cl` LOWRES normalises normals whose length is outside (0.99, 1.005) (zero normals stay zero) into the
+plan texture `nrm_fix`, which `reproject_warp` (tex 3) and the network input read instead of the game's normals. Normals in that range
+pass through unchanged, so unit-normal games are byte-identical (aw2-c: 48/48 outputs). Control: running count median 1.9 -> 11.6 of
+12, pixels without history 47% -> 4%, flat-region noise of the denoised image -35% (0.081-0.103 -> 0.047-0.074 per frame; same at
+1505x847 in DLSS K mode), texture detail unchanged; +0.1 ms at 720p. Hair keeps some speckle: 16% of its pixels still fail the normal
+test because strand normals change with the jitter (MetalFX's threshold, left as is). d4r's FSR RR path already normalises
+(`fsr_rr_prepare`), so its remaining noise has another cause (Control gives no hit distances).
+
+## Flicker on characters: still accumulation and jitter-proof normal test (Control, 2026-11-21)
+
+Capture `control-c` (853x480, camera still, the player character in view): after the normal fix the character still boiled (blotchy
+shading noise moving every frame). Two causes, two m4r changes (not MetalFX):
+
+1. **History test vs normal maps.** At low render sizes the game's normal maps change with the jitter: on a still camera 26% of the
+   character's and 52% of the floor's pixels failed `reproject_warp`'s `pow(dot, 128)` test. LOWRES (NSMOOTH, default; plan-time
+   `M4R_PLAN_NO_NSMOOTH=1` off) now gives `reproject_warp` (tex 3, `nrm_fix`) the depth-aware 3x3 mean of the unit normals (neighbours
+   within 2% of the depth), and the bilateral passes a separate per-pixel normal + roughness (`nrm_px`, instead of reproject_warp's
+   `normal_roughness_tex`): a first version that let the bilateral passes use the smoothed normal blurred normal-mapped detail (floor
+   plates; detail metric 0.34 -> 0.15). With the split, every pixel keeps its history and detail is unchanged; flicker barely moves (the
+   history was not the main cause).
+2. **MetalFX's history cap.** `reproject_warp` caps the history at 0.8 per frame (about a 5-9 frame average), which leaves coarse shading
+   noise boiling on large soft surfaces. TAILF flag 128 (runtime, while the camera is still; `M4R_NO_STILL_ACC=1` off, weight floor
+   `M4R_STILL_ACC_MIN` 0.2): pixels whose motion vector is under a quarter pixel (fading out by half a pixel) average the **3x3 mean** of
+   the result over frames (history in `mir_hist`, same luminance guard as the mirror accumulation) and keep the frame's own detail
+   (pixel minus its 3x3 mean); the corrected pixel is clamped to its 3x3 neighbourhood of the frame. Whole-pixel accumulation was tried
+   first: flicker -74% but softer textures, because the denoised image still carries the frame's jitter (the upscaler resolves it), so
+   averaging pixels averages sub-pixel-shifted detail; the unclamped 3x3 version left dark dots on silhouettes. Mirror pixels (flag 64)
+   keep their whole-pixel accumulation.
+
+Result (cycled static captures, low-pass frame-to-frame flicker / detail vs the multi-frame input mean): character 0.098 -> 0.054
+(-45%), whole frame 0.040 -> 0.021, detail 0.217 -> 0.207; control-b 0.036 -> 0.019, detail 0.340 -> 0.327; aw2-c 0.028 -> 0.022,
+detail 0.530 -> 0.520; moving camera (aw2-d) unchanged (0.01%). Cost: LOWRES +18 loads per pixel, TAILF +1 texture.
+
+## Floor blotches and hair speckle (Control, 2026-11-21)
+
+- **Mirror gate range 0.07-0.10** (was 0.10-0.15; `M4R_MIRROR_R0`/`R1`). Control's glossy floor (roughness 0.12-0.15, varying per
+  pixel) fell into the gate in patches; gated pixels skip MetalFX's spatial filter and kept dark ray-noise blotches (capture
+  `control-d`, 853x480). Alan Wake 2's water is at 0.04-0.06, so its mirrors stay fully gated (aw2-water: 0.7% of pixels change, by
+  0.01% on average); the floor now gets the normal filter (floor high-pass noise 0.097 -> 0.080, same as with the gate off).
+- **Dark despeckle** (TAILF flag 256, `M4R_NO_DARK_DESPECKLE=1` off): a pixel darker than 0.75 x its second darkest neighbour (`DSK`) is
+  lifted to that neighbour's level. Hair at low render sizes keeps ray dropouts because strand normals stop the bilateral filter; the
+  demodulated lighting is speckled, the albedo is smooth. Pixels on thin dark lines have two dark neighbours and stay (floor plate
+  ridges intact; 1-3% of pixels change, scattered single dots). Strong dark dots in hair (below half the 3x3 median): control-c
+  0.031 -> 0.010, control-b 0.016 -> 0.004.
+
+## Faint residual noise: what did not work (Control, 2026-11-21, capture `control-e`)
+
+Remaining faint noise at 853x480 (neck/shoulder strokes, sparkles on dark floors, grain behind glass) is dense fine noise that
+MetalFX's temporal blend lets through at its ~20% current-frame weight, not isolated outliers. Tried and left opt-in (default off):
+- **Temporal outlier clamp** (TAILF flag 512, `M4R_TEMPORAL_CLAMP=1`; per-pixel running mean luminance in `pxh0`/`pxh1`, the pixel kept
+  within [0.7, 1.4] x its 3x3 neighbours' running means while the camera is still): flicker -1..-3%, detail -1.5% (Control) / -3%
+  (Alan Wake 2). Narrower ranges ([0.85, 1.15], or [0.75, 1.33] x the median in smooth neighbourhoods) dulled the floor plates'
+  ridges (detail -9..-12%) and still left most of the shoulder strokes (they move from frame to frame, so the neighbours' means sink too).
+- **Strict sparkle removal** (flag 1024, `M4R_SPARKLE=1`; brighter than 1.33 x the second brightest neighbour): floor sparkles 3.04% ->
+  2.96% of pixels (they have bright neighbours), Alan Wake 2 detail -15% (real glints).
+Removing it outright would need more temporal weight on whole pixels; the denoised image still carries the jitter, so that softens
+textures (see the still accumulation above) unless the history is re-sampled to each frame's jitter (TAA-style), which also softens.
+A higher render size (Performance instead of Ultra Performance: 2.25x the rays per output pixel) is the clean lever.

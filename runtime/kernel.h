@@ -80,6 +80,9 @@ public:
     void setTexture(const Texture* t, uint32_t index) { textures_[index] = t ? t->record : 0; }
     void setThreadgroupMemory(uint32_t bytes, uint32_t index) { lds_[index] = bytes; }
     void setBarrier(bool b) { barrier_ = b; }   // memory barrier before the next dispatch (default: always)
+    // the next dispatch runs only rows of workgroups [n*k/count, n*(k+1)/count) of its grid (vkCmdDispatchBase: the workgroup ids keep
+    // their place in the whole grid, so the kernel computes the same pixels as in the whole dispatch); count 1 = all
+    void setBand(uint32_t k, uint32_t count) { band_ = k; bands_ = count ? count : 1; }
     bool dispatchThreads(uint32_t x, uint32_t y = 1, uint32_t z = 1);       // Metal dispatchThreads (grid in threads)
     bool dispatchThreadgroups(uint32_t x, uint32_t y = 1, uint32_t z = 1);  // Metal dispatchThreadgroups
     std::string error;
@@ -93,6 +96,8 @@ private:
     std::map<uint32_t, uint32_t> lds_;
     std::map<uint32_t, std::vector<uint8_t>> raw_;
     bool barrier_ = true;
+    uint32_t band_ = 0, bands_ = 1;
+    void launch(uint32_t nx, uint32_t ny, uint32_t nz);
 };
 
 } // namespace m4r

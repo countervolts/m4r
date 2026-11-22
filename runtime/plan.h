@@ -22,6 +22,8 @@ public:
     bool record(VkCommandBuffer cb, size_t first = 0, size_t count = size_t(-1));
     // ping-pong resources are written "a|b" in the plan: a on even, b on odd parity (MetalFX flips once per frame)
     void setParity(int p) { parity_ = p & 1; }
+    // profiling hook (M4R_STAGE_PROFILE): called after each recorded pass with the pass's kernel name
+    void setPassHook(void (*fn)(void*, const std::string&), void* user) { hookFn_ = fn; hookUser_ = user; }
     // passes marked `only FLAG` (or `only !FLAG`) in the plan run only while the flag is set (clear); flags start clear
     void setFlag(const std::string& name, bool on) { flags_[name] = on; }
     size_t passes() const { return passes_.size(); }
@@ -41,9 +43,13 @@ public:
     std::string error;
 
 private:
+    void (*hookFn_)(void*, const std::string&) = nullptr; void* hookUser_ = nullptr;
+    bool serial_ = false;   // plan line `serial`: passes run in plan order with a barrier before each (the denoiser plans: 1.5-2.5% faster than the dependency levels)
     struct Bind { char kind; uint32_t index; std::string name; std::vector<uint8_t> bytes; };
     struct Pass { Kernel* kernel = nullptr; bool groups = false; uint32_t grid[3] = {1, 1, 1}; std::vector<Bind> binds; std::string label;
-                  std::string only; bool onlyNot = false; };
+                  std::string only; bool onlyNot = false;
+                  bool overlap = false;
+                  uint32_t band = 0, bands = 1; };   // `band K N`: only the K-th of N row bands of the grid (see Encoder::setBand)   // `overlap`: no barrier before this pass in serial plans (it does not depend on the pass before it)
     Runtime& rt_;
     std::map<std::string, Buffer> buffers_;
     std::map<std::string, Texture> textures_;

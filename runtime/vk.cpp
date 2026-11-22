@@ -123,15 +123,17 @@ bool Context::adopt(VkInstance inst, VkPhysicalDevice phys, VkDevice dev, uint32
     return createBuffer(records, 1 << 20, true);
 }
 
-bool Context::wrap(Texture& t, VkImage image, VkFormat format, uint32_t w, uint32_t h) {
+bool Context::wrap(Texture& t, VkImage image, VkFormat format, uint32_t w, uint32_t h, bool alphaToAll) {
     t = Texture{};
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    if (alphaToAll) vci.components = {VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_A};
     const bool isDepth = format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
                          format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D16_UNORM || format == VK_FORMAT_X8_D24_UNORM_PACK32;
     vci.image = image; vci.viewType = VK_IMAGE_VIEW_TYPE_2D; vci.format = format;
     vci.subresourceRange = {VkImageAspectFlags(isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
     if (vkCreateImageView(device, &vci, nullptr, &t.view) != VK_SUCCESS) { error = "image view"; return false; }
     t.image = image; t.format = format; t.width = w; t.height = h; t.owned = false;
+    t.sampledOnly = alphaToAll;   // storage views must not swizzle
     return writeRecord(t);
 }
 
@@ -174,6 +176,8 @@ bool Context::createBuffer(Buffer& b, VkDeviceSize size, bool hostVisible, VkBuf
     }
     mai.memoryTypeIndex = type;
     if (type == UINT32_MAX || vkAllocateMemory(device, &mai, nullptr, &b.memory) != VK_SUCCESS) return false;
+    b.allocated = req.size;
+    b.deviceLocal = (memProps.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
     vkBindBufferMemory(device, b.buffer, b.memory, 0);
     VkBufferDeviceAddressInfo ai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
     ai.buffer = b.buffer;
@@ -189,7 +193,7 @@ void Context::destroyBuffer(Buffer& b) {
     b = Buffer{};
 }
 
-bool Context::createTexture(Texture& t, VkFormat format, uint32_t w, uint32_t h, uint32_t layers) {
+bool Context::createTexture(Texture& t, VkFormat format, uint32_t w, uint32_t h, uint32_t layers, bool compress) {
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(physical, format, &fp);
     const bool storage = fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
@@ -198,6 +202,7 @@ bool Context::createTexture(Texture& t, VkFormat format, uint32_t w, uint32_t h,
     ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+    if (compress && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (vkCreateImage(device, &ci, nullptr, &t.image) != VK_SUCCESS) return false;
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(device, t.image, &req);
@@ -205,6 +210,7 @@ bool Context::createTexture(Texture& t, VkFormat format, uint32_t w, uint32_t h,
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (vkAllocateMemory(device, &mai, nullptr, &t.memory) != VK_SUCCESS) return false;
+    t.allocated = req.size;
     vkBindImageMemory(device, t.image, t.memory, 0);
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image = t.image; vci.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D; vci.format = format;
@@ -231,7 +237,7 @@ bool Context::writeRecord(Texture& t) {
     std::memcpy(dst, tmp, 32);
     VkFormatProperties fp;
     vkGetPhysicalDeviceFormatProperties(physical, t.format, &fp);
-    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) {
+    if ((fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && !t.sampledOnly) {
         gi.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; gi.data.pStorageImage = &ii;
         getDescriptor(device, &gi, descProps.storageImageDescriptorSize, tmp);
         std::memcpy(dst + 32, tmp, 32);

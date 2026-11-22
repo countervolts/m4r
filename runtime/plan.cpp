@@ -1,5 +1,6 @@
 // m4r: pass plan executor (see plan.h).
 // SPDX-License-Identifier: GPL-3.0-only
+#include <cstdio>
 #include "plan.h"
 #include <set>
 #include <algorithm>
@@ -61,6 +62,7 @@ bool Plan::load(const std::string& dir) {
                             "--gpu " + dev + ")");
             continue;
         }
+        if (w == "serial") { serial_ = true; continue; }
         if (w == "buffer") {
             std::string name, src, path;
             size_t size;
@@ -75,11 +77,17 @@ bool Plan::load(const std::string& dir) {
             }
             buffers_[name] = b;
         } else if (w == "texture") {
-            std::string name, fmt;
+            std::string name, fmt, opt;
             uint32_t tw, th;
             ls >> name >> fmt >> tw >> th;
+            bool dcc = false;   // texture NAME FORMAT W H dcc: compressed (DCC) where the plan generator measured it to pay off
+            while (ls >> opt) if (opt == "dcc") dcc = true;
+            if (const char* e = std::getenv("M4R_DCC")) {   // experiments: M4R_DCC=* (all), =- (none) or =name,name,...
+                const std::string list = std::string(",") + e + ",";
+                dcc = list == ",*," || list.find("," + name + ",") != std::string::npos;
+            }
             Texture t;
-            if (!vk.createTexture(t, formatByName(fmt), tw, th)) return fail("texture " + name);
+            if (!vk.createTexture(t, formatByName(fmt), tw, th, 1, dcc)) return fail("texture " + name);
             textures_[name] = t;
             uninitialised_.push_back(name);   // transitioned and cleared in the first recorded frame
         } else if (w == "kernel") {
@@ -111,6 +119,13 @@ bool Plan::load(const std::string& dir) {
             VkDeviceSize off;
             ls >> name >> base >> off;
             views_[name] = {base, off};
+        } else if (w == "band") {      // band K N: this pass dispatches the K-th of N row bands of its workgroups
+            if (!cur) return fail("band outside a pass");
+            ls >> cur->band >> cur->bands;
+            if (!cur->bands || cur->band >= cur->bands) return fail("band K N needs K < N");
+        } else if (w == "overlap") {   // overlap: in a serial plan, the pass runs without a barrier after the previous one (independent of it;
+            if (!cur) return fail("overlap outside a pass");   //   the barrier before the next pass covers both)
+            cur->overlap = true;
         } else if (w == "only") {      // only FLAG / only !FLAG: the pass runs only while the flag is set / clear
             if (!cur) return fail("only outside a pass");
             std::string fl;
@@ -149,6 +164,16 @@ bool Plan::load(const std::string& dir) {
             if (auto it = have.find(a.location); it != have.end()) p.binds.push_back(it->second);
         }
     }
+    if (std::getenv("M4R_PLAN_MEM")) {   // M4R_PLAN_MEM=1: the plan's allocations (vkGet*MemoryRequirements sizes) on stderr, largest first
+        std::vector<std::pair<VkDeviceSize, std::string>> items;
+        VkDeviceSize tex = 0, bufLocal = 0, bufHost = 0;
+        for (auto& [n, t] : textures_) { items.emplace_back(t.allocated, "texture " + n); tex += t.allocated; }
+        for (auto& [n, b] : buffers_) { items.emplace_back(b.allocated, std::string(b.deviceLocal ? "buffer " : "buffer(host) ") + n); (b.deviceLocal ? bufLocal : bufHost) += b.allocated; }
+        std::sort(items.rbegin(), items.rend());
+        std::fprintf(stderr, "plan %s: textures %.2f MB, buffers %.2f MB device-local + %.2f MB host-visible-only, total %.2f MB\n", dir.c_str(),
+                     tex / 1048576.0, bufLocal / 1048576.0, bufHost / 1048576.0, (tex + bufLocal + bufHost) / 1048576.0);
+        for (auto& [sz, n] : items) std::fprintf(stderr, "  %9.3f MB  %s\n", sz / 1048576.0, n.c_str());
+    }
     return true;
 }
 
@@ -184,7 +209,8 @@ bool Plan::record(VkCommandBuffer cb, size_t first, size_t count) {
             uses[pi - first].emplace_back((bb.kind == 'b' ? "b:" : "t:") + nm, wr);
         }
     }
-    const bool serial = std::getenv("M4R_ALL_BARRIERS") != nullptr;
+    static const bool noSerial = std::getenv("M4R_LEVEL_SCHEDULE") != nullptr;   // the dependency levels even for plans that ask for plan order
+    const bool serial = std::getenv("M4R_ALL_BARRIERS") != nullptr || (serial_ && !noSerial);
     std::vector<int> level(last - first, 0);
     for (size_t i = 0; i < level.size(); ++i) {
         if (serial) { level[i] = int(i); continue; }
@@ -200,12 +226,15 @@ bool Plan::record(VkCommandBuffer cb, size_t first, size_t count) {
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return level[a] < level[b]; });
     int prevLevel = -1;
+    static const bool noOverlap = std::getenv("M4R_NO_OVERLAP") != nullptr;
     for (size_t oi : order) {
         const size_t pi = first + oi;
         Pass& p = passes_[pi];
         if (!active(p)) continue;
         enc.setKernel(p.kernel);
-        enc.setBarrier(level[oi] != prevLevel);
+        enc.setBand(p.band, p.bands);
+        // an `overlap` pass shares the previous pass's barrier (never the first pass recorded here: earlier work may be what it reads)
+        enc.setBarrier(level[oi] != prevLevel && !(serial && p.overlap && prevLevel >= 0 && !noOverlap));
         prevLevel = level[oi];
         for (auto& bb : p.binds) {
             Bind b = bb;
@@ -231,6 +260,7 @@ bool Plan::record(VkCommandBuffer cb, size_t first, size_t count) {
         bool ok = p.groups ? enc.dispatchThreadgroups(p.grid[0], p.grid[1], p.grid[2])
                            : enc.dispatchThreads(p.grid[0], p.grid[1], p.grid[2]);
         if (!ok) { error = p.label + ": " + enc.error; return false; }
+        if (hookFn_) hookFn_(hookUser_, p.label);
     }
     return true;
 }
