@@ -31,3 +31,4 @@ __pycache__/
 .xwin-cache/
 # local notes (not part of the repo)
 /private/
+/build-win/

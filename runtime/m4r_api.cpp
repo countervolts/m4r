@@ -3,6 +3,9 @@
 #include "plan.h"
 #include "params.h"
 #include "m4r.h"
+#ifdef M4R_HIPVK
+#include "hipvk/hipvk.h"
+#endif
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -346,6 +349,9 @@ M4R_API int m4r_create(m4r_context** out, PFN_vkGetInstanceProcAddr gipa, VkInst
         }
     }
     if (!loadVulkan(gipa, instance, device)) { c->error = "missing Vulkan entry points"; return 1; }
+#ifdef M4R_HIPVK
+    hipvk::setKernelDir(c->dir);   // hipvk_blit.hsaco (install.py) next to the plans
+#endif
     if (!c->vk.adopt(instance, physical, device, family)) { c->error = c->vk.error; return 1; }
     if (!c->rt.init()) { c->error = c->rt.error; return 1; }
     return 0;

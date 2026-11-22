@@ -270,9 +270,13 @@ def build(args):
     shader = os.path.join(os.path.dirname(HERE), 'shaders', 'sacneh.comp')
     if os.path.isfile(shader[:-5] + '.spv'):   # compiled in a release
         shutil.copyfile(shader[:-5] + '.spv', os.path.join(out, 'sacneh.spv'))
+    elif m4r_air.HIP_PORTS and not shutil.which('glslangValidator'):   # native Windows needs only the OpenCL port
+        open(os.path.join(out, 'sacneh.spv'), 'wb').close()
     else:
         subprocess.run(['glslangValidator', '-V', '--target-env', 'vulkan1.3', shader, '-o', os.path.join(out, 'sacneh.spv')],
                        check=True, capture_output=True)
+    if m4r_air.HIP_PORTS:
+        m4r_air.glsl_port(os.path.join(out, 'sacneh.spv'))
     transpose_weight_tiles(out, plan)
     decl = [l for l in plan if l.split(' ', 1)[0] in ('buffer', 'texture', 'kernel', 'glsl')]
     rest = [l for l in plan if l.split(' ', 1)[0] not in ('buffer', 'texture', 'kernel', 'glsl')]

@@ -13,7 +13,7 @@ Output (per layer): the descriptor bytes written (offset -> value/kind), H/W as 
 (scale and shift), and the weight-file ranges (weights, scales, zero points, bias) plus the bias-folding
 arguments.
 """
-import json, os, re, struct, subprocess, sys
+import json, os, re, shutil, struct, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from macho import MachO  # noqa: E402
@@ -42,7 +42,12 @@ S1_FIELDS = {0x08: ('K', 'u16'), 0x0a: ('C', 'u16'), 0x0c: ('CSkip', 'u16'), 0x0
 
 
 def objdump(binary):
-    out = subprocess.run(['llvm-objdump', '-d', '--no-show-raw-insn', binary], capture_output=True, text=True).stdout
+    # M4R_HOST_OBJDUMP: an llvm-objdump with the AArch64 target, for LLVM builds without it (AMD's TheRock SDK on Windows)
+    tool = os.environ.get('M4R_HOST_OBJDUMP', 'llvm-objdump')
+    r = subprocess.run([shutil.which(tool) or tool, '-d', '--no-show-raw-insn', binary], capture_output=True, text=True)
+    if r.returncode and 'cannot find target' in r.stderr:
+        raise SystemExit(f'{tool} cannot disassemble the MetalFX binary (no AArch64 target): set M4R_HOST_OBJDUMP to an llvm-objdump that has it')
+    out = r.stdout
     funcs, cur = {}, None
     for l in out.split('\n'):
         m = re.match(r'^([0-9a-f]+) <(.*)>:$', l)

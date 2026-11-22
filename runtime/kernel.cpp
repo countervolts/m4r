@@ -1,6 +1,9 @@
 // m4r: translated Metal kernels as Vulkan compute pipelines (see kernel.h).
 // SPDX-License-Identifier: GPL-3.0-only
 #include "kernel.h"
+#ifdef M4R_HIPVK
+#include "hipvk/hipvk.h"
+#endif
 #include <cstdio>
 #include <fstream>
 #include <random>
@@ -53,7 +56,9 @@ bool Runtime::init() {
     // vkhip donors are keyed by their specialisation (including the pipeline id); RADV's on-disk shader cache can
     // hand back a pipeline patched by an earlier process for a repeated key. Fresh ids per process avoid that.
     nextId_ = uint32_t(std::random_device{}()) | 1u;
+#ifndef M4R_HIPVK   // native Windows: kernels run through HIP itself (hipvk::createKernel), no pipeline-cache injection
     if (!hip_.load(vk_.device, vkGetDeviceProcAddr)) { error = "vkhip device functions"; return false; }
+#endif
     VkPushConstantRange pc{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
     VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     li.pushConstantRangeCount = 1; li.pPushConstantRanges = &pc;
@@ -117,6 +122,29 @@ Kernel* Runtime::load(const std::string& base, uint32_t extraLds) {
     k->kd = kd->second;
     k->staticLds = k->kd.lds;
     k->kd.lds = ((k->kd.lds + 15) & ~15u) + extraLds;
+#ifdef M4R_HIPVK
+    {
+        // HIP relocates the code object's globals itself; constexpr samplers are written into them
+        std::vector<hipvk::SamplerGlobal> smp;
+        for (auto& s : k->samplers) {
+            VkSamplerCreateInfo ci;
+            std::string why;
+            if (!decodeSamplerState(s.state[0], ci, why)) { error = base + ": sampler " + why; return nullptr; }
+            hipvk::SamplerGlobal g;
+            g.symbol = s.global;
+            VkSampler keep;
+            if (!vk_.samplerDescriptor(ci, g.descriptor, keep)) { error = "sampler"; return nullptr; }
+            k->keep.push_back(keep);
+            smp.push_back(g);
+        }
+        std::string err;
+        k->pipeline = hipvk::createKernel(elf, k->name, hipvk::KernelAbi::Kernarg, k->tg, k->kernargSize, k->kd.lds - k->staticLds, smp, err);
+        if (!k->pipeline) { error = base + ": " + err; return nullptr; }
+        Kernel* raw = k.get();
+        kernels_[base] = std::move(k);
+        return raw;
+    }
+#endif
     uint64_t dataAddr = 0;
     if (k->module.dataHi > k->module.dataLo) {
         if (!vk_.createBuffer(k->data, k->module.dataHi - k->module.dataLo, true)) { error = "data buffer"; return nullptr; }
@@ -147,6 +175,24 @@ Kernel* Runtime::load(const std::string& base, uint32_t extraLds) {
 Kernel* Runtime::loadGlsl(const std::string& spv, uint32_t tx, uint32_t ty, uint32_t tz) {
     auto it = kernels_.find(spv);
     if (it != kernels_.end()) return it->second.get();
+#ifdef M4R_HIPVK
+    {
+        // the pass's OpenCL port (shaders/<name>.cl, built next to the .spv as <name>.hsaco by the plan tools): kernel <name>, one
+        // argument, the argument block's address (what the push constant holds)
+        const std::string base = spv.substr(0, spv.size() - 4);
+        const std::string name = base.substr(base.find_last_of("/\\") + 1);
+        auto elf = readFile(base + ".hsaco");
+        if (elf.empty()) { error = base + ".hsaco missing (the OpenCL port of " + name + ")"; return nullptr; }
+        auto k = std::make_unique<Kernel>();
+        k->glsl = true; k->name = spv; k->tg[0] = tx; k->tg[1] = ty; k->tg[2] = tz;
+        std::string err;
+        k->pipeline = hipvk::createKernel(elf, name, hipvk::KernelAbi::ArgPointer, k->tg, 8, 0, {}, err);
+        if (!k->pipeline) { error = base + ": " + err; return nullptr; }
+        Kernel* raw = k.get();
+        kernels_[spv] = std::move(k);
+        return raw;
+    }
+#endif
     auto code = readFile(spv);
     if (code.empty() || code.size() % 4) { error = spv + " missing"; return nullptr; }
     VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -178,6 +224,11 @@ bool Encoder::dispatchThreadgroups(uint32_t x, uint32_t y, uint32_t z) {
 
 void Encoder::launch(uint32_t nx, uint32_t ny, uint32_t nz) {
     if (bands_ <= 1) { vkCmdDispatch(cb_, nx, ny, nz); return; }
+#ifdef M4R_HIPVK
+    // HIP launches have no workgroup base: the first band runs the whole grid (the same pixels), the others nothing
+    if (band_ == 0) vkCmdDispatch(cb_, nx, ny, nz);
+    return;
+#endif
     const uint32_t y0 = uint32_t(uint64_t(ny) * band_ / bands_), y1 = uint32_t(uint64_t(ny) * (band_ + 1) / bands_);
     if (y1 > y0) vkCmdDispatchBase(cb_, 0, y0, 0, nx, y1 - y0, nz);
 }

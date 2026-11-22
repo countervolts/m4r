@@ -22,7 +22,7 @@ Kernel argument block (what the host writes; the code object reads it through th
 Constexpr samplers declared inside the kernel become writable globals `__m4r_sampler_<n>` (16 bytes each);
 the manifest lists their Metal sampler-state words so the host can store matching descriptors there.
 """
-import argparse, hashlib, json, os, re, struct, subprocess, sys, tempfile
+import argparse, hashlib, json, os, re, shutil, struct, subprocess, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import intrinsics  # noqa: E402
@@ -39,6 +39,9 @@ TRIPLE = 'amdgcn-amd-amdhsa'
 GPUS = ('gfx1030', 'gfx1031', 'gfx1032', 'gfx1033', 'gfx1034', 'gfx1035', 'gfx1036', 'gfx1100', 'gfx1101', 'gfx1102',
         'gfx1103', 'gfx1150', 'gfx1151', 'gfx1152', 'gfx1153', 'gfx1200', 'gfx1201')
 GPU = os.environ.get('M4R_GPU', 'gfx1101')
+# native Windows runs m4r on HIP (runtime/hipvk), which cannot run SPIR-V: m4r's GLSL passes also get their OpenCL ports
+# (shaders/<name>.cl -> <name>.hsaco next to the .spv). M4R_HIP_PORTS=1 builds them elsewhere too.
+HIP_PORTS = os.name == 'nt' or os.environ.get('M4R_HIP_PORTS') == '1'
 
 
 def family(gpu=None):
@@ -76,7 +79,33 @@ BUILTINS = {
 }
 
 
+def llc_command(args):
+    """`llc ARGS`, or the same code generation through clang where LLVM ships no llc (AMD's TheRock SDK on Windows): clang -c with the
+    middle end switched off (-disable-llvm-optzns), so the bitcode opt produced is only lowered, as llc does."""
+    if shutil.which('llc') or not shutil.which('clang'):
+        return ['llc'] + args
+    out, rest, flags, feats, triple, cpu, olevel, obj = None, [], [], [], None, None, '-O3', False
+    it = iter(args)
+    for a in it:
+        if a == '-o': out = next(it)
+        elif a.startswith('-mtriple='): triple = a.split('=', 1)[1]
+        elif a.startswith('-mcpu='): cpu = a.split('=', 1)[1]
+        elif a.startswith('-mattr='): feats += [f for f in a.split('=', 1)[1].split(',') if f]
+        elif a in ('-O0', '-O1', '-O2', '-O3'): olevel = a
+        elif a == '-filetype=obj': obj = True
+        elif a.startswith('-'): flags.append(a)
+        else: rest.append(a)
+    cmd = ['clang', f'--target={triple}', f'-mcpu={cpu}', olevel, '-Xclang', '-disable-llvm-optzns', '-c' if obj else '-S', '-x', 'ir']
+    for f in feats: cmd += ['-Xclang', '-target-feature', '-Xclang', f]
+    for f in flags: cmd += ['-mllvm', f]
+    return cmd + rest + ['-o', out]
+
+
 def run(cmd, **kw):
+    if cmd and cmd[0] == 'llc':
+        cmd = llc_command(cmd[1:])
+    if os.name == 'nt' and cmd and not os.path.dirname(cmd[0]):
+        cmd = [shutil.which(cmd[0]) or cmd[0]] + list(cmd[1:])   # Windows: 'ld.lld' has a dot, so CreateProcess appends no .exe
     r = subprocess.run(cmd, capture_output=True, **kw)
     if r.returncode:
         err = r.stderr.decode(errors='replace')   # the message comes first, a crash's stack trace after it
@@ -986,6 +1015,26 @@ def compile_ir(text, out_path, mcpu=None, wave=32, keep=None, opt_level='3'):
             open(keep + '.s', 'wb').write(run(['llc', f'-O{opt_level}', f'-mtriple={TRIPLE}', f'-mcpu={mcpu}',
                                                 f'-mattr={target_features(wave)}', bc, '-o', '-']))
         run(['ld.lld', '-shared', obj, '-o', out_path])
+
+
+def compile_cl(src, out_path, mcpu=None, defs=None):
+    """OpenCL C -> code object (the HIP ports of m4r's GLSL passes, hipvk's blit kernel); no OpenCL library is linked"""
+    mcpu = mcpu or GPU
+    with tempfile.TemporaryDirectory() as d:
+        obj = os.path.join(d, 'k.o')
+        run(['clang', '-x', 'cl', '-cl-std=CL2.0', f'--target={TRIPLE}', f'-mcpu={mcpu}', '-nogpulib', '-O3', '-Xclang', '-target-feature',
+             '-Xclang', '+extended-image-insts', f'-I{os.path.dirname(os.path.abspath(src))}', '-c', src, '-o', obj] +
+            [f'-D{k}={v}' for k, v in (defs or {}).items()])
+        run(['ld.lld', '-shared', obj, '-o', out_path])
+
+
+def glsl_port(spv_path):
+    """builds the OpenCL port of the GLSL pass compiled to spv_path (shaders/<name>.cl, same name as the .spv) next to it"""
+    name = os.path.splitext(os.path.basename(spv_path))[0]
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'shaders', name + '.cl')
+    if not os.path.isfile(src):
+        raise RuntimeError(f'{name}: no OpenCL port (shaders/{name}.cl) for HIP')
+    compile_cl(src, os.path.splitext(spv_path)[0] + '.hsaco')
 
 
 def write_manifest(man, base):

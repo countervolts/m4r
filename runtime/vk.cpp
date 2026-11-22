@@ -1,6 +1,9 @@
 // m4r: minimal Vulkan context (see vk.h).
 // SPDX-License-Identifier: GPL-3.0-only
 #include "vk.h"
+#ifdef M4R_HIPVK
+#include "hipvk/hipvk.h"
+#endif
 #include <cstdlib>
 #include <cstdio>
 #include <string>
@@ -87,6 +90,10 @@ bool Context::create() {
 
 std::string gpuTarget(const char* deviceName) {
     if (const char* o = std::getenv("M4R_GPU")) return o;
+#ifdef M4R_HIPVK
+    (void)deviceName;
+    return hipvk::gpuTarget();
+#endif
     static const struct { const char* chip; const char* gfx; } chips[] = {
         {"NAVI21", "gfx1030"}, {"NAVI22", "gfx1031"}, {"NAVI23", "gfx1032"}, {"VANGOGH", "gfx1033"}, {"NAVI24", "gfx1034"},
         {"REMBRANDT", "gfx1035"}, {"RAPHAEL_MENDOCINO", "gfx1036"},
