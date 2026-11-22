@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 400" width="760" height="400" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<style>.bg{fill:#fcfcfb}.t1{fill:#1f1f1e}.t2{fill:#5f5e5a}.grid{stroke:#e4e3de}.base{stroke:#b5b4ad}.s0{fill:#2a78d6}.s1{fill:#eb6834}.s2{fill:#1baf7a}@media (prefers-color-scheme: dark){.bg{fill:#1a1a19}.t1{fill:#f0efec}.t2{fill:#c3c2b7}.grid{stroke:#33332f}.base{stroke:#5f5e5a}.s0{fill:#3987e5}.s1{fill:#d95926}.s2{fill:#199e70}}</style>
+<rect class="bg" width="760" height="400" rx="8"/>
+<text class="t1" x="56" y="24" font-size="15" font-weight="600">Ray Reconstruction denoiser, GPU time at 2560x1440 output (RX 7700 XT)</text>
+<rect class="s0" x="56" y="38" width="12" height="12" rx="3"/><text class="t2" x="73" y="48" font-size="12">MetalFX denoiser (m4r)</text>
+<rect class="s1" x="240" y="38" width="12" height="12" rx="3"/><text class="t2" x="257" y="48" font-size="12">FSR Ray Regeneration (d4r)</text>
+<rect class="s2" x="452" y="38" width="12" height="12" rx="3"/><text class="t2" x="469" y="48" font-size="12">DLSS RR, model E, incl. upscale (d4r)</text>
+<line class="base" x1="56" x2="744" y1="344.0" y2="344.0"/>
+<text class="t2" x="48" y="348.0" font-size="11" text-anchor="end">0</text>
+<line class="grid" x1="56" x2="744" y1="304.0" y2="304.0"/>
+<text class="t2" x="48" y="308.0" font-size="11" text-anchor="end">10</text>
+<line class="grid" x1="56" x2="744" y1="264.0" y2="264.0"/>
+<text class="t2" x="48" y="268.0" font-size="11" text-anchor="end">20</text>
+<line class="grid" x1="56" x2="744" y1="224.0" y2="224.0"/>
+<text class="t2" x="48" y="228.0" font-size="11" text-anchor="end">30</text>
+<line class="grid" x1="56" x2="744" y1="184.0" y2="184.0"/>
+<text class="t2" x="48" y="188.0" font-size="11" text-anchor="end">40</text>
+<line class="grid" x1="56" x2="744" y1="144.0" y2="144.0"/>
+<text class="t2" x="48" y="148.0" font-size="11" text-anchor="end">50</text>
+<line class="grid" x1="56" x2="744" y1="104.0" y2="104.0"/>
+<text class="t2" x="48" y="108.0" font-size="11" text-anchor="end">60</text>
+<line class="grid" x1="56" x2="744" y1="64.0" y2="64.0"/>
+<text class="t2" x="48" y="68.0" font-size="11" text-anchor="end">70</text>
+<text class="t2" transform="translate(16 204.0) rotate(-90)" font-size="11" text-anchor="middle">GPU ms per frame (lower is better)</text>
+<path class="s0" d="M71.8,344 V327.3 Q71.8,323.3 75.8,323.3 H101.8 Q105.8,323.3 105.8,327.3 V344 Z"><title>MetalFX denoiser (m4r), DLAA: 5.18 ms</title></path>
+<text class="t1" x="88.8" y="319.3" font-size="10" text-anchor="middle">5.2</text>
+<path class="s1" d="M107.8,344 V271.9 Q107.8,267.9 111.8,267.9 H137.8 Q141.8,267.9 141.8,271.9 V344 Z"><title>FSR Ray Regeneration (d4r), DLAA: 19.02 ms</title></path>
+<text class="t1" x="124.8" y="263.9" font-size="10" text-anchor="middle">19.0</text>
+<path class="s2" d="M143.8,344 V77.2 Q143.8,73.2 147.8,73.2 H173.8 Q177.8,73.2 177.8,77.2 V344 Z"><title>DLSS RR, model E, incl. upscale (d4r), DLAA: 67.70 ms</title></path>
+<text class="t1" x="160.8" y="69.2" font-size="10" text-anchor="middle">67.7</text>
+<text class="t1" x="124.8" y="362" font-size="12" text-anchor="middle">DLAA</text><text class="t2" x="124.8" y="377" font-size="11" text-anchor="middle">2560x1440</text>
+<path class="s0" d="M209.4,344 V339.0 Q209.4,335.0 213.4,335.0 H239.4 Q243.4,335.0 243.4,339.0 V344 Z"><title>MetalFX denoiser (m4r), Quality: 2.24 ms</title></path>
+<text class="t1" x="226.4" y="331.0" font-size="10" text-anchor="middle">2.2</text>
+<path class="s1" d="M245.4,344 V315.4 Q245.4,311.4 249.4,311.4 H275.4 Q279.4,311.4 279.4,315.4 V344 Z"><title>FSR Ray Regeneration (d4r), Quality: 8.15 ms</title></path>
+<text class="t1" x="262.4" y="307.4" font-size="10" text-anchor="middle">8.2</text>
+<path class="s2" d="M281.4,344 V224.8 Q281.4,220.8 285.4,220.8 H311.4 Q315.4,220.8 315.4,224.8 V344 Z"><title>DLSS RR, model E, incl. upscale (d4r), Quality: 30.80 ms</title></path>
+<text class="t1" x="298.4" y="216.8" font-size="10" text-anchor="middle">30.8</text>
+<text class="t1" x="262.4" y="362" font-size="12" text-anchor="middle">Quality</text><text class="t2" x="262.4" y="377" font-size="11" text-anchor="middle">1706x960</text>
+<path class="s0" d="M347.0,344 V341.2 Q347.0,337.2 351.0,337.2 H377.0 Q381.0,337.2 381.0,341.2 V344 Z"><title>MetalFX denoiser (m4r), Balanced: 1.70 ms</title></path>
+<text class="t1" x="364.0" y="333.2" font-size="10" text-anchor="middle">1.7</text>
+<path class="s1" d="M383.0,344 V323.9 Q383.0,319.9 387.0,319.9 H413.0 Q417.0,319.9 417.0,323.9 V344 Z"><title>FSR Ray Regeneration (d4r), Balanced: 6.02 ms</title></path>
+<text class="t1" x="400.0" y="315.9" font-size="10" text-anchor="middle">6.0</text>
+<path class="s2" d="M419.0,344 V250.4 Q419.0,246.4 423.0,246.4 H449.0 Q453.0,246.4 453.0,250.4 V344 Z"><title>DLSS RR, model E, incl. upscale (d4r), Balanced: 24.40 ms</title></path>
+<text class="t1" x="436.0" y="242.4" font-size="10" text-anchor="middle">24.4</text>
+<text class="t1" x="400.0" y="362" font-size="12" text-anchor="middle">Balanced</text><text class="t2" x="400.0" y="377" font-size="11" text-anchor="middle">1505x847</text>
+<path class="s0" d="M484.6,344 V343.2 Q484.6,339.2 488.6,339.2 H514.6 Q518.6,339.2 518.6,343.2 V344 Z"><title>MetalFX denoiser (m4r), Performance: 1.20 ms</title></path>
+<text class="t1" x="501.6" y="335.2" font-size="10" text-anchor="middle">1.2</text>
+<path class="s1" d="M520.6,344 V330.8 Q520.6,326.8 524.6,326.8 H550.6 Q554.6,326.8 554.6,330.8 V344 Z"><title>FSR Ray Regeneration (d4r), Performance: 4.31 ms</title></path>
+<text class="t1" x="537.6" y="322.8" font-size="10" text-anchor="middle">4.3</text>
+<path class="s2" d="M556.6,344 V277.2 Q556.6,273.2 560.6,273.2 H586.6 Q590.6,273.2 590.6,277.2 V344 Z"><title>DLSS RR, model E, incl. upscale (d4r), Performance: 17.70 ms</title></path>
+<text class="t1" x="573.6" y="269.2" font-size="10" text-anchor="middle">17.7</text>
+<text class="t1" x="537.6" y="362" font-size="12" text-anchor="middle">Performance</text><text class="t2" x="537.6" y="377" font-size="11" text-anchor="middle">1280x720</text>
+<path class="s0" d="M622.2,344 V344.0 Q622.2,342.2 624.0,342.2 H654.4 Q656.2,342.2 656.2,344.0 V344 Z"><title>MetalFX denoiser (m4r), Ultra Perf.: 0.45 ms</title></path>
+<text class="t1" x="639.2" y="338.2" font-size="10" text-anchor="middle">0.5</text>
+<path class="s1" d="M658.2,344 V339.6 Q658.2,335.6 662.2,335.6 H688.2 Q692.2,335.6 692.2,339.6 V344 Z"><title>FSR Ray Regeneration (d4r), Ultra Perf.: 2.09 ms</title></path>
+<text class="t1" x="675.2" y="331.6" font-size="10" text-anchor="middle">2.1</text>
+<path class="s2" d="M694.2,344 V311.6 Q694.2,307.6 698.2,307.6 H724.2 Q728.2,307.6 728.2,311.6 V344 Z"><title>DLSS RR, model E, incl. upscale (d4r), Ultra Perf.: 9.10 ms</title></path>
+<text class="t1" x="711.2" y="303.6" font-size="10" text-anchor="middle">9.1</text>
+<text class="t1" x="675.2" y="362" font-size="12" text-anchor="middle">Ultra Perf.</text><text class="t2" x="675.2" y="377" font-size="11" text-anchor="middle">853x480</text>
+</svg>

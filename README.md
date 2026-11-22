@@ -33,6 +33,20 @@ went from 6.7 to 1.98 ms and frame generation from 2.9 to 1.55 ms. They are meas
 in `build/run_bbr` / `build/run_fg`; [docs/mxu.md](docs/mxu.md) and [docs/air-translation.md](docs/air-translation.md)
 describe the main techniques.
 
+### Ray Reconstruction denoisers
+
+![Ray Reconstruction denoiser GPU time per mode](docs/rr-denoiser-speed.svg)
+
+GPU ms per frame for the denoiser alone at 2560x1440 output, on the same RX 7700 XT (lower is better):
+
+| Mode (render size) | MetalFX denoiser (m4r) | FSR Ray Regeneration (d4r) | DLSS RR, model E (d4r) |
+|---|---|---|---|
+| Native (2560x1440) | **5.18** | 19.02 | 67.7 |
+| Quality (1706x960) | **2.24** | 8.15 | 30.8 |
+| Balanced (1505x847) | **1.70** | 6.02 | 24.4 |
+| Performance (1280x720) | **1.20** | 4.31 | 17.7 |
+| Ultra Performance (853x480) | **0.45** | 2.09 | 9.1 |
+
 ## Install
 
 1. Extract `m4r-<version>.zip` into the folder with the game's main `.exe` (OptiScaler with MetalFX as `dxgi.dll`,
