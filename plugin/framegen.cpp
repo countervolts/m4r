@@ -9,7 +9,7 @@
 // into shared buffers, the generation dispatch packs the frame and runs m4r's MetalFX interpolation between it and the previous
 // frame on HIP, in the list the swapchain executes (split there, like the upscaler).
 // SPDX-License-Identifier: GPL-3.0-only
-#include "m4r_asi.h"
+#include "asi.h"
 #include "ffx_api/ffx_framegeneration.h"
 #include "ffx_api/dx12/ffx_api_dx12.h"
 #include <cstring>
@@ -83,8 +83,8 @@ bool initFrameGen(FrameGen& f, uint32_t renderW, uint32_t renderH) {
     if (f.initialised && f.renderW == renderW && f.renderH == renderH) return true;
     for (auto* s : {&f.depth[0], &f.depth[1], &f.motion[0], &f.motion[1], &f.color[0], &f.color[1], &f.output}) g.dx.release(*s);
     const uint32_t ow = f.display.width, oh = f.display.height;
-    if (m4r_interpolate_init(g.m4r, ow, oh, renderW, renderH) != 0) {
-        log("m4r_interpolate_init %ux%u -> %ux%u: %s", renderW, renderH, ow, oh, m4r_last_error(g.m4r));
+    if (be_interpolate_init(g.m4r, ow, oh, renderW, renderH) != 0) {
+        log("be_interpolate_init %ux%u -> %ux%u: %s", renderW, renderH, ow, oh, be_last_error(g.m4r));
         return false;
     }
     for (int i = 0; i < 2; ++i)
@@ -102,8 +102,8 @@ void runInterpolate(void* owner, ID3D12CommandQueue* queue) {
     Part* p = static_cast<Part*>(owner);
     std::lock_guard<std::mutex> lock(g.mutex);
     vkBeginCommandBuffer(g.cb, nullptr);
-    if (m4r_interpolate(g.m4r, g.cb, &p->interpolate) != 0) {
-        log("m4r_interpolate: %s", m4r_last_error(g.m4r));
+    if (be_interpolate(g.m4r, g.cb, &p->interpolate) != 0) {
+        log("be_interpolate: %s", be_last_error(g.m4r));
         vkBeginCommandBuffer(g.cb, nullptr);
     }
     vkEndCommandBuffer(g.cb);
@@ -163,7 +163,7 @@ ffxReturnCode_t generate(FrameGen& f, const ffxDispatchDescFrameGeneration& d) {
     }
     Part* p = split(f.parts, list, &runInterpolate);
     if (!p) { log("frame generation: the command list could not be split"); return FFX_API_RETURN_ERROR_RUNTIME_ERROR; }
-    m4r_interpolate_desc& m = p->interpolate;
+    be_interpolate_desc& m = p->interpolate;
     m = {};
     m.color = {f.color[slot].image, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_LAYOUT_GENERAL};
     m.prev_color = {f.color[slot ^ 1].image, VK_FORMAT_R16G16B16A16_SFLOAT, ow, oh, VK_IMAGE_LAYOUT_GENERAL};

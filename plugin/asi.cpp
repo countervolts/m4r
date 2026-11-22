@@ -8,7 +8,7 @@
 //
 // Files: <plugin dir>\m4r\plans (install.py), <plugin dir>\m4r\m4r.log.
 // SPDX-License-Identifier: GPL-3.0-only
-#include "m4r_asi.h"
+#include "asi.h"
 #include "ffx_api/ffx_upscale.h"
 #include "ffx_api/ffx_framegeneration.h"
 #include "ffx_api/dx12/ffx_api_dx12.h"
@@ -31,7 +31,7 @@ void log(const char* fmt, ...) {
     static FILE* f = nullptr;
     static std::mutex m;
     std::lock_guard<std::mutex> lock(m);
-    if (!f && !g.dir.empty()) f = _fsopen((g.dir + "\\m4r.log").c_str(), "w", _SH_DENYNO);
+    if (!f && !g.dir.empty()) f = _fsopen((g.dir + "\\" BE_NAME ".log").c_str(), "w", _SH_DENYNO);
     if (f) { std::fprintf(f, "%s\n", buf); std::fflush(f); }
     if (g.api && OPTI_API_HAS(g.api, Log)) g.api->Log(g.plugin, OptiLog_Info, buf);
 }
@@ -42,17 +42,17 @@ bool ready(ID3D12Device* device) {
     if (g.failed) return false;
     const char* why = nullptr;
     if (!d4r_split::install(device, &why)) { log("command-list split unavailable: %s", why ? why : "?"); g.failed = true; return false; }
-    if (m4r_create(&g.m4r, nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0, (g.dir + "\\plans").c_str()) != 0) {
-        log("m4r: %s", g.m4r ? m4r_last_error(g.m4r) : "no context");
-        if (g.m4r) m4r_destroy(g.m4r);
+    if (be_create(&g.m4r, nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, 0, (g.dir + "\\" BE_DATA).c_str()) != 0) {
+        log("%s: %s", BE_NAME, g.m4r ? be_last_error(g.m4r) : "no context");
+        if (g.m4r) be_destroy(g.m4r);
         g.m4r = nullptr; g.failed = true;
         return false;
     }
-    if (!g.dx.init(device)) { log("interop: %s", g.dx.error.c_str()); m4r_destroy(g.m4r); g.m4r = nullptr; g.failed = true; return false; }
+    if (!g.dx.init(device)) { log("interop: %s", g.dx.error.c_str()); be_destroy(g.m4r); g.m4r = nullptr; g.failed = true; return false; }
     VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandBufferCount = 1;
     vkAllocateCommandBuffers(VK_NULL_HANDLE, &ai, &g.cb);
-    log("m4r ready on %s (HIP)", hipvk::gpuTarget().c_str());
+    log("%s ready on %s (HIP)", BE_NAME, hipvk::gpuTarget().c_str());
     return true;
 }
 
@@ -119,8 +119,8 @@ static void runUpscale(void* owner, ID3D12CommandQueue* queue) {
     Part* p = static_cast<Part*>(owner);
     std::lock_guard<std::mutex> lock(g.mutex);
     vkBeginCommandBuffer(g.cb, nullptr);
-    if (m4r_upscale(g.m4r, g.cb, &p->upscale) != 0) {
-        log("m4r_upscale: %s", m4r_last_error(g.m4r));
+    if (be_upscale(g.m4r, g.cb, &p->upscale) != 0) {
+        log("be_upscale: %s", be_last_error(g.m4r));
         vkEndCommandBuffer(g.cb);
         vkBeginCommandBuffer(g.cb, nullptr);   // an empty submission keeps the fence handoff intact
     }
@@ -144,8 +144,8 @@ static float halton(int i, int b) {
     return r;
 }
 
-constexpr uint64_t kVersionId = 0x6d3472'0001ull;   // "m4r" 1
-static const char* kVersionName = "1.0.0 (MetalFX, m4r)";
+constexpr uint64_t kVersionId = BE_VERSION_ID;
+static const char* kVersionName = BE_VERSION_NAME;
 
 static ffxReturnCode_t query(ffxContext* ctx, ffxQueryDescHeader* desc) {
     for (auto* h = desc; h; h = h->pNext) {
@@ -227,7 +227,7 @@ static bool initUpscaler(Upscaler& u, uint32_t outW, uint32_t outH) {
     if (u.initialised && u.outW == outW && u.outH == outH) return true;
     g.dx.release(u.color); g.dx.release(u.depth); g.dx.release(u.motion); g.dx.release(u.exposure); g.dx.release(u.output);
     const uint32_t iw = u.maxRender.width, ih = u.maxRender.height;
-    if (m4r_upscale_init(g.m4r, outW, outH, iw, ih) != 0) { log("m4r_upscale_init %ux%u -> %ux%u: %s", iw, ih, outW, outH, m4r_last_error(g.m4r)); return false; }
+    if (be_upscale_init(g.m4r, outW, outH, iw, ih) != 0) { log("be_upscale_init %ux%u -> %ux%u: %s", iw, ih, outW, outH, be_last_error(g.m4r)); return false; }
     if (!g.dx.create(u.color, iw, ih, dxi::Layout::RGBA16F) || !g.dx.create(u.depth, iw, ih, dxi::Layout::R32F) ||
         !g.dx.create(u.motion, iw, ih, dxi::Layout::RG16F) || !g.dx.create(u.exposure, 1, 1, dxi::Layout::R32F) ||
         !g.dx.create(u.output, outW, outH, dxi::Layout::RGBA16F)) {
@@ -277,7 +277,7 @@ static ffxReturnCode_t dispatch(ffxContext* ctx, const ffxDispatchDescHeader* de
     if (exposure) dxi::transition(list, exposure, read, es);
     Part* p = split(u.parts, list, &runUpscale);
     if (!p) { log("the command list could not be split"); return FFX_API_RETURN_ERROR_RUNTIME_ERROR; }
-    m4r_upscale_desc& m = p->upscale;
+    be_upscale_desc& m = p->upscale;
     m = {};
     m.color = {u.color.image, VK_FORMAT_R16G16B16A16_SFLOAT, u.color.w, u.color.h, VK_IMAGE_LAYOUT_GENERAL};
     m.depth = {u.depth.image, VK_FORMAT_R32_SFLOAT, u.depth.w, u.depth.h, VK_IMAGE_LAYOUT_GENERAL};
@@ -334,9 +334,9 @@ using namespace m4rasi;
 extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, OptiPlugin* plugin) {
     g.api = api; g.plugin = plugin;
     if (!OPTI_API_HAS(api, RegisterProvider)) { log("OptiScaler is too old for provider plugins (plugin API version %u)", api ? api->version : 0); return false; }
-    const bool up = api->RegisterProvider(plugin, "MetalFX", OptiProvider_Ffx, &getProc, nullptr);
-    const bool fg = api->RegisterProvider(plugin, "MetalFX FG", OptiProvider_FfxFg, &fgGetProc, nullptr);
-    log("registered: MetalFX upscaler %s, MetalFX FG %s", up ? "yes" : "no", fg ? "yes" : "no");
+    const bool up = api->RegisterProvider(plugin, BE_UPSCALER, OptiProvider_Ffx, &getProc, nullptr);
+    const bool fg = api->RegisterProvider(plugin, BE_FG, OptiProvider_FfxFg, &fgGetProc, nullptr);
+    log("registered: %s %s, %s %s", BE_UPSCALER, up ? "yes" : "no", BE_FG, fg ? "yes" : "no");
     return up || fg;
 }
 
@@ -347,7 +347,7 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
         GetModuleFileNameA(module, path, MAX_PATH);
         std::string dir = path;
         dir = dir.substr(0, dir.find_last_of("\\/"));
-        g.dir = dir + "\\m4r";
+        g.dir = dir + "\\" BE_NAME;
     }
     return TRUE;
 }

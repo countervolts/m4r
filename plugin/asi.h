@@ -1,10 +1,10 @@
-// m4r.asi: shared state of the OptiScaler plugin (m4r_asi.cpp: upscaler, framegen.cpp: frame generation).
+// The OptiScaler plugin's shared state (asi.cpp: upscaler, framegen.cpp: frame generation; backend.h: which upscaler).
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include "dx_interop.h"
 #include "optiscaler_plugin.h"
 #include "ffx_api/ffx_api.h"
-#include "m4r.h"
+#include "backend.h"
 #include <mutex>
 #include <string>
 #include <vector>
@@ -20,8 +20,8 @@ struct Part {
     uint64_t retireValue = 0;
     bool busy = false;
     // what the HIP work between the parts runs (filled when the list is split, read when it executes)
-    m4r_upscale_desc upscale{};
-    m4r_interpolate_desc interpolate{};
+    be_upscale_desc upscale{};
+    be_interpolate_desc interpolate{};
 };
 
 struct Parts {
@@ -40,7 +40,7 @@ struct Global {
     const OptiPluginApi* api = nullptr;
     OptiPlugin* plugin = nullptr;
     std::string dir;    // <plugin dir>\m4r
-    m4r_context* m4r = nullptr;
+    be_context* m4r = nullptr;
     bool failed = false;
     dxi::Interop dx;
     VkCommandBuffer cb = VK_NULL_HANDLE;   // hipvk command buffer for the work between the parts
