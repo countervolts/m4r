@@ -58,16 +58,17 @@ bool ready(ID3D12Device* device) {
 
 // ---- second parts of split lists ---------------------------------------------------------------------------------------------
 
-Part* Parts::get(ID3D12Device* device) {
+Part* Parts::get(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type) {
     for (Part* p : parts)
-        if (!p->busy && p->retire->GetCompletedValue() >= p->retireValue) {
+        if (!p->busy && p->type == type && p->retire->GetCompletedValue() >= p->retireValue) {
             if (FAILED(p->allocator->Reset()) || FAILED(p->list->Reset(p->allocator, nullptr))) continue;
             p->busy = true;
             return p;
         }
     auto* p = new Part;
-    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&p->allocator))) ||
-        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, p->allocator, nullptr, IID_PPV_ARGS(&p->list))) ||
+    p->type = type;
+    if (FAILED(device->CreateCommandAllocator(type, IID_PPV_ARGS(&p->allocator))) ||
+        FAILED(device->CreateCommandList(0, type, p->allocator, nullptr, IID_PPV_ARGS(&p->list))) ||
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&p->retire)))) {
         delete p;
         return nullptr;
@@ -92,10 +93,21 @@ void partDone(void* owner, bool) { static_cast<Part*>(owner)->busy = false; }
 // Splits `list` here: what is recorded into it from now on runs after `work(part, queue)` (called between the parts on the
 // executing thread, under g.mutex). Returns the part (its `job` holds the caller's state) or null.
 Part* split(Parts& parts, ID3D12GraphicsCommandList* list, void (*work)(void*, ID3D12CommandQueue*)) {
-    Part* p = parts.get(g.dx.device());
-    if (!p) return nullptr;
+    // why a split fails, logged the first few times (the callers only report that it failed)
+    static int reported = 0;
+    auto why = [&](const char* reason) {
+        if (reported < 8) { ++reported; log("split refused (%s): list %p type %d", reason, static_cast<void*>(list), int(list->GetType())); }
+    };
+    const D3D12_COMMAND_LIST_TYPE type = list->GetType();
+    if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && (type != D3D12_COMMAND_LIST_TYPE_COMPUTE || !d4r_split::installedCompute())) {
+        why("its type can't be split");
+        return nullptr;
+    }
+    Part* p = parts.get(g.dx.device(), type);
+    if (!p) { why("no second part"); return nullptr; }
     const uint64_t v = ++g.splitValue;
     if (!d4r_split::begin(list, p->list, g.dx.splitFence(), v, p->retire, ++p->retireValue, &partDone, p, work, p)) {
+        why(!d4r_split::installed() ? "split hooks not installed" : d4r_split::isSplit(list) ? "list already split" : "no free split slot");
         p->list->Close();
         p->busy = false;
         --p->retireValue;

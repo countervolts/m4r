@@ -18,6 +18,7 @@ struct Part {
     ID3D12GraphicsCommandList* list = nullptr;
     ID3D12Fence* retire = nullptr;
     uint64_t retireValue = 0;
+    D3D12_COMMAND_LIST_TYPE type = D3D12_COMMAND_LIST_TYPE_DIRECT;   // the game list's: direct, or compute (AMD's FG)
     bool busy = false;
     // what the HIP work between the parts runs (filled when the list is split, read when it executes)
     be_upscale_desc upscale{};
@@ -29,7 +30,7 @@ struct Part {
 
 struct Parts {
     std::vector<Part*> parts;
-    Part* get(ID3D12Device* device);
+    Part* get(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type);
     void drain();   // waits until the GPU has retired every part
 };
 

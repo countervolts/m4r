@@ -46,8 +46,14 @@ using Close = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*);
 inline Split splits[MaxSplits];
 inline std::atomic<int> active{0};
 inline std::mutex mutex;
-inline Close close = nullptr;
+inline Close close = nullptr;          // Close of direct lists
+inline Close closeCompute = nullptr;   // compute lists have a vtable of their own (AMD's frame generation records on them)
 inline std::atomic<bool> ready{false};
+inline std::atomic<bool> computeReady{false};
+inline HRESULT closeOf(ID3D12GraphicsCommandList* list)
+{
+    return (list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE && closeCompute ? closeCompute : close)(list);
+}
 } // namespace detail
 } // namespace d4r_split
 
@@ -57,6 +63,8 @@ inline std::atomic<bool> ready{false};
 extern "C" {
 extern void* d4r_split_original[d4r_split::MaxSlots];  // the used attribute belongs to its definition
 extern void* d4r_split_thunks[d4r_split::MaxSlots];
+extern void* d4r_split_original_c[d4r_split::MaxSlots];
+extern void* d4r_split_thunks_c[d4r_split::MaxSlots];
 void* d4r_split_target(void* self);
 }
 #else
@@ -64,6 +72,9 @@ extern "C" {
 // the original methods, by vtable slot (used by the stubs below)
 __attribute__((used)) void* d4r_split_original[d4r_split::MaxSlots] = {};
 extern void* d4r_split_thunks[d4r_split::MaxSlots];
+// the same for compute lists
+__attribute__((used)) void* d4r_split_original_c[d4r_split::MaxSlots] = {};
+extern void* d4r_split_thunks_c[d4r_split::MaxSlots];
 
 // The list a call on `self` records into: the second part while `self` is split, otherwise `self`.
 __attribute__((used)) void* d4r_split_target(void* self)
@@ -120,6 +131,48 @@ d4r_split_thunks:
     .endr
     .text
 )");
+
+// The compute-list stubs: the same, through the compute vtable's originals
+__asm__(R"(
+    .att_syntax
+    .text
+    .irp idx,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85
+    .globl d4r_split_thunk_c_\idx
+d4r_split_thunk_c_\idx:
+    push %rcx
+    push %rdx
+    push %r8
+    push %r9
+    sub $0x68, %rsp
+    movdqu %xmm0, 0x20(%rsp)
+    movdqu %xmm1, 0x30(%rsp)
+    movdqu %xmm2, 0x40(%rsp)
+    movdqu %xmm3, 0x50(%rsp)
+    call d4r_split_target
+    movdqu 0x20(%rsp), %xmm0
+    movdqu 0x30(%rsp), %xmm1
+    movdqu 0x40(%rsp), %xmm2
+    movdqu 0x50(%rsp), %xmm3
+    add $0x68, %rsp
+    pop %r9
+    pop %r8
+    pop %rdx
+    pop %rcx
+    mov %rax, %rcx
+    jmp *(d4r_split_original_c + 8 * \idx)(%rip)
+    .endr
+    .section .rdata,"dr"
+    .p2align 3
+    .globl d4r_split_thunks_c
+d4r_split_thunks_c:
+    .rept 11
+    .quad 0
+    .endr
+    .irp idx,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85
+    .quad d4r_split_thunk_c_\idx
+    .endr
+    .text
+)");
 #endif  // D4R_D3D12_SPLIT_DECL
 
 namespace d4r_split {
@@ -153,11 +206,11 @@ inline HRESULT STDMETHODCALLTYPE close_hook(ID3D12GraphicsCommandList* list)
         if (Split* split = find(list); split != nullptr && split->recording.load())
         {
             split->recording.store(false, std::memory_order_release);
-            second = close(split->second);
+            second = closeOf(split->second);
             split->closed = true;
         }
     }
-    const HRESULT first = close(list);
+    const HRESULT first = closeOf(list);
     return FAILED(second) ? second : first;
 }
 
@@ -169,7 +222,7 @@ inline void reset_hook(ID3D12GraphicsCommandList* list)
     if (split == nullptr)
         return;
     if (split->recording.load())
-        close(split->second);
+        closeOf(split->second);
     finish(*split, false);
 }
 
@@ -226,24 +279,25 @@ inline bool execute_hook(ID3D12CommandQueue* queue, UINT count, ID3D12CommandLis
 
 inline bool installed() { return detail::ready.load(); }
 
-// Replaces the recording methods of the command lists `device` creates (once per process). Needs the submission
-// hooks. False: lists cannot be split (the reason in *failure).
-inline bool install(ID3D12Device* device, const char** failure = nullptr)
+// Whether `list` is split now
+inline bool isSplit(ID3D12GraphicsCommandList* list)
 {
-    using namespace detail;
-    static std::mutex installMutex;
-    std::lock_guard<std::mutex> lock(installMutex);
-    if (ready.load())
-        return true;
-    if (!d4r_submit::install(device, failure))
-        return false;
+    std::lock_guard<std::mutex> lock(detail::mutex);
+    return detail::find(list) != nullptr;
+}
+
+namespace detail {
+// Patches the vtable of a list of `type`: Close, and every recording slot with `thunks` (originals into `originals`).
+// False: the list could not be made or a slot not patched.
+inline bool patchList(ID3D12Device* device, D3D12_COMMAND_LIST_TYPE type, void* const* thunks, void** originals,
+                      Close* closeOriginal)
+{
     ID3D12CommandAllocator* allocator = nullptr;
     ID3D12GraphicsCommandList* list = nullptr;
-    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
-        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&list))))
+    if (FAILED(device->CreateCommandAllocator(type, IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(0, type, allocator, nullptr, IID_PPV_ARGS(&list))))
     {
         if (allocator) allocator->Release();
-        if (failure) *failure = "the probe list could not be created";
         return false;
     }
     // the vtable's length is that of the newest interface the runtime implements; patching past it would
@@ -268,31 +322,49 @@ inline bool install(ID3D12Device* device, const char** failure = nullptr)
         }
     }
     void** vtable = *reinterpret_cast<void***>(list);
-    bool ok = true;
-    void* closeOriginal = nullptr;
-    ok = d4r_submit::detail::patch(vtable, CloseSlot, reinterpret_cast<void*>(&close_hook), &closeOriginal);
-    if (closeOriginal) close = reinterpret_cast<Close>(closeOriginal);
+    void* closeFound = nullptr;
+    bool ok = d4r_submit::detail::patch(vtable, CloseSlot, reinterpret_cast<void*>(&close_hook), &closeFound);
+    if (closeFound) *closeOriginal = reinterpret_cast<Close>(closeFound);
     for (size_t slot = FirstRedirected; ok && slot < slots; ++slot)
     {
         void* original = nullptr;
-        ok = d4r_submit::detail::patch(vtable, slot, d4r_split_thunks[slot], &original);
-        if (original) d4r_split_original[slot] = original;
-        ok = ok && d4r_split_original[slot] != nullptr;
+        ok = d4r_submit::detail::patch(vtable, slot, thunks[slot], &original);
+        if (original) originals[slot] = original;
+        ok = ok && originals[slot] != nullptr;
     }
     list->Close();
     list->Release();
     allocator->Release();
-    if (!ok || close == nullptr)
+    return ok && *closeOriginal != nullptr;
+}
+} // namespace detail
+
+// Replaces the recording methods of the command lists `device` creates (once per process): direct lists, and compute
+// lists when their vtable can be patched too (installedCompute). Needs the submission hooks. False: lists cannot be
+// split (the reason in *failure).
+inline bool install(ID3D12Device* device, const char** failure = nullptr)
+{
+    using namespace detail;
+    static std::mutex installMutex;
+    std::lock_guard<std::mutex> lock(installMutex);
+    if (ready.load())
+        return true;
+    if (!d4r_submit::install(device, failure))
+        return false;
+    if (!patchList(device, D3D12_COMMAND_LIST_TYPE_DIRECT, d4r_split_thunks, d4r_split_original, &close))
     {
         if (failure) *failure = "the command list vtable could not be patched";
         return false;
     }
+    computeReady = patchList(device, D3D12_COMMAND_LIST_TYPE_COMPUTE, d4r_split_thunks_c, d4r_split_original_c, &closeCompute);
     auto& s = d4r_submit::detail::state();
     s.splitExecute = &execute_hook;
     s.splitReset = &reset_hook;
     ready = true;
     return true;
 }
+
+inline bool installedCompute() { return detail::computeReady.load(); }
 
 // From now on what is recorded into `list` goes into `second` (open, of the same type). When `list` is executed,
 // `second` follows it on the same queue once `fence` reaches `value`, and `retire` is then signalled to
@@ -305,6 +377,8 @@ inline bool begin(ID3D12GraphicsCommandList* list, ID3D12GraphicsCommandList* se
 {
     using namespace detail;
     if (!ready.load())
+        return false;
+    if (list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE && !computeReady.load())
         return false;
     std::lock_guard<std::mutex> lock(mutex);
     if (find(list) != nullptr)

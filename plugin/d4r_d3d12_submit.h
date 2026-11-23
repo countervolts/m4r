@@ -36,6 +36,7 @@ struct State {
     uint64_t value = 0;
     Execute execute = nullptr;
     Reset reset = nullptr;
+    Reset resetCompute = nullptr;   // compute lists have a vtable of their own
     std::atomic<bool> installed{false};
     // d4r_d3d12_split.h: executes a batch holding a split list itself (true), and sees every Reset
     std::atomic<bool (*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*, Execute)> splitExecute{nullptr};
@@ -88,7 +89,8 @@ inline HRESULT STDMETHODCALLTYPE reset(ID3D12GraphicsCommandList* list, ID3D12Co
     }
     for (const Pending& p : dropped) p.discarded(p.owner);
     if (const auto split = s.splitReset.load()) split(list);
-    return s.reset(list, allocator, pipeline);
+    const Reset original = list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE && s.resetCompute ? s.resetCompute : s.reset;
+    return original(list, allocator, pipeline);
 }
 } // namespace detail
 
@@ -119,6 +121,19 @@ inline bool install(ID3D12Device* device, const char** failure = nullptr) {
             ok = s.execute && s.reset;
         }
         if (!ok && failure) *failure = "the vtables could not be patched";
+    }
+    // compute lists (AMD's frame generation records on them): their Reset too. Optional: direct lists work without it
+    if (ok) {
+        ID3D12CommandAllocator* ca = nullptr;
+        ID3D12GraphicsCommandList* cl = nullptr;
+        if (SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(&ca))) &&
+            SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COMPUTE, ca, nullptr, IID_PPV_ARGS(&cl)))) {
+            void* resetOriginal = nullptr;
+            if (patch(*reinterpret_cast<void***>(cl), ResetSlot, reinterpret_cast<void*>(&detail::reset), &resetOriginal) && resetOriginal)
+                s.resetCompute = reinterpret_cast<Reset>(resetOriginal);
+        }
+        if (cl) { cl->Close(); cl->Release(); }
+        if (ca) ca->Release();
     }
     if (list) { list->Close(); list->Release(); }
     if (allocator) allocator->Release();
