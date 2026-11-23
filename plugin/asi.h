@@ -65,5 +65,10 @@ ffxReturnCode_t fgDestroyContext(ffxContext* ctx);
 ffxReturnCode_t fgConfigure(ffxContext* ctx, const ffxConfigureDescHeader* desc);
 ffxReturnCode_t fgQuery(ffxContext* ctx, ffxQueryDescHeader* desc);
 ffxReturnCode_t fgDispatch(ffxContext* ctx, const ffxDispatchDescHeader* desc);
+// all4r's frame generation router: the generator alone (see framegen.cpp)
+void* fgGenCreate(ID3D12Device* device, uint32_t flags, uint32_t displayW, uint32_t displayH, uint32_t maxRenderW, uint32_t maxRenderH);
+int fgGenPrepare(void* f, const void* prepareDesc);
+int fgGenGenerate(void* f, const void* generateDesc);
+void fgGenDestroy(void* f);
 
 } // namespace m4rasi

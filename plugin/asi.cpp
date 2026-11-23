@@ -345,6 +345,14 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
     return up || fg || rr;
 }
 
+// all4r.asi switches frame generation between backends while the game runs: it keeps AMD's swapchain and calls these per frame
+extern "C" __declspec(dllexport) void* All4rFgCreate(ID3D12Device* device, uint32_t flags, uint32_t dw, uint32_t dh, uint32_t mw, uint32_t mh) {
+    return fgGenCreate(device, flags, dw, dh, mw, mh);
+}
+extern "C" __declspec(dllexport) int All4rFgPrepare(void* f, const void* desc) { return fgGenPrepare(f, desc); }
+extern "C" __declspec(dllexport) int All4rFgGenerate(void* f, const void* desc) { return fgGenGenerate(f, desc); }
+extern "C" __declspec(dllexport) void All4rFgDestroy(void* f) { fgGenDestroy(f); }
+
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(module);

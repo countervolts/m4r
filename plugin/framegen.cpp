@@ -272,6 +272,38 @@ void* fgGetProc(void*, const char* name) {
     return nullptr;
 }
 
+// all4r's frame generation router: the generator alone, without AMD's contexts. all4r keeps AMD's swapchain and frame generation
+// context for the whole session and sends each frame's prepare and generation dispatches to the generator picked in its menu, so
+// the user switches between AMD's FSR FG, MetalFX and ANF while the game runs.
+void* fgGenCreate(ID3D12Device* device, uint32_t flags, uint32_t displayW, uint32_t displayH, uint32_t maxRenderW, uint32_t maxRenderH) {
+    if (!device) return nullptr;
+    std::lock_guard<std::mutex> lock(g.mutex);
+    if (!ready(device)) return nullptr;
+    auto* f = new FrameGen;
+    f->device = device; f->flags = flags; f->display = {displayW, displayH}; f->maxRender = {maxRenderW, maxRenderH};
+    log("frame generation for all4r: render %ux%u -> %ux%u, flags 0x%x", maxRenderW, maxRenderH, displayW, displayH, flags);
+    return f;
+}
+int fgGenPrepare(void* f, const void* desc) {
+    if (!f || !desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    return int(prepare(*static_cast<FrameGen*>(f), *static_cast<const ffxDispatchDescFrameGenerationPrepare*>(desc)));
+}
+int fgGenGenerate(void* f, const void* desc) {
+    if (!f || !desc) return FFX_API_RETURN_ERROR_PARAMETER;
+    FrameGen& fg = *static_cast<FrameGen*>(f);
+    if (fg.broken) return FFX_API_RETURN_ERROR_RUNTIME_ERROR;
+    return int(generate(fg, *static_cast<const ffxDispatchDescFrameGeneration*>(desc)));
+}
+void fgGenDestroy(void* p) {
+    auto* f = static_cast<FrameGen*>(p);
+    if (!f) return;
+    std::lock_guard<std::mutex> lock(g.mutex);
+    f->parts.drain();
+    hipvk::finish();
+    for (auto* s : {&f->depth[0], &f->depth[1], &f->motion[0], &f->motion[1], &f->color[0], &f->color[1], &f->output}) g.dx.release(*s);
+    delete f;
+}
+
 // The upscaler provider's entry points route frame generation descriptors here (a dll that serves both kinds)
 ffxReturnCode_t fgCreateContext(ffxContext* ctx, ffxCreateContextDescHeader* desc) { return createImpl(ctx, desc, nullptr); }
 ffxReturnCode_t fgDestroyContext(ffxContext* ctx) { return destroyEntry(ctx, nullptr); }
