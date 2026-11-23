@@ -98,6 +98,12 @@ def main():
         sys.exit(f'{a.resources} has no default.metallib')
     if not os.path.isfile(a.binary):
         sys.exit(f'{a.binary} not found')
+    # the denoiser (Ray Reconstruction) needs MetalFX files beyond the upscaler's: without them its plans are skipped
+    dn_files = ['emit_dbfnet_v3_2_constants.dat', 'emit_ubfnet_v3_2_constants.dat', os.path.join('ubf.mtlpackage', 'library.mpsgraphpackage', 'resources.bin')]
+    missing = [f for f in dn_files if not os.path.isfile(os.path.join(a.resources, f))]
+    if missing and not a.no_denoiser:
+        print(f'no denoiser plans (Ray Reconstruction): {a.resources} lacks ' + ', '.join(missing))
+        a.no_denoiser = True
     if not a.game and not a.plans:
         sys.exit('pass --game or --plans')
     if not a.plans and not os.path.isfile(a.m4r_dll):
