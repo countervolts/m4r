@@ -557,7 +557,7 @@ kernel void nn_lowres(constant const char* normals, constant const char* motion,
         for (int k = 0; k < 4; ++k) {
             const float u = fma(fma(msx, (float)mv[k].x, pjx) - cjx, imw, ((float)(2 * gx + (k >> 1)) + 0.5f) * iuw);
             const float v = fma(fma(msy, (float)mv[k].y, pjy) - cjy, imh, ((float)(2 * gy + (k & 1)) + 0.5f) * iuh);
-            hs4[k] = __builtin_amdgcn_image_sample_lz_2d_v4f16_f32(15, u, v, *(constant const tex_t*)hist, hs, false, 0, 0).xyz;
+            hs4[k] = ((half4)__builtin_amdgcn_image_sample_lz_2d_v4f16_f32(15, u, v, *(constant const tex_t*)hist, hs, false, 0, 0)).xyz;   // LLVM 24 returns a GCC vector
         }
     }
     half3 aN = (half3)(-INFINITY), aC = (half3)(-INFINITY), aH = (half3)(-INFINITY), aS = (half3)(-INFINITY);
