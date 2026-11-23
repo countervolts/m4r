@@ -48,7 +48,7 @@ if(M4R_NATIVE_WINDOWS)
   endif()
   set_target_properties(m4r PROPERTIES PREFIX "")
   # m4r.asi: the OptiScaler plugin (MetalFX upscaler and frame generation providers), everything linked in
-  add_library(m4r_asi SHARED plugin/asi.cpp plugin/framegen.cpp)
+  add_library(m4r_asi SHARED plugin/asi.cpp plugin/framegen.cpp plugin/rr.cpp)
   target_include_directories(m4r_asi PRIVATE plugin)
   target_link_libraries(m4r_asi PRIVATE m4r_runtime d3d12)
   set_target_properties(m4r_asi PROPERTIES PREFIX "" OUTPUT_NAME m4r SUFFIX ".asi" ARCHIVE_OUTPUT_NAME m4r_asi)

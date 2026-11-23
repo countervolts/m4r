@@ -22,6 +22,9 @@ struct Part {
     // what the HIP work between the parts runs (filled when the list is split, read when it executes)
     be_upscale_desc upscale{};
     be_interpolate_desc interpolate{};
+#ifdef BE_RR
+    be_denoise_desc denoise{};
+#endif
 };
 
 struct Parts {
@@ -51,6 +54,9 @@ extern Global g;
 void log(const char* fmt, ...);
 bool ready(ID3D12Device* device);   // g.mutex held
 Part* split(Parts& parts, ID3D12GraphicsCommandList* list, void (*work)(void*, ID3D12CommandQueue*));   // g.mutex held
+
+// rr.cpp (backends with BE_RR): NGX Ray Reconstruction exports
+void* rrGetProc(void*, const char* name);
 
 // framegen.cpp
 void* fgGetProc(void*, const char* name);

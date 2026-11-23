@@ -5,6 +5,8 @@
 //   run_asi fg <m4r.asi> <fixture dir> <frames> <out dir>   "MetalFX FG": the prepare and frame generation dispatches, called
 //       directly as the swapchain's frame generation callback would (tests/scene_fg.py fixtures; needs AMD's FFX frame generation
 //       dlls next to the plugin, as in a game)
+//   run_asi rr <m4r.asi> <fixture dir> <frames> <out dir>   "MetalFX" Ray Reconstruction (NGX, OptiScaler's Dlssd kind) on
+//       tests/scene_rr.py captures; writes output-NN.raw like run_denoise_api (RUN_ASI_NO_FLIP=1: the capture's jitter as it is)
 // Sizes: 640x360 -> 1280x720. Plans: <asi dir>\m4r\plans.
 // SPDX-License-Identifier: GPL-3.0-only
 #define WIN32_LEAN_AND_MEAN
@@ -19,6 +21,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -303,8 +307,116 @@ static int framegen(Gpu& gpu, const Ffx& ffx, const std::string& fx, int frames,
     return 0;
 }
 
+// ---- rr: the Ray Reconstruction provider (NGX), on tests/scene_rr.py captures ---------------------------------------------------
+
+struct NgxParam {   // NVSDK_NGX_Parameter, MSVC vtable order (this file is built with clang-cl), a plain map like OptiScaler's
+    struct V { int type; unsigned long long u; double d; void* p; };
+    std::map<std::string, V> m;
+    virtual void Set(const char* n, unsigned long long v) { m[n] = {0, v, double(v), nullptr}; }
+    virtual void Set(const char* n, float v) { m[n] = {1, (unsigned long long)v, v, nullptr}; }
+    virtual void Set(const char* n, double v) { m[n] = {1, (unsigned long long)v, v, nullptr}; }
+    virtual void Set(const char* n, unsigned int v) { m[n] = {0, v, double(v), nullptr}; }
+    virtual void Set(const char* n, int v) { m[n] = {0, (unsigned long long)(long long)v, double(v), nullptr}; }
+    virtual void Set(const char* n, struct ID3D11Resource* v) { m[n] = {2, 0, 0, v}; }
+    virtual void Set(const char* n, ID3D12Resource* v) { m[n] = {2, 0, 0, v}; }
+    virtual void Set(const char* n, void* v) { m[n] = {2, 0, 0, v}; }
+    template <class T> unsigned num(const char* n, T* v) const {
+        auto it = m.find(n); if (it == m.end() || it->second.type == 2) return 0xBAD00010u;
+        *v = it->second.type == 1 ? T(it->second.d) : T(it->second.u); return 1;
+    }
+    template <class T> unsigned ptr(const char* n, T** v) const {
+        auto it = m.find(n); if (it == m.end() || it->second.type != 2) return 0xBAD00010u;
+        *v = static_cast<T*>(it->second.p); return 1;
+    }
+    virtual unsigned Get(const char* n, unsigned long long* v) const { return num(n, v); }
+    virtual unsigned Get(const char* n, float* v) const { return num(n, v); }
+    virtual unsigned Get(const char* n, double* v) const { return num(n, v); }
+    virtual unsigned Get(const char* n, unsigned int* v) const { return num(n, v); }
+    virtual unsigned Get(const char* n, int* v) const { return num(n, v); }
+    virtual unsigned Get(const char* n, struct ID3D11Resource** v) const { return ptr(n, v); }
+    virtual unsigned Get(const char* n, ID3D12Resource** v) const { return ptr(n, v); }
+    virtual unsigned Get(const char* n, void** v) const { return ptr(n, v); }
+    virtual void Reset() { m.clear(); }
+};
+struct NgxHandle { unsigned int Id; };
+
+static int rayReconstruction(Gpu& gpu, OptiGetProcFn gp, const std::string& fx, int frames, const std::string& outDir) {
+    using Init = unsigned (*)(unsigned long long, const wchar_t*, ID3D12Device*, int, const void*);
+    using Create = unsigned (*)(ID3D12GraphicsCommandList*, int, NgxParam*, NgxHandle**);
+    using Evaluate = unsigned (*)(ID3D12GraphicsCommandList*, const NgxHandle*, NgxParam*, void*);
+    using Release = unsigned (*)(NgxHandle*);
+    auto init = reinterpret_cast<Init>(gp(nullptr, "NVSDK_NGX_D3D12_Init_Ext"));
+    auto create = reinterpret_cast<Create>(gp(nullptr, "NVSDK_NGX_D3D12_CreateFeature"));
+    auto evaluate = reinterpret_cast<Evaluate>(gp(nullptr, "NVSDK_NGX_D3D12_EvaluateFeature"));
+    auto release = reinterpret_cast<Release>(gp(nullptr, "NVSDK_NGX_D3D12_ReleaseFeature"));
+    if (!init || !create || !evaluate || !release) { std::fprintf(stderr, "NGX exports missing\n"); return 1; }
+    if (init(1, L".", gpu.dev, 0, nullptr) != 1) { std::fprintf(stderr, "NGX init failed (see m4r.log)\n"); return 1; }
+    auto meta = [&](int id) {
+        std::map<std::string, std::vector<double>> mm;
+        std::ifstream f(fx + "/rr-" + std::to_string(id) + ".txt");
+        std::string line;
+        while (std::getline(f, line)) {
+            std::istringstream ls(line); std::string k; ls >> k;
+            if (k == "image") continue;
+            double v; while (ls >> v) mm[k].push_back(v);
+        }
+        return mm;
+    };
+    auto m0 = meta(0);
+    const uint32_t ow2 = uint32_t(m0["output"][0]), oh2 = uint32_t(m0["output"][1]), iw2 = uint32_t(m0["content"][0]), ih2 = uint32_t(m0["content"][1]);
+    NgxParam cp;
+    cp.Set("Width", iw2); cp.Set("Height", ih2); cp.Set("OutWidth", ow2); cp.Set("OutHeight", oh2);
+    cp.Set("DLSS.Feature.Create.Flags", int((1 << 1) | (1 << 3)));   // MVLowRes | DepthInverted
+    if (gpu.begin()) return 1;
+    NgxHandle* h = nullptr;
+    if (create(gpu.list, 13, &cp, &h) != 1) { std::fprintf(stderr, "CreateFeature failed (see m4r.log)\n"); return 1; }
+    double ms0 = 0;
+    if (gpu.run(&ms0)) return 1;
+    struct In { const char* key; const char* file; DXGI_FORMAT fmt; uint32_t bpp; Tex t; };
+    In ins[] = {{"Color", "color", DXGI_FORMAT_R16G16B16A16_FLOAT, 8, {}}, {"Depth", "depth", DXGI_FORMAT_R32_FLOAT, 4, {}},
+                {"MotionVectors", "motion", DXGI_FORMAT_R16G16B16A16_FLOAT, 8, {}}, {"GBuffer.Normals", "normals", DXGI_FORMAT_R16G16B16A16_FLOAT, 8, {}},
+                {"GBuffer.DiffuseAlbedo", "diffuse_albedo", DXGI_FORMAT_R8G8B8A8_UNORM, 4, {}},
+                {"GBuffer.SpecularAlbedo", "specular_albedo", DXGI_FORMAT_R8G8B8A8_UNORM, 4, {}}};
+    for (auto& in : ins)
+        if (!gpu.texture(in.t, in.fmt, iw2, ih2, in.bpp, false, kRead)) { std::fprintf(stderr, "textures\n"); return 1; }
+    Tex output;
+    if (!gpu.texture(output, DXGI_FORMAT_R16G16B16A16_FLOAT, ow2, oh2, 8, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return 1;
+    const bool flip = !std::getenv("RUN_ASI_NO_FLIP");   // the capture holds the MetalFX sign; DLSS-RR gets the opposite one
+    for (int t = 0; t < frames; ++t) {
+        auto mm = meta(t);
+        if (gpu.begin()) return 1;
+        for (auto& in : ins) {
+            auto d = readAll(fx + "/rr-" + std::to_string(t) + "-" + in.file + ".raw");
+            if (d.size() != size_t(iw2) * ih2 * in.bpp) { std::fprintf(stderr, "frame %d: %s size\n", t, in.file); return 1; }
+            gpu.upload2d(in.t, d.data(), kRead);
+        }
+        NgxParam p;
+        for (auto& in : ins) p.Set(in.key, in.t.res);
+        p.Set("Output", output.res);
+        float w2v[16], v2c[16];
+        for (int i = 0; i < 16; ++i) { w2v[i] = float(mm["world_to_view"][i]); v2c[i] = float(mm["view_to_clip"][i]); }
+        p.Set("WorldToViewMatrix", static_cast<void*>(w2v)); p.Set("ViewToClipMatrix", static_cast<void*>(v2c));
+        const float js = flip ? -1.0f : 1.0f;
+        p.Set("Jitter.Offset.X", float(mm["jitter"][0]) * js); p.Set("Jitter.Offset.Y", float(mm["jitter"][1]) * js);
+        p.Set("MV.Scale.X", 1.0f); p.Set("MV.Scale.Y", 1.0f);
+        p.Set("DLSS.Pre.Exposure", 1.0f); p.Set("Reset", int(mm["reset"][0]));
+        p.Set("DLSS.Use.HW.Depth", 1); p.Set("DLSS.Roughness.Mode", 1);
+        p.Set("DLSS.Render.Subrect.Dimensions.Width", iw2); p.Set("DLSS.Render.Subrect.Dimensions.Height", ih2);
+        if (evaluate(gpu.list, h, &p, nullptr) != 1) { std::fprintf(stderr, "frame %d: EvaluateFeature failed (see m4r.log)\n", t); return 1; }
+        gpu.readback2d(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        double ms = 0;
+        if (gpu.run(&ms)) return 1;
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "/output-%02d.raw", t);
+        if (gpu.save(output, outDir + nm)) return 1;
+        std::printf("frame %d: %.3f ms (submit to completion)\n", t, ms);
+    }
+    if (release(h) != 1) { std::fprintf(stderr, "ReleaseFeature failed\n"); return 1; }
+    return 0;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 6) { std::fprintf(stderr, "usage: %s up|fg <m4r.asi> <fixture dir> <frames> <out dir>\n", argv[0]); return 2; }
+    if (argc < 6) { std::fprintf(stderr, "usage: %s up|fg|rr <m4r.asi> <fixture dir> <frames> <out dir>\n", argv[0]); return 2; }
     const std::string mode = argv[1], asi = argv[2], fx = argv[3], outDir = argv[5];
     const int frames = std::atoi(argv[4]);
     Gpu gpu;
@@ -317,6 +429,12 @@ int main(int argc, char** argv) {
     api.size = sizeof api; api.version = OPTI_PLUGIN_API_VERSION;
     api.Log = &logFn; api.RegisterProvider = &registerProvider; api.RegisterTab = &registerTab; api.GetString = &getString; api.GetBool = &getBool;
     if (!init(&api, reinterpret_cast<OptiPlugin*>(&api))) { std::fprintf(stderr, "OptiPluginInit failed\n"); return 1; }
+    if (mode == "rr") {
+        if (!g_getProc[OptiProvider_Dlssd]) { std::fprintf(stderr, "the plugin registered no Ray Reconstruction provider\n"); return 1; }
+        const int rc = rayReconstruction(gpu, g_getProc[OptiProvider_Dlssd], fx, frames, outDir);
+        if (rc == 0) std::printf("ok\n");
+        return rc;
+    }
     Ffx ffx{};
     const OptiProviderKind kind = mode == "fg" ? OptiProvider_FfxFg : OptiProvider_Ffx;
     if (!ffxOf(g_getProc[kind], ffx)) { std::fprintf(stderr, "the plugin registered no %s provider\n", mode.c_str()); return 1; }

@@ -29,13 +29,14 @@
 
 namespace dxi {
 
-enum class Layout : uint32_t { RGBA16F = 0, R32F = 1, RG16F = 2, RGBA32F = 3 };
+enum class Layout : uint32_t { RGBA16F = 0, R32F = 1, RG16F = 2, RGBA32F = 3, RGBA8 = 4 };   // RGBA8: unorm
 inline uint32_t layoutBytes(Layout l) { return l == Layout::RGBA16F ? 8 : l == Layout::RGBA32F ? 16 : 4; }
 inline VkFormat layoutFormat(Layout l) {
     switch (l) {
     case Layout::RGBA16F: return VK_FORMAT_R16G16B16A16_SFLOAT;
     case Layout::R32F: return VK_FORMAT_R32_SFLOAT;
     case Layout::RG16F: return VK_FORMAT_R16G16_SFLOAT;
+    case Layout::RGBA8: return VK_FORMAT_R8G8B8A8_UNORM;
     default: return VK_FORMAT_R32G32B32A32_SFLOAT;
     }
 }
@@ -83,6 +84,7 @@ uint pack2(float a, float b) { return f32tof16(a) | (f32tof16(b) << 16); }
     if (layout == 0) dst.Store2(off + id.x * 8, uint2(pack2(v.x, v.y), pack2(v.z, v.w)));
     else if (layout == 1) dst.Store(off + id.x * 4, asuint(v.x));
     else if (layout == 2) dst.Store(off + id.x * 4, pack2(v.x, v.y));
+    else if (layout == 4) { uint4 q = uint4(round(saturate(v) * 255.0)); dst.Store(off + id.x * 4, q.x | (q.y << 8) | (q.z << 16) | (q.w << 24)); }
     else dst.Store4(off + id.x * 16, asuint(v));
 }
 [numthreads(8, 8, 1)] void unpack(uint3 id : SV_DispatchThreadID) {
@@ -92,6 +94,7 @@ uint pack2(float a, float b) { return f32tof16(a) | (f32tof16(b) << 16); }
     if (layout == 0) { uint2 d = srcBuf.Load2(off + (id.x + ox) * 8); v = float4(f16tof32(d.x), f16tof32(d.x >> 16), f16tof32(d.y), f16tof32(d.y >> 16)); }
     else if (layout == 1) v = float4(asfloat(srcBuf.Load(off + (id.x + ox) * 4)), 0, 0, 1);
     else if (layout == 2) { uint d = srcBuf.Load(off + (id.x + ox) * 4); v = float4(f16tof32(d), f16tof32(d >> 16), 0, 1); }
+    else if (layout == 4) { uint d = srcBuf.Load(off + (id.x + ox) * 4); v = float4(d & 255, (d >> 8) & 255, (d >> 16) & 255, d >> 24) / 255.0; }
     else v = asfloat(srcBuf.Load4(off + (id.x + ox) * 16));
     if (flags & 1) v.w = 1;
     dstTex[id.xy] = v * scale;

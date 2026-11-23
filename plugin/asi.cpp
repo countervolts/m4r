@@ -336,8 +336,13 @@ extern "C" __declspec(dllexport) bool OptiPluginInit(const OptiPluginApi* api, O
     if (!OPTI_API_HAS(api, RegisterProvider)) { log("OptiScaler is too old for provider plugins (plugin API version %u)", api ? api->version : 0); return false; }
     const bool up = api->RegisterProvider(plugin, BE_UPSCALER, OptiProvider_Ffx, &getProc, nullptr);
     const bool fg = api->RegisterProvider(plugin, BE_FG, OptiProvider_FfxFg, &fgGetProc, nullptr);
+    bool rr = false;
+#ifdef BE_RR
+    rr = api->RegisterProvider(plugin, BE_RR, OptiProvider_Dlssd, &rrGetProc, nullptr);
+    log("registered: %s ray reconstruction %s", BE_RR, rr ? "yes" : "no");
+#endif
     log("registered: %s %s, %s %s", BE_UPSCALER, up ? "yes" : "no", BE_FG, fg ? "yes" : "no");
-    return up || fg;
+    return up || fg || rr;
 }
 
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID) {

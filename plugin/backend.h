@@ -21,3 +21,8 @@ typedef m4r_interpolate_desc be_interpolate_desc;
 #define be_upscale m4r_upscale
 #define be_interpolate_init m4r_interpolate_init
 #define be_interpolate m4r_interpolate
+// Ray Reconstruction (rr.cpp): MetalFX's denoiser and its upscaling network
+#define BE_RR "MetalFX"
+typedef m4r_denoise_desc be_denoise_desc;
+#define be_denoise_init m4r_denoise_init
+#define be_denoise m4r_denoise
