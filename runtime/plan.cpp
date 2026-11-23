@@ -57,7 +57,10 @@ bool Plan::load(const std::string& dir) {
         if (w == "gpu") {   // gpu gfx1101: the kernels below are code for that GPU only
             ls >> gpu_;
             const std::string& dev = rt_.vk().gpu;
-            if (!dev.empty() && gpu_ != dev)
+            // a generic target (gfx11-generic) runs on every GPU of its family: gfx10-3-generic on gfx103x, gfxNN-generic on gfxNNxx
+            const bool generic = gpu_.size() > 8 && gpu_.compare(gpu_.size() - 8, 8, "-generic") == 0;
+            const std::string family = gpu_ == "gfx10-3-generic" ? "gfx103" : gpu_.substr(0, 5);
+            if (!dev.empty() && gpu_ != dev && !(generic && dev.rfind(family, 0) == 0))
                 return fail("this plan was built for " + gpu_ + " but the GPU is " + dev + "; reinstall the plans for it (install.py "
                             "--gpu " + dev + ")");
             continue;

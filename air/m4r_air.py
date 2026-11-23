@@ -37,7 +37,8 @@ TRIPLE = 'amdgcn-amd-amdhsa'
 # gfx11 has WMMA (Apple's 16x16x16 MXU products on v_wmma, accumulators kept in WMMA layout across GEMM chains), gfx12 has
 # WMMA with another register layout, gfx10.3 none (dot-product instructions; bit-identical to the WMMA build on gfx1101).
 GPUS = ('gfx1030', 'gfx1031', 'gfx1032', 'gfx1033', 'gfx1034', 'gfx1035', 'gfx1036', 'gfx1100', 'gfx1101', 'gfx1102',
-        'gfx1103', 'gfx1150', 'gfx1151', 'gfx1152', 'gfx1153', 'gfx1200', 'gfx1201')
+        'gfx1103', 'gfx1150', 'gfx1151', 'gfx1152', 'gfx1153', 'gfx1200', 'gfx1201',
+        'gfx10-3-generic', 'gfx11-generic', 'gfx12-generic')   # generic: one code object for every GPU of the family (all4r's prebuilt plans)
 GPU = os.environ.get('M4R_GPU', 'gfx1101')
 # native Windows runs m4r on HIP (runtime/hipvk), which cannot run SPIR-V: m4r's GLSL passes also get their OpenCL ports
 # (shaders/<name>.cl -> <name>.hsaco next to the .spv). M4R_HIP_PORTS=1 builds them elsewhere too.

@@ -56,6 +56,7 @@ struct m4r_context {
     VkQueryPool tsPool = VK_NULL_HANDLE;
     uint32_t tsCalls = 0, tsN = 0;
     double tsSum = 0;
+    std::string bbrError[2];   // why that load failed
     bool bbrTried[2] = {false, false};   // the plan of this depth convention was loaded (or failed to) on its first use
     std::map<uint64_t, bool> bbrNoPlan;   // content sizes without a plan of their own (looked up once)
     uint64_t bbrFrame[2] = {}, fgFrame = 0;
@@ -1304,8 +1305,13 @@ M4R_API int m4r_upscale(m4r_context* c, VkCommandBuffer cb, const m4r_upscale_de
         c->bbrTried[rev] = true;
         auto p = std::make_unique<Plan>(c->rt);
         if (p->load(c->dir + "/" + sizeName("bbr", c->bbrSize) + (rev ? "" : "-fwd"))) c->bbr[rev] = std::move(p);
+        else c->bbrError[rev] = p->error;
     }
-    if (!c->bbr[rev]) { c->error = std::string("no plan for ") + (rev ? "reversed" : "forward") + " depth (prepare it with --reversed-depth " + (rev ? "1" : "0") + ")"; return 1; }
+    if (!c->bbr[rev]) {
+        c->error = std::string("no plan for ") + (rev ? "reversed" : "forward") + " depth (prepare it with --reversed-depth " + (rev ? "1" : "0") + ")";
+        if (!c->bbrError[rev].empty()) c->error += ": " + c->bbrError[rev];
+        return 1;
+    }
     dumpUpscale(c, cb, d, cw, ch);
     ++c->upCalls;
     return recordBbr(c, cb, *c->bbr[rev], c->bbrFrame[rev], d, cw, ch);
